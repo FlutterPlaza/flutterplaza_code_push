@@ -1,0 +1,56 @@
+# Example GitHub Actions workflow for Code Push integration.
+# Copy this to .github/workflows/code-push.yml in your Flutter project.
+
+name: Code Push Release & Patch
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+jobs:
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Install fcp
+        run: dart pub global activate flutter_compile
+
+      - name: Authenticate
+        run: fcp codepush login --api-key ${{ secrets.CODE_PUSH_API_KEY }}
+
+      - name: Setup engine artifacts
+        run: fcp codepush setup --platform android-arm64
+
+      - name: Create release
+        run: fcp codepush release --build --platform apk --deterministic
+
+  patch:
+    if: "!startsWith(github.ref, 'refs/tags/')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Install fcp
+        run: dart pub global activate flutter_compile
+
+      - name: Authenticate
+        run: fcp codepush login --api-key ${{ secrets.CODE_PUSH_API_KEY }}
+
+      - name: Setup engine artifacts
+        run: fcp codepush setup --platform android-arm64
+
+      - name: Create patch (staged rollout)
+        run: |
+          RELEASE_ID=$(fcp codepush status --json | jq -r '.releases[0].id')
+          fcp codepush patch --build --release-id "$RELEASE_ID" --rollout 10

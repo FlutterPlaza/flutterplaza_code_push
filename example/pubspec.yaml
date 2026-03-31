@@ -1,0 +1,12 @@
+name: flutterplaza_code_push_example
+description: Example app demonstrating flutterplaza_code_push.
+publish_to: 'none'
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutterplaza_code_push:
+    path: ../
