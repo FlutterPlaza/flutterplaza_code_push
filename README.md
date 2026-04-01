@@ -206,4 +206,4 @@ describing the error.
 
 ## License
 
-MIT. See [LICENSE](LICENSE) for details.
+BSD 3-Clause. See [LICENSE](LICENSE) for details.
