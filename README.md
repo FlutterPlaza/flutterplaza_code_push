@@ -12,7 +12,7 @@ the `fcp` CLI) through a platform channel.
 Before using this package, you need:
 
 1. **`fcp` CLI** installed (`dart pub global activate flutter_compile`)
-2. A FlutterPlaza Code Push account (`fcp codepush login`)
+2. A FlutterPlaza Code Push account — run `fcp codepush login` (opens browser for sign-in)
 3. Code-push-enabled engine artifacts (`fcp codepush setup`)
 
 ## Installation
@@ -185,7 +185,7 @@ describing the error.
 ## Typical Workflow
 
 ```
-1. fcp codepush login          # authenticate (one-time)
+1. fcp codepush login          # opens browser, click Authorize (one-time)
 2. fcp codepush setup          # download engine artifacts (per Flutter version)
 3. fcp codepush init           # register app on server
 4. fcp codepush release --build --platform apk   # upload baseline
