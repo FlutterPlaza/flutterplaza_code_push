@@ -1,3 +1,8 @@
+## 0.1.2
+
+- fix: safe type handling for server responses (prevents crashes from malformed data)
+- fix: broad exception catch on all platform channel calls
+
 ## 0.1.1
 
 - fix: license updated to BSD 3-Clause (was incorrectly MIT)

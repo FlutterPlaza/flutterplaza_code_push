@@ -35,20 +35,28 @@ abstract final class CodePush {
   ///
   /// Throws a [CodePushException] if the check fails (e.g., network error).
   static Future<UpdateInfo> checkForUpdate() async {
-    final Map<String, dynamic>? result =
-        await _channel.invokeMapMethod<String, dynamic>(
-      'CodePush.checkForUpdate',
-    );
-    if (result == null) {
-      throw CodePushException(
-        'Failed to check for update: no response from engine.',
+    try {
+      final Map<String, dynamic>? result =
+          await _channel.invokeMapMethod<String, dynamic>(
+        'CodePush.checkForUpdate',
       );
+      if (result == null) {
+        throw CodePushException(
+          'Failed to check for update: no response from engine.',
+        );
+      }
+      return UpdateInfo(
+        isUpdateAvailable: result['isUpdateAvailable'] == true,
+        patchVersion: result['patchVersion']?.toString(),
+        downloadSize: result['downloadSize'] is int
+            ? result['downloadSize'] as int
+            : null,
+      );
+    } on CodePushException {
+      rethrow;
+    } catch (e) {
+      throw CodePushException('Update check failed: $e');
     }
-    return UpdateInfo(
-      isUpdateAvailable: result['isUpdateAvailable'] as bool? ?? false,
-      patchVersion: result['patchVersion'] as String?,
-      downloadSize: result['downloadSize'] as int?,
-    );
   }
 
   /// Downloads and applies the latest available patch.
