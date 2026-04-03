@@ -190,7 +190,7 @@ describing the error.
 3. fcp codepush init           # register app on server
 4. fcp codepush release --build --platform apk   # upload baseline
 5. # ... make code changes ...
-6. fcp codepush patch --build --release-id <id>  # upload patch
+6. fcp codepush patch --build --platform apk --release-id <id>  # upload patch
 7. App calls CodePush.checkForUpdate() → downloads → restarts with new code
 ```
 
