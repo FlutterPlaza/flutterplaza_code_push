@@ -1,39 +1,225 @@
 import 'dart:async' show Timer;
-import 'dart:convert' show base64Encode;
+import 'dart:convert' show base64Encode, jsonDecode, utf8;
+import 'dart:io' show Directory, File, HttpClient, Platform, exit;
+import 'dart:isolate' show Isolate;
 
+import 'dart:ui' as ui;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'models.dart';
 
 /// The platform channel used to communicate with the code push engine.
-const MethodChannel _channel = MethodChannel('flutter/codepush');
+/// The engine handler parses messages as JSON, so we must use JSONMethodCodec
+/// instead of the default StandardMethodCodec (binary).
+const MethodChannel _channel =
+    MethodChannel('flutter/codepush', JSONMethodCodec());
 
 /// Service for managing over-the-air code push updates.
 ///
-/// Code push allows pushing Dart code changes to deployed apps without
-/// requiring App Store or Play Store review. This class provides methods
-/// to check for updates, download and apply patches, query the current
-/// patch status, and roll back to the previous version.
+/// Provides both low-level methods (check, install, rollback) and a
+/// high-level [init] method that handles the entire update lifecycle
+/// automatically.
 ///
-/// All methods communicate with the native engine through the
-/// `flutter/codepush` platform channel, which is handled by the
-/// custom FlutterPlaza code push engine.
+/// ## Quick start
 ///
 /// ```dart
-/// final update = await CodePush.checkForUpdate();
-/// if (update.isUpdateAvailable) {
-///   await CodePush.downloadAndApply(
-///     onProgress: (progress) => print('Download: ${(progress * 100).toInt()}%'),
-///   );
-/// }
+/// // In your app's root widget:
+/// CodePush.init(
+///   serverUrl: 'https://api.codepush.flutterplaza.com',
+///   appId: 'your-app-id',
+///   releaseVersion: '1.0.0+1',
+/// );
+/// ```
+///
+/// Or wrap your app with [CodePushOverlay] for the update-ready banner:
+///
+/// ```dart
+/// CodePushOverlay(
+///   config: CodePushConfig(
+///     serverUrl: 'https://api.codepush.flutterplaza.com',
+///     appId: 'your-app-id',
+///     releaseVersion: '1.0.0+1',
+///   ),
+///   child: MyApp(),
+/// )
 /// ```
 abstract final class CodePush {
-  /// Checks the code push server for available updates.
+  static Timer? _timer;
+
+  /// Debug status notifier — shows what code push is doing.
+  static final ValueNotifier<String> status = ValueNotifier('init');
+
+  /// The result from the last loaded module.
   ///
-  /// Returns an [UpdateInfo] describing whether an update is available and
-  /// its metadata.
+  /// On iOS, bytecode modules return a JSON string which is auto-parsed
+  /// into a `Map<String, dynamic>`. Apps can listen to this to apply
+  /// OTA patches to their UI.
+  static final ValueNotifier<Object?> moduleResult = ValueNotifier(null);
+  static Object? _lastModuleResult;
+  static bool _moduleLoaded = false;
+
+  /// Initializes automatic code push update checking.
   ///
-  /// Throws a [CodePushException] if the check fails (e.g., network error).
+  /// Call this once in your app's startup. It will:
+  /// 1. Check for updates immediately
+  /// 2. Check periodically at the given [interval]
+  /// 3. Check on app resume from background
+  ///
+  /// When a patch is installed, [onUpdateReady] is called so you can
+  /// prompt the user to restart.
+  static void init({
+    required String serverUrl,
+    required String appId,
+    required String releaseVersion,
+    Duration interval = const Duration(hours: 4),
+    String channel = 'production',
+    VoidCallback? onUpdateReady,
+  }) {
+    _timer?.cancel();
+    _timer = Timer.periodic(interval, (_) {
+      checkAndInstall(
+        serverUrl: serverUrl,
+        appId: appId,
+        releaseVersion: releaseVersion,
+        channel: channel,
+        onUpdateReady: onUpdateReady,
+      );
+    });
+    // Check immediately on init.
+    checkAndInstall(
+      serverUrl: serverUrl,
+      appId: appId,
+      releaseVersion: releaseVersion,
+      channel: channel,
+      onUpdateReady: onUpdateReady,
+    );
+  }
+
+  /// Stops automatic update checking.
+  static void dispose() {
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  /// Checks the server for updates, downloads and installs if available.
+  ///
+  /// Returns `true` if a patch was installed (restart needed).
+  static Future<bool> checkAndInstall({
+    required String serverUrl,
+    required String appId,
+    required String releaseVersion,
+    String channel = 'production',
+    VoidCallback? onUpdateReady,
+  }) async {
+    try {
+      status.value = 'Checking server...';
+      final url = '$serverUrl/api/v1/updates'
+          '?app_id=$appId'
+          '&version=${Uri.encodeComponent(releaseVersion)}'
+          '&platform=$_platform'
+          '&channel=$channel';
+
+      final r = await _httpGet(url);
+      if (r.statusCode == 204 || r.statusCode != 200) {
+        status.value = 'No update (${r.statusCode})';
+        return false;
+      }
+
+      final data = jsonDecode(r.body) as Map<String, dynamic>;
+      if (data['patch_available'] != true) {
+        status.value = 'No patch available';
+        return false;
+      }
+
+      final patchUrl = data['patch_url'] as String?;
+      if (patchUrl == null || patchUrl.isEmpty) {
+        status.value = 'No patch URL';
+        return false;
+      }
+
+      status.value = 'Downloading patch...';
+      final dlR = await _httpGetBytes(patchUrl);
+      if (dlR.statusCode != 200) {
+        status.value = 'Download failed (${dlR.statusCode})';
+        return false;
+      }
+      final patchBytes = Uint8List.fromList(dlR.bytes);
+      if (patchBytes.isEmpty) {
+        status.value = 'Empty patch';
+        return false;
+      }
+
+      status.value = 'Installing (${patchBytes.length}B)...';
+      if (Platform.isIOS) {
+        if (_moduleLoaded) {
+          status.value = 'Patch active';
+          return false; // Already loaded this session.
+        }
+        await _installPatchFromDart(patchBytes);
+        try {
+          // Extract the payload from the patch wrapper.
+          final offsetBytes = patchBytes.buffer.asByteData();
+          final payloadOffset = offsetBytes.getUint32(12, Endian.little);
+          final payload = patchBytes.sublist(payloadOffset);
+
+          // Check if payload is ELF (can't load on iOS) or bytecode
+          final isELF = payload.length > 4 &&
+              payload[0] == 0x7f && payload[1] == 0x45 &&
+              payload[2] == 0x4c && payload[3] == 0x46;
+          if (isELF) {
+            status.value = 'Patch is ELF (needs bytecode for iOS). Restart required.';
+            onUpdateReady?.call();
+            return true;
+          }
+          status.value = 'Loading module...';
+          final rawResult = await ui.codePushLoadModule(Uint8List.fromList(payload));
+          // Module loaded live — no restart needed on iOS.
+          // Auto-parse JSON strings into Map/List for structured data.
+          Object? result = rawResult;
+          if (rawResult is String) {
+            try {
+              final parsed = jsonDecode(rawResult);
+              if (parsed is Map || parsed is List) result = parsed;
+            } catch (_) {
+              // Not JSON — keep as raw string.
+            }
+          }
+          _lastModuleResult = result;
+          _moduleLoaded = true;
+          moduleResult.value = result;
+          status.value = 'Patch active';
+          return true;
+        } catch (e) {
+          status.value = 'Module error: $e';
+          onUpdateReady?.call();
+          return true;
+        }
+      } else {
+        // Android/desktop: install via engine, restart required.
+        await installPatch(patchBytes);
+        status.value = 'Restart to apply';
+        onUpdateReady?.call();
+        return true;
+      }
+    } catch (e) {
+      status.value = 'Error: $e';
+      return false;
+    }
+  }
+
+  /// Kills the app process for a cold restart.
+  ///
+  /// On next launch, the engine will load the installed patch.
+  /// This is the only way to apply a patch — warm resumes don't
+  /// re-initialize the Dart VM.
+  static void restart() => exit(0);
+
+  // ── Low-level engine API ────────────────────────────────────────
+
+  /// Checks the engine for available updates (delegates to Dart side HTTP).
   static Future<UpdateInfo> checkForUpdate() async {
     try {
       final Map<String, dynamic>? result =
@@ -59,38 +245,23 @@ abstract final class CodePush {
     }
   }
 
-  /// Downloads and applies the latest available patch.
+  /// Installs a patch from raw bytes.
   ///
-  /// The optional [onProgress] callback is called with a value between 0.0
-  /// and 1.0 representing the download progress.
+  /// The [patchBytes] must be a valid `.vmcode` file. The engine verifies
+  /// the patch integrity (SHA-256 hash, optional RSA signature) before
+  /// installing it.
   ///
-  /// The patch will take effect on the next app restart.
-  ///
-  /// Throws a [CodePushException] if the download or application fails.
-  static Future<void> downloadAndApply({
-    ValueChanged<double>? onProgress,
-  }) async {
-    if (onProgress != null) {
-      _channel.setMethodCallHandler((call) async {
-        if (call.method == 'CodePush.downloadProgress') {
-          final double progress = (call.arguments as num).toDouble();
-          onProgress(progress);
-        }
-        return null;
-      });
-    }
-
-    try {
-      final bool? success = await _channel.invokeMethod<bool>(
-        'CodePush.downloadAndApply',
+  /// The patch takes effect on the next cold restart.
+  static Future<void> installPatch(Uint8List patchBytes) async {
+    final String base64Data = base64Encode(patchBytes);
+    final result = await _channel.invokeMethod<dynamic>(
+      'CodePush.installPatch',
+      <String>[base64Data],
+    );
+    if (result != true) {
+      throw CodePushException(
+        'Failed to install patch${result is String ? ": $result" : ""}',
       );
-      if (success != true) {
-        throw CodePushException('Failed to download and apply patch.');
-      }
-    } finally {
-      if (onProgress != null) {
-        _channel.setMethodCallHandler(null);
-      }
     }
   }
 
@@ -101,9 +272,7 @@ abstract final class CodePush {
         await _channel.invokeMapMethod<String, dynamic>(
       'CodePush.getCurrentPatch',
     );
-    if (result == null) {
-      return null;
-    }
+    if (result == null) return null;
     return PatchInfo(
       version: result['version'] as String,
       installedAt: DateTime.fromMillisecondsSinceEpoch(
@@ -113,113 +282,349 @@ abstract final class CodePush {
   }
 
   /// Returns whether the app is currently running with a code push patch.
+  ///
+  /// Returns `false` if the code push engine is not available.
   static Future<bool> get isPatched async {
-    final bool? result = await _channel.invokeMethod<bool>(
-      'CodePush.isPatched',
-    );
-    return result ?? false;
+    try {
+      return await _channel.invokeMethod<bool>('CodePush.isPatched') ?? false;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Rolls back to the previous version by removing the active patch.
-  ///
-  /// The rollback takes effect on the next app restart.
-  ///
-  /// Throws a [CodePushException] if the rollback fails.
+  /// Takes effect on next cold restart.
   static Future<void> rollback() async {
-    final bool? success = await _channel.invokeMethod<bool>(
-      'CodePush.rollback',
-    );
+    final bool? success =
+        await _channel.invokeMethod<bool>('CodePush.rollback');
     if (success != true) {
       throw CodePushException('Failed to roll back patch.');
     }
   }
 
-  /// Installs a patch from raw bytes.
-  ///
-  /// The [patchBytes] must be a valid `.vmcode` file. The engine verifies
-  /// the patch integrity (SHA-256 hash, optional RSA signature) before
-  /// installing it.
-  ///
-  /// This is useful when the app downloads the patch itself (e.g., using
-  /// `dart:io` HttpClient or the `http` package) and wants to install it
-  /// directly.
-  ///
-  /// The patch takes effect on the next app restart.
-  ///
-  /// Throws a [CodePushException] if verification or installation fails.
-  static Future<void> installPatch(Uint8List patchBytes) async {
-    final String base64Data = base64Encode(patchBytes);
-    final bool? success = await _channel.invokeMethod<bool>(
-      'CodePush.installPatch',
-      <String>[base64Data],
+  /// Returns the release version string from the engine config.
+  static Future<String> get releaseVersion async {
+    return await _channel.invokeMethod<String>('CodePush.getReleaseVersion') ??
+        '';
+  }
+
+  // ── Private helpers ─────────────────────────────────────────────
+
+  /// iOS-only: write patch directly from Dart to bypass engine C++ file I/O
+  /// which breaks Apple Clang LTO.
+  static Future<void> _installPatchFromDart(Uint8List patchBytes) async {
+    // Ask the engine for its configured patch directory path.
+    final patchDir = await _channel.invokeMethod<String>('CodePush.getPatchDir');
+    if (patchDir == null || patchDir.isEmpty) {
+      throw CodePushException('Engine returned no patch directory.');
+    }
+
+    final dir = Directory(patchDir);
+    if (!dir.existsSync()) {
+      dir.createSync(recursive: true);
+    }
+
+    final file = File('$patchDir/patch.vmcode');
+    await file.writeAsBytes(patchBytes, flush: true);
+  }
+
+  static String get _platform {
+    if (Platform.isIOS) return 'ios';
+    if (Platform.isAndroid) return 'android';
+    if (Platform.isMacOS) return 'macos';
+    if (Platform.isLinux) return 'linux';
+    if (Platform.isWindows) return 'windows';
+    return 'unknown';
+  }
+}
+
+/// Configuration for [CodePushOverlay].
+@immutable
+class CodePushConfig {
+  const CodePushConfig({
+    required this.serverUrl,
+    required this.appId,
+    required this.releaseVersion,
+    this.checkInterval = const Duration(hours: 4),
+    this.channel = 'production',
+  });
+
+  final String serverUrl;
+  final String appId;
+  final String releaseVersion;
+  final Duration checkInterval;
+  final String channel;
+}
+
+/// A widget that wraps your app and shows an update-ready banner
+/// when a code push patch has been downloaded and installed.
+///
+/// ```dart
+/// runApp(
+///   CodePushOverlay(
+///     config: CodePushConfig(
+///       serverUrl: 'https://api.codepush.flutterplaza.com',
+///       appId: 'your-app-id',
+///       releaseVersion: '1.0.0+1',
+///     ),
+///     child: MyApp(),
+///   ),
+/// );
+/// ```
+class CodePushOverlay extends StatefulWidget {
+  const CodePushOverlay({
+    super.key,
+    required this.config,
+    required this.child,
+    this.bannerBuilder,
+    this.showDebugBar = false,
+  });
+
+  /// Code push configuration.
+  final CodePushConfig config;
+
+  /// The app widget.
+  final Widget child;
+
+  /// Optional custom banner builder. If null, uses the default banner.
+  /// Return `null` to hide the banner.
+  final Widget Function(BuildContext context, VoidCallback onRestart,
+      VoidCallback onDismiss)? bannerBuilder;
+
+  /// Whether to show the debug status bar at the top. Defaults to false.
+  final bool showDebugBar;
+
+  @override
+  State<CodePushOverlay> createState() => _CodePushOverlayState();
+}
+
+class _CodePushOverlayState extends State<CodePushOverlay>
+    with WidgetsBindingObserver {
+  bool _updateReady = false;
+  bool _patchActive = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    CodePush.moduleResult.addListener(_onModuleLoaded);
+    CodePush.init(
+      serverUrl: widget.config.serverUrl,
+      appId: widget.config.appId,
+      releaseVersion: widget.config.releaseVersion,
+      interval: widget.config.checkInterval,
+      channel: widget.config.channel,
+      onUpdateReady: () {
+        if (mounted) setState(() => _updateReady = true);
+      },
     );
-    if (success != true) {
-      throw CodePushException(
-        'Failed to install patch: verification failed or write error.',
+  }
+
+  void _onModuleLoaded() {
+    if (CodePush.moduleResult.value != null && mounted) {
+      setState(() => _patchActive = true);
+    }
+  }
+
+  @override
+  void dispose() {
+    CodePush.moduleResult.removeListener(_onModuleLoaded);
+    CodePush.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      CodePush.checkAndInstall(
+        serverUrl: widget.config.serverUrl,
+        appId: widget.config.appId,
+        releaseVersion: widget.config.releaseVersion,
+        channel: widget.config.channel,
+        onUpdateReady: () {
+          if (mounted) setState(() => _updateReady = true);
+        },
       );
     }
   }
 
-  /// Returns the release version string that this app build corresponds to.
-  static Future<String> get releaseVersion async {
-    final String? version = await _channel.invokeMethod<String>(
-      'CodePush.getReleaseVersion',
+  @override
+  Widget build(BuildContext context) {
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: Stack(
+        children: [
+          widget.child,
+          if (widget.showDebugBar && !_patchActive)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: ValueListenableBuilder<String>(
+                valueListenable: CodePush.status,
+                builder: (_, status, __) => GestureDetector(
+                  onTap: () {
+                    Clipboard.setData(ClipboardData(text: 'CP: $status'));
+                  },
+                  child: Container(
+                    color: const Color(0xFF1A237E),
+                    padding: const EdgeInsets.fromLTRB(12, 50, 12, 6),
+                    child: Text('CP: $status',
+                        style: const TextStyle(color: Colors.white, fontSize: 11, decoration: TextDecoration.none)),
+                  ),
+                ),
+              ),
+            ),
+          if (_updateReady)
+          Positioned(
+            left: 16,
+            right: 16,
+            bottom: MediaQuery.of(context).padding.bottom + 16,
+            child: widget.bannerBuilder != null
+                ? widget.bannerBuilder!(
+                    context,
+                    CodePush.restart,
+                    () => setState(() => _updateReady = false),
+                  )!
+                : _DefaultUpdateBanner(
+                    onRestart: CodePush.restart,
+                    onDismiss: () => setState(() => _updateReady = false),
+                  ),
+          ),
+        ],
+      ),
     );
-    return version ?? '';
   }
+}
 
-  /// Requests the engine to clean up old, inactive patches from local storage.
-  ///
-  /// This frees disk space by removing patches that are no longer active.
-  /// The currently active patch (if any) is never removed.
-  ///
-  /// Returns the number of patches removed, or 0 if none were cleaned up.
-  static Future<int> cleanupOldPatches() async {
-    final int? removed = await _channel.invokeMethod<int>(
-      'CodePush.cleanupOldPatches',
+class _DefaultUpdateBanner extends StatelessWidget {
+  const _DefaultUpdateBanner({
+    required this.onRestart,
+    required this.onDismiss,
+  });
+
+  final VoidCallback onRestart;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Material(
+      borderRadius: BorderRadius.circular(12),
+      color: theme.colorScheme.surface,
+      elevation: 4,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            const Icon(Icons.system_update, size: 20),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Text('Update ready. Restart to apply.'),
+            ),
+            TextButton(
+              onPressed: onDismiss,
+              child: const Text('LATER'),
+            ),
+            const SizedBox(width: 4),
+            FilledButton(
+              onPressed: onRestart,
+              child: const Text('RESTART'),
+            ),
+          ],
+        ),
+      ),
     );
-    return removed ?? 0;
   }
+}
 
-  /// Starts periodic background checks for code push updates.
-  ///
-  /// Checks the server every [interval] for new patches. When an update
-  /// is found, [onUpdateAvailable] is called with the [UpdateInfo].
-  ///
-  /// Returns a [Timer] that can be cancelled to stop periodic checks.
-  ///
-  /// ```dart
-  /// final timer = CodePush.checkForUpdatePeriodically(
-  ///   interval: Duration(hours: 4),
-  ///   onUpdateAvailable: (update) {
-  ///     print('Update available: ${update.patchVersion}');
-  ///   },
-  /// );
-  /// // Later: timer.cancel();
-  /// ```
-  static Timer checkForUpdatePeriodically({
-    required Duration interval,
-    required ValueChanged<UpdateInfo> onUpdateAvailable,
-  }) {
-    return Timer.periodic(interval, (_) async {
-      try {
-        final UpdateInfo update = await checkForUpdate();
-        if (update.isUpdateAvailable) {
-          onUpdateAvailable(update);
+/// A widget that rebuilds when a code push module result is available.
+///
+/// Use this to apply OTA patches to specific parts of your UI.
+///
+/// ```dart
+/// CodePushPatchBuilder(
+///   patchKey: 'settings_banner',
+///   builder: (context, patchData, child) {
+///     if (patchData == null) return child!;
+///     final parts = patchData.split('|');
+///     return Text(parts[0]);
+///   },
+///   child: Text('Default content'),
+/// )
+/// ```
+class CodePushPatchBuilder extends StatelessWidget {
+  const CodePushPatchBuilder({
+    super.key,
+    this.patchKey,
+    required this.builder,
+    this.child,
+  });
+
+  /// Optional key to filter which patch data this builder responds to.
+  /// If the module result is a pipe-delimited string starting with this key,
+  /// the remaining data is passed to the builder. If null, all results
+  /// are passed through.
+  final String? patchKey;
+
+  /// Builder called with the patch data string (or null if no patch).
+  final Widget Function(BuildContext context, String? patchData, Widget? child) builder;
+
+  /// Optional child widget passed to the builder (typically the default/baseline UI).
+  final Widget? child;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<Object?>(
+      valueListenable: CodePush.moduleResult,
+      builder: (context, result, _) {
+        if (result is String && result.isNotEmpty) {
+          if (patchKey != null) {
+            if (result.startsWith('$patchKey:')) {
+              return builder(context, result.substring(patchKey!.length + 1), child);
+            }
+            return builder(context, null, child);
+          }
+          return builder(context, result, child);
         }
-      } on CodePushException {
-        // Silently ignore check failures during periodic checks.
-      }
-    });
-  }
-
-  /// Returns the number of patches currently stored on the device.
-  ///
-  /// This includes both active and inactive patches waiting to be cleaned up.
-  static Future<int> get patchCount async {
-    final int? count = await _channel.invokeMethod<int>(
-      'CodePush.getPatchCount',
+        return builder(context, null, child);
+      },
     );
-    return count ?? 0;
+  }
+}
+
+// ── HTTP helpers (run in isolates) ────────────────────────────────────
+
+class _HttpResult {
+  final int statusCode;
+  final String body;
+  final List<int> bytes;
+  _HttpResult(this.statusCode, this.body, this.bytes);
+}
+
+Future<_HttpResult> _httpGet(String url) async {
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+  try {
+    final request = await client.getUrl(Uri.parse(url));
+    final response = await request.close();
+    final bytes = await response.fold<List<int>>(
+        <int>[], (prev, chunk) => prev..addAll(chunk));
+    return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
+  } finally {
+    client.close();
+  }
+}
+
+Future<_HttpResult> _httpGetBytes(String url) async {
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
+  try {
+    final request = await client.getUrl(Uri.parse(url));
+    final response = await request.close();
+    final bytes = await response.fold<List<int>>(
+        <int>[], (prev, chunk) => prev..addAll(chunk));
+    return _HttpResult(response.statusCode, '', bytes);
+  } finally {
+    client.close();
   }
 }
