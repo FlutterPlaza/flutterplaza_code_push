@@ -48,6 +48,16 @@ const MethodChannel _channel =
 /// ```
 abstract final class CodePush {
   static Timer? _timer;
+  static Timer? _launchTimer;
+
+  /// Maximum consecutive failed boots before auto-rollback.
+  static const int _maxBootAttempts = 3;
+
+  /// Seconds to wait before declaring a launch successful.
+  static const int _launchGracePeriodSeconds = 10;
+
+  /// Cached patch directory path from the engine.
+  static String? _cachedPatchDir;
 
   /// Debug status notifier — shows what code push is doing.
   static final ValueNotifier<String> status = ValueNotifier('init');
@@ -61,12 +71,14 @@ abstract final class CodePush {
   static Object? _lastModuleResult;
   static bool _moduleLoaded = false;
 
-  /// Initializes automatic code push update checking.
+  /// Initializes automatic code push update checking with crash protection.
   ///
   /// Call this once in your app's startup. It will:
-  /// 1. Check for updates immediately
-  /// 2. Check periodically at the given [interval]
-  /// 3. Check on app resume from background
+  /// 1. Run crash protection checks (auto-rollback if needed)
+  /// 2. Check for updates immediately
+  /// 3. Check periodically at the given [interval]
+  /// 4. Check on app resume from background
+  /// 5. Report launch success after [_launchGracePeriodSeconds]
   ///
   /// When a patch is installed, [onUpdateReady] is called so you can
   /// prompt the user to restart.
@@ -79,6 +91,15 @@ abstract final class CodePush {
     VoidCallback? onUpdateReady,
   }) {
     _timer?.cancel();
+
+    // Crash protection runs async because it needs the engine's patch dir
+    // via platform channel. We fire-and-forget — it must not block init.
+    _runCrashProtection().then((_) {
+      // Start launch success timer only after crash protection completes,
+      // so a rollback doesn't get immediately overwritten by a success report.
+      _startLaunchTimer();
+    });
+
     _timer = Timer.periodic(interval, (_) {
       checkAndInstall(
         serverUrl: serverUrl,
@@ -98,10 +119,12 @@ abstract final class CodePush {
     );
   }
 
-  /// Stops automatic update checking.
+  /// Stops automatic update checking and cancels the launch timer.
   static void dispose() {
     _timer?.cancel();
     _timer = null;
+    _launchTimer?.cancel();
+    _launchTimer = null;
   }
 
   /// Checks the server for updates, downloads and installs if available.
@@ -194,8 +217,11 @@ abstract final class CodePush {
           return true;
         } catch (e) {
           status.value = 'Module error: $e';
-          onUpdateReady?.call();
-          return true;
+          // Report failure — do NOT prompt restart on module load errors,
+          // as the patch may be corrupt. The boot counter will eventually
+          // trigger auto-rollback if this keeps happening.
+          _reportLaunchFailure();
+          return false;
         }
       } else {
         // Android/desktop: install via engine, restart required.
@@ -335,6 +361,123 @@ abstract final class CodePush {
     if (Platform.isLinux) return 'linux';
     if (Platform.isWindows) return 'windows';
     return 'unknown';
+  }
+
+  // ── Crash protection ──────────────────────────────────────────────
+
+  /// Runs crash protection on startup.
+  ///
+  /// On iOS, the engine's C++ Updater is disabled (Apple Clang LTO issue),
+  /// so we handle the boot counter entirely in Dart. On other platforms,
+  /// the engine handles it natively — we just start the launch timer so
+  /// Dart can signal success back via the platform channel.
+  static Future<void> _runCrashProtection() async {
+    if (!Platform.isIOS) return; // Engine handles non-iOS.
+    try {
+      final patchDir = await _getPatchDir();
+      if (patchDir == null) return;
+      final patchFile = File('$patchDir/patch.vmcode');
+      if (!patchFile.existsSync()) return; // No patch, nothing to protect.
+
+      if (_iosCheckAndAutoRollback(patchDir)) {
+        status.value = 'Auto-rolled back (crash loop detected)';
+      } else {
+        _iosIncrementBootCounter(patchDir);
+      }
+    } catch (e) {
+      // Crash protection must never itself crash the app.
+      status.value = 'Crash protection error: $e';
+    }
+  }
+
+  /// Starts a timer that reports a successful launch after a grace period.
+  static void _startLaunchTimer() {
+    _launchTimer?.cancel();
+    _launchTimer = Timer(
+      Duration(seconds: _launchGracePeriodSeconds),
+      _reportLaunchSuccess,
+    );
+  }
+
+  /// Reports a successful launch to the engine (resets boot counter).
+  static Future<void> _reportLaunchSuccess() async {
+    try {
+      await _channel.invokeMethod<dynamic>('CodePush.reportLaunchSuccess');
+    } catch (_) {
+      // Engine updater may be null (iOS). Handle in Dart.
+    }
+    // Also reset in Dart for iOS.
+    if (Platform.isIOS) {
+      try {
+        final patchDir = await _getPatchDir();
+        if (patchDir != null) _iosResetBootCounter(patchDir);
+      } catch (_) {}
+    }
+  }
+
+  /// Reports a failed launch to the engine.
+  static Future<void> _reportLaunchFailure() async {
+    try {
+      await _channel.invokeMethod<dynamic>('CodePush.reportLaunchFailure');
+    } catch (_) {}
+  }
+
+  // ── iOS-only boot counter (Dart-side, since engine updater is disabled) ──
+
+  /// Gets the engine's configured patch directory via platform channel.
+  /// Caches the result so subsequent calls don't need the channel.
+  static Future<String?> _getPatchDir() async {
+    if (_cachedPatchDir != null) return _cachedPatchDir;
+    try {
+      final dir = await _channel.invokeMethod<String>('CodePush.getPatchDir');
+      if (dir != null && dir.isNotEmpty) {
+        _cachedPatchDir = dir;
+        return dir;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  static int _iosReadBootCounter(String patchDir) {
+    try {
+      final file = File('$patchDir/boot_counter');
+      if (!file.existsSync()) return 0;
+      return int.tryParse(file.readAsStringSync().trim()) ?? 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  static void _iosWriteBootCounter(String patchDir, int count) {
+    try {
+      final dir = Directory(patchDir);
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      File('$patchDir/boot_counter').writeAsStringSync('$count');
+    } catch (_) {}
+  }
+
+  static void _iosIncrementBootCounter(String patchDir) {
+    _iosWriteBootCounter(patchDir, _iosReadBootCounter(patchDir) + 1);
+  }
+
+  static void _iosResetBootCounter(String patchDir) {
+    _iosWriteBootCounter(patchDir, 0);
+  }
+
+  /// Returns true if a rollback was performed.
+  static bool _iosCheckAndAutoRollback(String patchDir) {
+    final count = _iosReadBootCounter(patchDir);
+    if (count < _maxBootAttempts) return false;
+
+    // Auto-rollback: remove the patch and reset the counter.
+    try {
+      final patchFile = File('$patchDir/patch.vmcode');
+      if (patchFile.existsSync()) patchFile.deleteSync();
+      final infoFile = File('$patchDir/patch_info.json');
+      if (infoFile.existsSync()) infoFile.deleteSync();
+      _iosResetBootCounter(patchDir);
+    } catch (_) {}
+    return true;
   }
 }
 

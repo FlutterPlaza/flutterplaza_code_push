@@ -1,11 +1,24 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutterplaza_code_push/flutterplaza_code_push.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const MyApp());
+
+  // Wrap your app with CodePushOverlay for automatic OTA updates.
+  // It checks for patches on startup, periodically, and on app resume.
+  // When a patch is downloaded, a banner prompts the user to restart.
+  runApp(
+    CodePushOverlay(
+      config: CodePushConfig(
+        serverUrl: 'https://your-server.com',
+        appId: 'your-app-id',
+        releaseVersion: '1.0.0+1',
+        checkInterval: const Duration(hours: 4),
+      ),
+      showDebugBar: true, // Set to false in production.
+      child: const MyApp(),
+    ),
+  );
 }
 
 class MyApp extends StatelessWidget {
@@ -28,12 +41,8 @@ class CodePushDemo extends StatefulWidget {
 
 class _CodePushDemoState extends State<CodePushDemo> {
   String _status = 'Idle';
-  double _progress = 0;
   bool _isPatched = false;
-  String _releaseVersion = '';
   PatchInfo? _currentPatch;
-  int _patchCount = 0;
-  Timer? _periodicTimer;
 
   @override
   void initState() {
@@ -41,56 +50,29 @@ class _CodePushDemoState extends State<CodePushDemo> {
     _loadStatus();
   }
 
-  @override
-  void dispose() {
-    _periodicTimer?.cancel();
-    super.dispose();
-  }
-
   Future<void> _loadStatus() async {
-    try {
-      final results = await Future.wait([
-        CodePush.isPatched,
-        CodePush.releaseVersion,
-        CodePush.currentPatch,
-        CodePush.patchCount,
-      ]);
-      setState(() {
-        _isPatched = results[0] as bool;
-        _releaseVersion = results[1] as String;
-        _currentPatch = results[2] as PatchInfo?;
-        _patchCount = results[3] as int;
-      });
-    } on CodePushException {
-      // Engine not available — running without code push.
-    }
+    final patched = await CodePush.isPatched;
+    final patch = await CodePush.currentPatch;
+    setState(() {
+      _isPatched = patched;
+      _currentPatch = patch;
+    });
   }
 
-  Future<void> _checkAndApply() async {
-    setState(() {
-      _status = 'Checking for updates...';
-      _progress = 0;
-    });
-
+  Future<void> _manualCheck() async {
+    setState(() => _status = 'Checking for updates...');
     try {
-      final update = await CodePush.checkForUpdate();
-      if (!update.isUpdateAvailable) {
-        setState(() => _status = 'No update available');
-        return;
-      }
-
-      setState(
-        () => _status = 'Downloading ${update.patchVersion} '
-            '(${_formatBytes(update.downloadSize)})...',
-      );
-
-      await CodePush.downloadAndApply(
-        onProgress: (progress) {
-          setState(() => _progress = progress);
+      final installed = await CodePush.checkAndInstall(
+        serverUrl: 'https://your-server.com',
+        appId: 'your-app-id',
+        releaseVersion: '1.0.0+1',
+        onUpdateReady: () {
+          setState(() => _status = 'Patch installed! Restart to apply.');
         },
       );
-
-      setState(() => _status = 'Patch applied! Restart to activate.');
+      if (!installed) {
+        setState(() => _status = 'No update available.');
+      }
       await _loadStatus();
     } on CodePushException catch (e) {
       setState(() => _status = 'Error: ${e.message}');
@@ -106,41 +88,6 @@ class _CodePushDemoState extends State<CodePushDemo> {
     } on CodePushException catch (e) {
       setState(() => _status = 'Rollback failed: ${e.message}');
     }
-  }
-
-  Future<void> _cleanup() async {
-    try {
-      final removed = await CodePush.cleanupOldPatches();
-      setState(() => _status = 'Cleaned up $removed old patch(es).');
-      await _loadStatus();
-    } on CodePushException catch (e) {
-      setState(() => _status = 'Cleanup failed: ${e.message}');
-    }
-  }
-
-  void _togglePeriodicCheck() {
-    if (_periodicTimer != null && _periodicTimer!.isActive) {
-      _periodicTimer!.cancel();
-      setState(() => _status = 'Periodic checking stopped.');
-      return;
-    }
-
-    _periodicTimer = CodePush.checkForUpdatePeriodically(
-      interval: const Duration(hours: 4),
-      onUpdateAvailable: (update) {
-        setState(() {
-          _status = 'Update found: ${update.patchVersion}';
-        });
-      },
-    );
-    setState(() => _status = 'Checking every 4 hours...');
-  }
-
-  String _formatBytes(int? bytes) {
-    if (bytes == null) return 'unknown size';
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
   }
 
   @override
@@ -160,9 +107,7 @@ class _CodePushDemoState extends State<CodePushDemo> {
                   Text('Status',
                       style: Theme.of(context).textTheme.titleMedium),
                   const SizedBox(height: 8),
-                  Text('Release: $_releaseVersion'),
                   Text('Patched: $_isPatched'),
-                  Text('Patches on device: $_patchCount'),
                   if (_currentPatch != null) ...[
                     Text('Active patch: ${_currentPatch!.version}'),
                     Text('Installed: ${_currentPatch!.installedAt}'),
@@ -176,36 +121,43 @@ class _CodePushDemoState extends State<CodePushDemo> {
 
           // Update status.
           Text(_status, textAlign: TextAlign.center),
-          if (_progress > 0 && _progress < 1)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              child: LinearProgressIndicator(value: _progress),
-            ),
 
           const SizedBox(height: 16),
 
-          // Actions.
+          // Manual update check.
           ElevatedButton(
-            onPressed: _checkAndApply,
+            onPressed: _manualCheck,
             child: const Text('Check for Updates'),
           ),
           const SizedBox(height: 8),
+
+          // Rollback (only enabled when patched).
           OutlinedButton(
             onPressed: _isPatched ? _rollback : null,
             child: const Text('Rollback'),
           ),
-          const SizedBox(height: 8),
-          OutlinedButton(
-            onPressed: _cleanup,
-            child: const Text('Cleanup Old Patches'),
-          ),
-          const SizedBox(height: 8),
-          OutlinedButton(
-            onPressed: _togglePeriodicCheck,
-            child: Text(
-              _periodicTimer?.isActive == true
-                  ? 'Stop Periodic Check'
-                  : 'Start Periodic Check (4h)',
+
+          const SizedBox(height: 24),
+
+          // CodePushPatchBuilder: reacts to live module results.
+          // Use this to patch specific parts of your UI without a full restart.
+          CodePushPatchBuilder(
+            patchKey: 'banner',
+            builder: (context, patchData, child) {
+              if (patchData == null) return child!;
+              return Card(
+                color: Colors.green.shade50,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(patchData),
+                ),
+              );
+            },
+            child: const Card(
+              child: Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('Default banner content'),
+              ),
             ),
           ),
         ],
