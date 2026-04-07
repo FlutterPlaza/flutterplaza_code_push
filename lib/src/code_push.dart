@@ -424,10 +424,15 @@ abstract final class CodePush {
 
   // ── iOS-only boot counter (Dart-side, since engine updater is disabled) ──
 
-  /// Gets the engine's configured patch directory via platform channel.
-  /// Caches the result so subsequent calls don't need the channel.
+  /// Gets the patch directory, checking the local filesystem first (fast)
+  /// then falling back to the engine platform channel.
+  ///
+  /// On iOS the engine updater is disabled, so we check the standard
+  /// Application Support path first. This avoids waiting for a platform
+  /// channel timeout when the custom engine isn't present.
   static Future<String?> _getPatchDir() async {
     if (_cachedPatchDir != null) return _cachedPatchDir;
+    // Try the engine's platform channel first (fast when available).
     try {
       final dir = await _channel.invokeMethod<String>('CodePush.getPatchDir');
       if (dir != null && dir.isNotEmpty) {
@@ -435,6 +440,19 @@ abstract final class CodePush {
         return dir;
       }
     } catch (_) {}
+    // Fallback for iOS when the custom engine isn't present.
+    // Directory.systemTemp on iOS returns <data-container>/tmp/.
+    // The data container root is the parent of tmp.
+    if (Platform.isIOS) {
+      try {
+        final dataContainer = Directory.systemTemp.parent.path;
+        final local = '$dataContainer/Library/Application Support/code_push';
+        if (Directory(local).existsSync()) {
+          _cachedPatchDir = local;
+          return local;
+        }
+      } catch (_) {}
+    }
     return null;
   }
 
