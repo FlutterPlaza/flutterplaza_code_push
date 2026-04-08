@@ -25,3 +25,4 @@ library;
 export 'src/code_push.dart'
     show CodePush, CodePushConfig, CodePushOverlay, CodePushPatchBuilder;
 export 'src/models.dart';
+export 'src/widget_renderer.dart' show CodePushWidgetArea;
