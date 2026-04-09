@@ -14,10 +14,13 @@ import 'code_push.dart';
 /// )
 /// ```
 class CodePushWidgetArea extends StatelessWidget {
-  const CodePushWidgetArea({super.key, required this.child});
+  const CodePushWidgetArea({super.key, required this.child, this.onAction});
 
   /// Default content shown when no patch is active.
   final Widget child;
+
+  /// Called when a button with an `action` or `onPressed` IR key is tapped.
+  final void Function(dynamic action)? onAction;
 
   @override
   Widget build(BuildContext context) {
@@ -25,7 +28,7 @@ class CodePushWidgetArea extends StatelessWidget {
       valueListenable: CodePush.moduleResult,
       builder: (context, result, _) {
         if (result is Map<String, dynamic>) {
-          return _WidgetIR.build(result, context);
+          return _WidgetIR.build(result, context, onAction);
         }
         if (result is String && result.isNotEmpty) {
           return Text(result);
@@ -42,7 +45,7 @@ class CodePushWidgetArea extends StatelessWidget {
 /// The IR uses `_w` to identify widget types and mirrors the constructor
 /// parameters defined in the server's widget registry.
 class _WidgetIR {
-  static Widget build(Map<String, dynamic> desc, [BuildContext? context]) {
+  static Widget build(Map<String, dynamic> desc, [BuildContext? context, void Function(dynamic action)? onAction]) {
     final type = (desc['_w'] ?? desc['type']) as String? ?? '';
 
     // Navigation support: if _navigate is set, wrap the widget in a
@@ -58,12 +61,12 @@ class _WidgetIR {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           mainAxisAlignment: _mainAxis(desc['mainAxisAlignment']),
-          children: _children(desc, context),
+          children: _children(desc, context, onAction),
         );
       case 'Row':
         return Row(
           mainAxisAlignment: _mainAxis(desc['mainAxisAlignment']),
-          children: _children(desc, context),
+          children: _children(desc, context, onAction),
         );
       case 'Container':
         return Container(
@@ -74,38 +77,38 @@ class _WidgetIR {
                   borderRadius: BorderRadius.circular(12),
                 )
               : null,
-          child: _child(desc, context),
+          child: _child(desc, context, onAction),
         );
       case 'Card':
         return Card(
           color: _color(desc['color']),
           elevation: (desc['elevation'] as num?)?.toDouble(),
           child: desc['child'] is Map<String, dynamic>
-              ? build(desc['child'] as Map<String, dynamic>, context)
+              ? build(desc['child'] as Map<String, dynamic>, context, onAction)
               : Padding(
                   padding: _edgeInsets(desc['padding']),
-                  child: _child(desc, context),
+                  child: _child(desc, context, onAction),
                 ),
         );
       case 'Padding':
         return Padding(
           padding: _edgeInsets(desc['padding']),
-          child: _child(desc, context),
+          child: _child(desc, context, onAction),
         );
       case 'Center':
-        return Center(child: _child(desc, context));
+        return Center(child: _child(desc, context, onAction));
       case 'Align':
-        return Align(child: _child(desc));
+        return Align(child: _child(desc, null, onAction));
       case 'SizedBox':
         return SizedBox(
           height: (desc['height'] as num?)?.toDouble(),
           width: (desc['width'] as num?)?.toDouble(),
-          child: _child(desc, context),
+          child: _child(desc, context, onAction),
         );
       case 'Expanded':
         return Expanded(
           flex: (desc['flex'] as int?) ?? 1,
-          child: _child(desc, context) ?? const SizedBox.shrink(),
+          child: _child(desc, context, onAction) ?? const SizedBox.shrink(),
         );
       case 'Text':
         final style = desc['style'] as Map<String, dynamic>?;
@@ -130,13 +133,23 @@ class _WidgetIR {
         );
       case 'ElevatedButton':
         return ElevatedButton(
-          onPressed: () {},
-          child: _child(desc, context),
+          onPressed: () {
+            final action = desc['action'] ?? desc['onPressed'];
+            if (action != null && onAction != null) {
+              onAction(action);
+            }
+          },
+          child: _child(desc, context, onAction),
         );
       case 'TextButton':
         return TextButton(
-          onPressed: () {},
-          child: _child(desc, context) ?? const SizedBox.shrink(),
+          onPressed: () {
+            final action = desc['action'] ?? desc['onPressed'];
+            if (action != null && onAction != null) {
+              onAction(action);
+            }
+          },
+          child: _child(desc, context, onAction) ?? const SizedBox.shrink(),
         );
       case 'Chip':
         return Chip(label: Text(desc['label'] as String? ?? ''));
@@ -151,29 +164,29 @@ class _WidgetIR {
       case 'Opacity':
         return Opacity(
           opacity: (desc['opacity'] as num?)?.toDouble() ?? 1.0,
-          child: _child(desc, context) ?? const SizedBox.shrink(),
+          child: _child(desc, context, onAction) ?? const SizedBox.shrink(),
         );
       case 'ClipRRect':
-        return ClipRRect(child: _child(desc));
+        return ClipRRect(child: _child(desc, null, onAction));
       case 'Wrap':
         return Wrap(
           spacing: _double(desc['spacing']) ?? 0,
           runSpacing: _double(desc['runSpacing']) ?? 0,
-          children: _children(desc, context),
+          children: _children(desc, context, onAction),
         );
       case 'ListTile':
         return ListTile(
           title: desc['title'] is Map<String, dynamic>
-              ? build(desc['title'] as Map<String, dynamic>, context)
+              ? build(desc['title'] as Map<String, dynamic>, context, onAction)
               : null,
           subtitle: desc['subtitle'] is Map<String, dynamic>
-              ? build(desc['subtitle'] as Map<String, dynamic>, context)
+              ? build(desc['subtitle'] as Map<String, dynamic>, context, onAction)
               : null,
           leading: desc['leading'] is Map<String, dynamic>
-              ? build(desc['leading'] as Map<String, dynamic>, context)
+              ? build(desc['leading'] as Map<String, dynamic>, context, onAction)
               : null,
           trailing: desc['trailing'] is Map<String, dynamic>
-              ? build(desc['trailing'] as Map<String, dynamic>, context)
+              ? build(desc['trailing'] as Map<String, dynamic>, context, onAction)
               : null,
         );
       case 'CircularProgressIndicator':
@@ -181,24 +194,24 @@ class _WidgetIR {
       case 'SingleChildScrollView':
         return SingleChildScrollView(
           padding: _edgeInsets(desc['padding']),
-          child: _child(desc, context),
+          child: _child(desc, context, onAction),
         );
       case 'Scaffold':
         return Scaffold(
           appBar: desc['appBar'] is Map<String, dynamic>
               ? PreferredSize(
                   preferredSize: const Size.fromHeight(56),
-                  child: build(desc['appBar'] as Map<String, dynamic>, context),
+                  child: build(desc['appBar'] as Map<String, dynamic>, context, onAction),
                 )
               : null,
           body: desc['body'] is Map<String, dynamic>
-              ? build(desc['body'] as Map<String, dynamic>, context)
+              ? build(desc['body'] as Map<String, dynamic>, context, onAction)
               : null,
         );
       case 'AppBar':
         return AppBar(
           title: desc['title'] is Map<String, dynamic>
-              ? build(desc['title'] as Map<String, dynamic>, context)
+              ? build(desc['title'] as Map<String, dynamic>, context, onAction)
               : desc['title'] is String
                   ? Text(desc['title'] as String)
                   : null,
@@ -233,19 +246,19 @@ class _WidgetIR {
     );
   }
 
-  static Widget? _child(Map<String, dynamic> desc, [BuildContext? ctx]) {
+  static Widget? _child(Map<String, dynamic> desc, [BuildContext? ctx, void Function(dynamic action)? onAction]) {
     final c = desc['child'];
-    if (c is Map<String, dynamic>) return build(c, ctx);
+    if (c is Map<String, dynamic>) return build(c, ctx, onAction);
     return null;
   }
 
   static List<Widget> _children(Map<String, dynamic> desc,
-      [BuildContext? ctx]) {
+      [BuildContext? ctx, void Function(dynamic action)? onAction]) {
     final list = desc['children'] as List<dynamic>?;
     if (list == null) return [];
     return list
         .whereType<Map<String, dynamic>>()
-        .map((d) => build(d, ctx))
+        .map((d) => build(d, ctx, onAction))
         .toList();
   }
 

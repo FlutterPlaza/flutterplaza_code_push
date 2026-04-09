@@ -1,7 +1,6 @@
 import 'dart:async' show Timer;
-import 'dart:convert' show base64Encode, jsonDecode, utf8;
+import 'dart:convert' show base64Encode, jsonDecode, jsonEncode, utf8;
 import 'dart:io' show Directory, File, HttpClient, Platform, exit;
-import 'dart:isolate' show Isolate;
 
 import 'dart:ui' as ui;
 
@@ -157,6 +156,7 @@ abstract final class CodePush {
         return false;
       }
 
+      final patchId = data['patch_id']?.toString();
       final patchUrl = data['patch_url'] as String?;
       if (patchUrl == null || patchUrl.isEmpty) {
         status.value = 'No patch URL';
@@ -199,6 +199,23 @@ abstract final class CodePush {
           }
           status.value = 'Loading module...';
           final rawResult = await ui.codePushLoadModule(Uint8List.fromList(payload));
+
+          // If the engine returns null/false, the module failed to load
+          // (bad bytecode, version mismatch, verification failure).
+          // Delete the patch immediately instead of waiting for 3-boot
+          // auto-rollback.
+          if (rawResult == null || rawResult == false) {
+            status.value = 'Module load failed — rolling back patch';
+            await _iosImmediateRollback(
+              serverUrl: serverUrl,
+              appId: appId,
+              patchId: patchId,
+              errorMessage:
+                  'loadDynamicModule returned ${rawResult ?? "null"} — deleted immediately',
+            );
+            return false;
+          }
+
           // Module loaded live — no restart needed on iOS.
           // Auto-parse JSON strings into Map/List for structured data.
           Object? result = rawResult;
@@ -216,11 +233,16 @@ abstract final class CodePush {
           status.value = 'Patch active';
           return true;
         } catch (e) {
-          status.value = 'Module error: $e';
-          // Report failure — do NOT prompt restart on module load errors,
-          // as the patch may be corrupt. The boot counter will eventually
-          // trigger auto-rollback if this keeps happening.
-          _reportLaunchFailure();
+          status.value = 'Module error: $e — rolling back patch';
+          // Patch is bad (corrupt bytecode, exception during load, etc.).
+          // Delete immediately instead of retrying for 3 boots.
+          await _iosImmediateRollback(
+            serverUrl: serverUrl,
+            appId: appId,
+            patchId: patchId,
+            errorMessage:
+                'loadDynamicModule threw $e — deleted immediately',
+          );
           return false;
         }
       } else {
@@ -353,6 +375,43 @@ abstract final class CodePush {
         '';
   }
 
+  /// Downloads and applies the latest patch from the engine.
+  ///
+  /// Throws [CodePushException] if the download or application fails.
+  static Future<void> downloadAndApply() async {
+    final result =
+        await _channel.invokeMethod<bool>('CodePush.downloadAndApply');
+    if (result != true) {
+      throw CodePushException('Failed to download and apply patch.');
+    }
+  }
+
+  /// Removes old patch files, returning the number of patches removed.
+  static Future<int> cleanupOldPatches() async {
+    return await _channel.invokeMethod<int>('CodePush.cleanupOldPatches') ?? 0;
+  }
+
+  /// Returns the number of installed patches.
+  static Future<int> get patchCount async {
+    return await _channel.invokeMethod<int>('CodePush.getPatchCount') ?? 0;
+  }
+
+  /// Periodically checks for updates and calls [onUpdateAvailable] when one
+  /// is found. Returns a [Timer] that can be cancelled to stop checking.
+  static Timer checkForUpdatePeriodically({
+    required Duration interval,
+    required void Function(UpdateInfo update) onUpdateAvailable,
+  }) {
+    return Timer.periodic(interval, (_) async {
+      try {
+        final info = await checkForUpdate();
+        if (info.isUpdateAvailable) {
+          onUpdateAvailable(info);
+        }
+      } catch (_) {}
+    });
+  }
+
   // ── Private helpers ─────────────────────────────────────────────
 
   /// iOS-only: write patch directly from Dart to bypass engine C++ file I/O
@@ -434,11 +493,51 @@ abstract final class CodePush {
     }
   }
 
-  /// Reports a failed launch to the engine.
-  static Future<void> _reportLaunchFailure() async {
+  /// iOS-only: immediately deletes the patch and reports failure to the server
+  /// when [ui.codePushLoadModule] fails. This avoids waiting for the 3-boot
+  /// auto-rollback threshold — the bad patch is removed on first attempt.
+  static Future<void> _iosImmediateRollback({
+    required String serverUrl,
+    required String appId,
+    required String? patchId,
+    required String errorMessage,
+  }) async {
+    // 1. Delete the patch files from disk.
     try {
-      await _channel.invokeMethod<dynamic>('CodePush.reportLaunchFailure');
+      final patchDir = await _getPatchDir();
+      if (patchDir != null) {
+        final patchFile = File('$patchDir/patch.vmcode');
+        if (await patchFile.exists()) await patchFile.delete();
+        final infoFile = File('$patchDir/patch_info.json');
+        if (await infoFile.exists()) await infoFile.delete();
+        _iosResetBootCounter(patchDir);
+      }
+    } catch (_) {
+      // Never crash the app over cleanup — engine rollback is the safety net.
+    }
+
+    // 2. Tell the engine to reset its internal state / boot counter.
+    try {
+      await _channel.invokeMethod<dynamic>('CodePush.rollback');
     } catch (_) {}
+
+    // 3. Reset in-memory module state so the app runs on baseline.
+    _moduleLoaded = false;
+    _lastModuleResult = null;
+    moduleResult.value = null;
+
+    // 4. Report the failure to the server (fire-and-forget).
+    try {
+      await _httpPostJson('$serverUrl/api/v1/telemetry/device-report', {
+        'app_id': appId,
+        'patch_id': patchId,
+        'success': false,
+        'platform': 'ios',
+        'error_message': errorMessage,
+      });
+    } catch (_) {
+      // Telemetry is best-effort — never block the app.
+    }
   }
 
   // ── iOS-only boot counter (Dart-side, since engine updater is disabled) ──
@@ -804,6 +903,23 @@ Future<_HttpResult> _httpGetBytes(String url) async {
     final bytes = await response.fold<List<int>>(
         <int>[], (prev, chunk) => prev..addAll(chunk));
     return _HttpResult(response.statusCode, '', bytes);
+  } finally {
+    client.close();
+  }
+}
+
+Future<_HttpResult> _httpPostJson(String url, Map<String, dynamic> body) async {
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+  try {
+    final request = await client.postUrl(Uri.parse(url));
+    request.headers.set('Content-Type', 'application/json');
+    final encoded = utf8.encode(jsonEncode(body));
+    request.contentLength = encoded.length;
+    request.add(encoded);
+    final response = await request.close();
+    final bytes = await response.fold<List<int>>(
+        <int>[], (prev, chunk) => prev..addAll(chunk));
+    return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
     client.close();
   }

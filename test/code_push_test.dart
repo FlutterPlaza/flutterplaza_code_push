@@ -8,7 +8,7 @@ import 'package:flutterplaza_code_push/flutterplaza_code_push.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  const channel = MethodChannel('flutter/codepush');
+  const channel = MethodChannel('flutter/codepush', JSONMethodCodec());
   late List<MethodCall> log;
 
   setUp(() {

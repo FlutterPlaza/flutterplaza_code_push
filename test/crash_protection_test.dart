@@ -58,6 +58,25 @@ bool _checkAndAutoRollback(String patchDir) {
 }
 
 // ---------------------------------------------------------------------------
+// Replica of immediate rollback file cleanup (mirrors _iosImmediateRollback)
+// ---------------------------------------------------------------------------
+
+/// Simulates the file-cleanup portion of _iosImmediateRollback.
+/// In production, this also calls CodePush.rollback (platform channel) and
+/// POSTs telemetry to the server. Here we only test the filesystem behaviour.
+Future<void> _immediateRollback(String patchDir) async {
+  try {
+    final patchFile = File('$patchDir/patch.vmcode');
+    if (await patchFile.exists()) await patchFile.delete();
+    final infoFile = File('$patchDir/patch_info.json');
+    if (await infoFile.exists()) await infoFile.delete();
+    _resetBootCounter(patchDir);
+  } catch (_) {
+    // Never crash the app over cleanup.
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -352,6 +371,90 @@ void main() {
       expect(_checkAndAutoRollback(patchDir), isFalse);
       expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
       expect(_readBootCounter(patchDir), 1);
+    });
+  });
+
+  // ── iOS immediate rollback on load failure ──────────────────────────
+
+  group('iOS immediate rollback (load failure)', () {
+    test('deletes patch.vmcode on first failed load attempt', () async {
+      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      _writeBootCounter(patchDir, 1); // Only 1 boot — below 3-boot threshold.
+
+      await _immediateRollback(patchDir);
+
+      // Patch deleted immediately — no need to wait for 3 boots.
+      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(_readBootCounter(patchDir), 0);
+    });
+
+    test('deletes patch_info.json alongside patch.vmcode', () async {
+      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      File('$patchDir/patch_info.json').writeAsStringSync('{"v":"1.0"}');
+
+      await _immediateRollback(patchDir);
+
+      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch_info.json').existsSync(), isFalse);
+    });
+
+    test('resets boot counter to 0', () async {
+      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      _writeBootCounter(patchDir, 2);
+
+      await _immediateRollback(patchDir);
+
+      expect(_readBootCounter(patchDir), 0);
+    });
+
+    test('handles missing patch.vmcode gracefully', () async {
+      // No patch file on disk — cleanup should not throw.
+      _writeBootCounter(patchDir, 1);
+
+      await _immediateRollback(patchDir);
+
+      expect(_readBootCounter(patchDir), 0);
+    });
+
+    test('handles missing patch_info.json gracefully', () async {
+      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      // No patch_info.json.
+
+      await _immediateRollback(patchDir);
+
+      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+    });
+
+    test('after immediate rollback, new patch can be installed fresh', () async {
+      // Bad patch triggers immediate rollback.
+      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      _writeBootCounter(patchDir, 1);
+      await _immediateRollback(patchDir);
+
+      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(_readBootCounter(patchDir), 0);
+
+      // New (good) patch is installed — counter starts fresh.
+      File('$patchDir/patch.vmcode').writeAsBytesSync([0x60, 0x0D]);
+      _incrementBootCounter(patchDir);
+      expect(_readBootCounter(patchDir), 1);
+      expect(_checkAndAutoRollback(patchDir), isFalse);
+      expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
+    });
+
+    test('immediate rollback is faster than 3-boot auto-rollback', () async {
+      // Demonstrate the key difference: auto-rollback needs 3 boots,
+      // immediate rollback acts on first failure.
+      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      _writeBootCounter(patchDir, 0);
+
+      // Auto-rollback would NOT act here (counter below threshold).
+      expect(_checkAndAutoRollback(patchDir), isFalse);
+      expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
+
+      // Immediate rollback DOES act.
+      await _immediateRollback(patchDir);
+      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
     });
   });
 }

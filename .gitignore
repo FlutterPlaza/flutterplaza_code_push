@@ -1,0 +1,16 @@
+# Dart/Flutter generated
+.dart_tool/
+build/
+.packages
+pubspec.lock
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+
+# Environment
+.env
