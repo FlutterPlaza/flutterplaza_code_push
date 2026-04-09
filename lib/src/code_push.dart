@@ -319,13 +319,32 @@ abstract final class CodePush {
   }
 
   /// Rolls back to the previous version by removing the active patch.
-  /// Takes effect on next cold restart.
+  /// Takes effect on next cold restart. On iOS (where the engine updater
+  /// is disabled), removes the patch file directly from Dart.
   static Future<void> rollback() async {
-    final bool? success =
-        await _channel.invokeMethod<bool>('CodePush.rollback');
-    if (success != true) {
-      throw CodePushException('Failed to roll back patch.');
+    // Try engine-side rollback first (works on Android/desktop).
+    try {
+      final bool? success =
+          await _channel.invokeMethod<bool>('CodePush.rollback');
+      if (success == true) return;
+    } catch (_) {}
+
+    // Dart-side rollback for iOS (engine updater is null).
+    final patchDir = await _getPatchDir();
+    if (patchDir == null) {
+      throw CodePushException('No patch directory configured.');
     }
+    final patchFile = File('$patchDir/patch.vmcode');
+    if (!patchFile.existsSync()) {
+      throw CodePushException('No active patch to roll back.');
+    }
+    patchFile.deleteSync();
+    final infoFile = File('$patchDir/patch_info.json');
+    if (infoFile.existsSync()) infoFile.deleteSync();
+    _iosResetBootCounter(patchDir);
+    _moduleLoaded = false;
+    _lastModuleResult = null;
+    moduleResult.value = null;
   }
 
   /// Returns the release version string from the engine config.

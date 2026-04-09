@@ -25,7 +25,7 @@ class CodePushWidgetArea extends StatelessWidget {
       valueListenable: CodePush.moduleResult,
       builder: (context, result, _) {
         if (result is Map<String, dynamic>) {
-          return _WidgetIR.build(result);
+          return _WidgetIR.build(result, context);
         }
         if (result is String && result.isNotEmpty) {
           return Text(result);
@@ -42,20 +42,28 @@ class CodePushWidgetArea extends StatelessWidget {
 /// The IR uses `_w` to identify widget types and mirrors the constructor
 /// parameters defined in the server's widget registry.
 class _WidgetIR {
-  static Widget build(Map<String, dynamic> desc) {
+  static Widget build(Map<String, dynamic> desc, [BuildContext? context]) {
     final type = (desc['_w'] ?? desc['type']) as String? ?? '';
+
+    // Navigation support: if _navigate is set, wrap the widget in a
+    // tap handler that pushes a new page with the target widget tree.
+    final navigate = desc['_navigate'] as Map<String, dynamic>?;
+    if (navigate != null && context != null) {
+      return _wrapNavigation(desc, navigate, context);
+    }
+
     switch (type) {
       case 'Column':
         return Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           mainAxisAlignment: _mainAxis(desc['mainAxisAlignment']),
-          children: _children(desc),
+          children: _children(desc, context),
         );
       case 'Row':
         return Row(
           mainAxisAlignment: _mainAxis(desc['mainAxisAlignment']),
-          children: _children(desc),
+          children: _children(desc, context),
         );
       case 'Container':
         return Container(
@@ -66,38 +74,38 @@ class _WidgetIR {
                   borderRadius: BorderRadius.circular(12),
                 )
               : null,
-          child: _child(desc),
+          child: _child(desc, context),
         );
       case 'Card':
         return Card(
           color: _color(desc['color']),
           elevation: (desc['elevation'] as num?)?.toDouble(),
           child: desc['child'] is Map<String, dynamic>
-              ? build(desc['child'] as Map<String, dynamic>)
+              ? build(desc['child'] as Map<String, dynamic>, context)
               : Padding(
                   padding: _edgeInsets(desc['padding']),
-                  child: _child(desc),
+                  child: _child(desc, context),
                 ),
         );
       case 'Padding':
         return Padding(
           padding: _edgeInsets(desc['padding']),
-          child: _child(desc),
+          child: _child(desc, context),
         );
       case 'Center':
-        return Center(child: _child(desc));
+        return Center(child: _child(desc, context));
       case 'Align':
         return Align(child: _child(desc));
       case 'SizedBox':
         return SizedBox(
           height: (desc['height'] as num?)?.toDouble(),
           width: (desc['width'] as num?)?.toDouble(),
-          child: _child(desc),
+          child: _child(desc, context),
         );
       case 'Expanded':
         return Expanded(
           flex: (desc['flex'] as int?) ?? 1,
-          child: _child(desc) ?? const SizedBox.shrink(),
+          child: _child(desc, context) ?? const SizedBox.shrink(),
         );
       case 'Text':
         final style = desc['style'] as Map<String, dynamic>?;
@@ -123,12 +131,12 @@ class _WidgetIR {
       case 'ElevatedButton':
         return ElevatedButton(
           onPressed: () {},
-          child: _child(desc),
+          child: _child(desc, context),
         );
       case 'TextButton':
         return TextButton(
           onPressed: () {},
-          child: _child(desc) ?? const SizedBox.shrink(),
+          child: _child(desc, context) ?? const SizedBox.shrink(),
         );
       case 'Chip':
         return Chip(label: Text(desc['label'] as String? ?? ''));
@@ -143,7 +151,7 @@ class _WidgetIR {
       case 'Opacity':
         return Opacity(
           opacity: (desc['opacity'] as num?)?.toDouble() ?? 1.0,
-          child: _child(desc) ?? const SizedBox.shrink(),
+          child: _child(desc, context) ?? const SizedBox.shrink(),
         );
       case 'ClipRRect':
         return ClipRRect(child: _child(desc));
@@ -151,21 +159,21 @@ class _WidgetIR {
         return Wrap(
           spacing: _double(desc['spacing']) ?? 0,
           runSpacing: _double(desc['runSpacing']) ?? 0,
-          children: _children(desc),
+          children: _children(desc, context),
         );
       case 'ListTile':
         return ListTile(
           title: desc['title'] is Map<String, dynamic>
-              ? build(desc['title'] as Map<String, dynamic>)
+              ? build(desc['title'] as Map<String, dynamic>, context)
               : null,
           subtitle: desc['subtitle'] is Map<String, dynamic>
-              ? build(desc['subtitle'] as Map<String, dynamic>)
+              ? build(desc['subtitle'] as Map<String, dynamic>, context)
               : null,
           leading: desc['leading'] is Map<String, dynamic>
-              ? build(desc['leading'] as Map<String, dynamic>)
+              ? build(desc['leading'] as Map<String, dynamic>, context)
               : null,
           trailing: desc['trailing'] is Map<String, dynamic>
-              ? build(desc['trailing'] as Map<String, dynamic>)
+              ? build(desc['trailing'] as Map<String, dynamic>, context)
               : null,
         );
       case 'CircularProgressIndicator':
@@ -173,24 +181,24 @@ class _WidgetIR {
       case 'SingleChildScrollView':
         return SingleChildScrollView(
           padding: _edgeInsets(desc['padding']),
-          child: _child(desc),
+          child: _child(desc, context),
         );
       case 'Scaffold':
         return Scaffold(
           appBar: desc['appBar'] is Map<String, dynamic>
               ? PreferredSize(
                   preferredSize: const Size.fromHeight(56),
-                  child: build(desc['appBar'] as Map<String, dynamic>),
+                  child: build(desc['appBar'] as Map<String, dynamic>, context),
                 )
               : null,
           body: desc['body'] is Map<String, dynamic>
-              ? build(desc['body'] as Map<String, dynamic>)
+              ? build(desc['body'] as Map<String, dynamic>, context)
               : null,
         );
       case 'AppBar':
         return AppBar(
           title: desc['title'] is Map<String, dynamic>
-              ? build(desc['title'] as Map<String, dynamic>)
+              ? build(desc['title'] as Map<String, dynamic>, context)
               : desc['title'] is String
                   ? Text(desc['title'] as String)
                   : null,
@@ -204,16 +212,41 @@ class _WidgetIR {
 
   // ── Helpers ──────────────────────────────────────────────────────
 
-  static Widget? _child(Map<String, dynamic> desc) {
+  static Widget _wrapNavigation(
+    Map<String, dynamic> desc,
+    Map<String, dynamic> navigate,
+    BuildContext context,
+  ) {
+    // Build the widget without _navigate to avoid infinite recursion.
+    final cleanDesc = Map<String, dynamic>.from(desc)..remove('_navigate');
+    final child = build(cleanDesc, context);
+
+    return GestureDetector(
+      onTap: () {
+        Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => _NavigatedPage(widgetIR: navigate),
+          ),
+        );
+      },
+      child: child,
+    );
+  }
+
+  static Widget? _child(Map<String, dynamic> desc, [BuildContext? ctx]) {
     final c = desc['child'];
-    if (c is Map<String, dynamic>) return build(c);
+    if (c is Map<String, dynamic>) return build(c, ctx);
     return null;
   }
 
-  static List<Widget> _children(Map<String, dynamic> desc) {
+  static List<Widget> _children(Map<String, dynamic> desc,
+      [BuildContext? ctx]) {
     final list = desc['children'] as List<dynamic>?;
     if (list == null) return [];
-    return list.whereType<Map<String, dynamic>>().map(build).toList();
+    return list
+        .whereType<Map<String, dynamic>>()
+        .map((d) => build(d, ctx))
+        .toList();
   }
 
   static Color? _color(dynamic value) {
@@ -327,5 +360,33 @@ class _WidgetIR {
       default:
         return Icons.help_outline;
     }
+  }
+}
+
+/// A page pushed by the `_navigate` IR action.
+class _NavigatedPage extends StatelessWidget {
+  const _NavigatedPage({required this.widgetIR});
+
+  final Map<String, dynamic> widgetIR;
+
+  @override
+  Widget build(BuildContext context) {
+    // If the IR is a Scaffold, render it directly.
+    // Otherwise wrap in a Scaffold with a back button.
+    final type = (widgetIR['_w'] ?? widgetIR['type']) as String?;
+    if (type == 'Scaffold') {
+      return _WidgetIR.build(widgetIR, context);
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          (widgetIR['_title'] as String?) ?? 'Details',
+        ),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: _WidgetIR.build(widgetIR, context),
+      ),
+    );
   }
 }
