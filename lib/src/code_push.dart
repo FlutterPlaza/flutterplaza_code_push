@@ -324,7 +324,15 @@ abstract final class CodePush {
           final payloadOffset = offsetBytes.getUint32(12, Endian.little);
           final payload = patchBytes.sublist(payloadOffset);
 
-          // Check if payload is ELF (can't load on iOS) or bytecode
+          // Format guard: the Dart VM's dynamic module loader
+          // ONLY accepts Dart kernel files (magic 90 AB CD EF).
+          // Anything else — ELF, Mach-O, random bytes — either
+          // returns a soft failure (we handle with rollback) or
+          // aborts the VM inside DN_Internal_loadDynamicModule
+          // with SIGABRT and no recoverable error. We guard the
+          // two most likely wrong-format cases explicitly so the
+          // user gets a clear diagnostic instead of a process
+          // kill.
           final isELF = payload.length > 4 &&
               payload[0] == 0x7f &&
               payload[1] == 0x45 &&
@@ -336,6 +344,41 @@ abstract final class CodePush {
             onUpdateReady?.call();
             return true;
           }
+
+          // Defensive: reject Mach-O explicitly. This is what older
+          // flutter_compile CLIs (< 0.19.11) incorrectly shipped as
+          // iOS patches — the baseline's App.framework/App Mach-O
+          // binary. Passing it to `ui.codePushLoadModule` aborts
+          // the VM. Devices on a new SDK running against an old CLI
+          // get a clear diagnostic + immediate rollback instead of
+          // an unrecoverable crash loop.
+          final isMachO = payload.length > 4 &&
+              ((payload[0] == 0xfe &&
+                      payload[1] == 0xed &&
+                      payload[2] == 0xfa &&
+                      payload[3] == 0xcf) ||
+                  (payload[0] == 0xcf &&
+                      payload[1] == 0xfa &&
+                      payload[2] == 0xed &&
+                      payload[3] == 0xfe));
+          if (isMachO) {
+            final magicHex = payload
+                .take(4)
+                .map((b) => b.toRadixString(16).padLeft(2, '0'))
+                .join('');
+            status.value = 'Patch is Mach-O (magic $magicHex) — expected Dart '
+                'kernel. Upgrade flutter_compile to 0.19.11+ and '
+                'rebuild the patch.';
+            await _iosImmediateRollback(
+              serverUrl: serverUrl,
+              appId: appId,
+              patchId: patchId,
+              errorMessage: 'Patch is Mach-O (0x$magicHex) not Dart kernel — '
+                  'rejected before loadDynamicModule',
+            );
+            return false;
+          }
+
           status.value = 'Loading module...';
           // `codePushLoadModule` is a runtime hook added by the custom
           // code-push-enabled Flutter engine. It does not exist on the
