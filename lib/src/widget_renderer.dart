@@ -45,7 +45,8 @@ class CodePushWidgetArea extends StatelessWidget {
 /// The IR uses `_w` to identify widget types and mirrors the constructor
 /// parameters defined in the server's widget registry.
 class _WidgetIR {
-  static Widget build(Map<String, dynamic> desc, [BuildContext? context, void Function(dynamic action)? onAction]) {
+  static Widget build(Map<String, dynamic> desc,
+      [BuildContext? context, void Function(dynamic action)? onAction]) {
     final type = (desc['_w'] ?? desc['type']) as String? ?? '';
 
     // Navigation support: if _navigate is set, wrap the widget in a
@@ -118,10 +119,9 @@ class _WidgetIR {
           maxLines: desc['maxLines'] as int?,
           style: TextStyle(
             fontSize: _double(style?['fontSize'] ?? desc['fontSize']),
-            fontWeight:
-                (style?['fontWeight'] ?? desc['fontWeight']) == 'bold'
-                    ? FontWeight.bold
-                    : null,
+            fontWeight: (style?['fontWeight'] ?? desc['fontWeight']) == 'bold'
+                ? FontWeight.bold
+                : null,
             color: _color(style?['color'] ?? desc['color']),
           ),
         );
@@ -180,13 +180,16 @@ class _WidgetIR {
               ? build(desc['title'] as Map<String, dynamic>, context, onAction)
               : null,
           subtitle: desc['subtitle'] is Map<String, dynamic>
-              ? build(desc['subtitle'] as Map<String, dynamic>, context, onAction)
+              ? build(
+                  desc['subtitle'] as Map<String, dynamic>, context, onAction)
               : null,
           leading: desc['leading'] is Map<String, dynamic>
-              ? build(desc['leading'] as Map<String, dynamic>, context, onAction)
+              ? build(
+                  desc['leading'] as Map<String, dynamic>, context, onAction)
               : null,
           trailing: desc['trailing'] is Map<String, dynamic>
-              ? build(desc['trailing'] as Map<String, dynamic>, context, onAction)
+              ? build(
+                  desc['trailing'] as Map<String, dynamic>, context, onAction)
               : null,
         );
       case 'CircularProgressIndicator':
@@ -201,7 +204,8 @@ class _WidgetIR {
           appBar: desc['appBar'] is Map<String, dynamic>
               ? PreferredSize(
                   preferredSize: const Size.fromHeight(56),
-                  child: build(desc['appBar'] as Map<String, dynamic>, context, onAction),
+                  child: build(desc['appBar'] as Map<String, dynamic>, context,
+                      onAction),
                 )
               : null,
           body: desc['body'] is Map<String, dynamic>
@@ -246,7 +250,8 @@ class _WidgetIR {
     );
   }
 
-  static Widget? _child(Map<String, dynamic> desc, [BuildContext? ctx, void Function(dynamic action)? onAction]) {
+  static Widget? _child(Map<String, dynamic> desc,
+      [BuildContext? ctx, void Function(dynamic action)? onAction]) {
     final c = desc['child'];
     if (c is Map<String, dynamic>) return build(c, ctx, onAction);
     return null;

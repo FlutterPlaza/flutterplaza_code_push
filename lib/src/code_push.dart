@@ -163,6 +163,56 @@ abstract final class CodePush {
         return false;
       }
 
+      // ── Baseline compatibility guard ────────────────────────────
+      //
+      // Before touching any bytes, verify that the running Flutter
+      // engine is the code-push-enabled variant and — if the server
+      // supplies an `engine_fingerprint` — that the patch was compiled
+      // for the same Flutter SDK version.
+      //
+      // Without this guard, loading a patch onto a baseline that was
+      // built with a stock Flutter engine SIGSEGVs inside the Dart VM
+      // (`DRT_AllocateObject` reading from `0x10`) because the AOT
+      // snapshot's class layout disagrees with the running VM. The
+      // crash is a release-mode null deref with no user-visible
+      // diagnostic — the app just dies on the next allocation.
+      final actualEngineFingerprint = await _probeEngineFingerprint();
+      final expectedEngineFingerprint = data['engine_fingerprint'] as String?;
+
+      if (actualEngineFingerprint == null) {
+        status.value = 'Incompatible baseline: engine has no code push support';
+        await _reportIncompatibleBaseline(
+          serverUrl: serverUrl,
+          appId: appId,
+          patchId: patchId,
+          reason: 'Engine has no code push support (stock Flutter engine '
+              'or missing flutter/codepush method channel).',
+          expectedFingerprint: expectedEngineFingerprint,
+          actualFingerprint: null,
+        );
+        return false;
+      }
+
+      // Phase 2 defense-in-depth: only compare when both sides supply
+      // a fingerprint. Older servers don't send one; older engines
+      // don't expose one. Either null short-circuits to the Phase 1
+      // "engine is present" check that already succeeded above.
+      if (expectedEngineFingerprint != null &&
+          actualEngineFingerprint != 'unknown' &&
+          expectedEngineFingerprint != actualEngineFingerprint) {
+        status.value = 'Incompatible baseline: engine ABI mismatch '
+            '($actualEngineFingerprint vs $expectedEngineFingerprint)';
+        await _reportIncompatibleBaseline(
+          serverUrl: serverUrl,
+          appId: appId,
+          patchId: patchId,
+          reason: 'Engine ABI mismatch',
+          expectedFingerprint: expectedEngineFingerprint,
+          actualFingerprint: actualEngineFingerprint,
+        );
+        return false;
+      }
+
       status.value = 'Downloading patch...';
       final dlR = await _httpGetBytes(patchUrl);
       if (dlR.statusCode != 200) {
@@ -190,15 +240,26 @@ abstract final class CodePush {
 
           // Check if payload is ELF (can't load on iOS) or bytecode
           final isELF = payload.length > 4 &&
-              payload[0] == 0x7f && payload[1] == 0x45 &&
-              payload[2] == 0x4c && payload[3] == 0x46;
+              payload[0] == 0x7f &&
+              payload[1] == 0x45 &&
+              payload[2] == 0x4c &&
+              payload[3] == 0x46;
           if (isELF) {
-            status.value = 'Patch is ELF (needs bytecode for iOS). Restart required.';
+            status.value =
+                'Patch is ELF (needs bytecode for iOS). Restart required.';
             onUpdateReady?.call();
             return true;
           }
           status.value = 'Loading module...';
-          final rawResult = await ui.codePushLoadModule(Uint8List.fromList(payload));
+          // `codePushLoadModule` is a runtime hook added by the custom
+          // code-push-enabled Flutter engine. It does not exist on the
+          // stock `dart:ui`, so the static analyzer can't see it. The
+          // presence check at the top of checkAndInstall
+          // (`_probeEngineFingerprint`) guarantees we only reach this
+          // point on an engine that actually exposes the hook.
+          final rawResult = await ui
+              // ignore: undefined_function
+              .codePushLoadModule(Uint8List.fromList(payload));
 
           // If the engine returns null/false, the module failed to load
           // (bad bytecode, version mismatch, verification failure).
@@ -240,8 +301,7 @@ abstract final class CodePush {
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            errorMessage:
-                'loadDynamicModule threw $e — deleted immediately',
+            errorMessage: 'loadDynamicModule threw $e — deleted immediately',
           );
           return false;
         }
@@ -264,6 +324,106 @@ abstract final class CodePush {
   /// This is the only way to apply a patch — warm resumes don't
   /// re-initialize the Dart VM.
   static void restart() => exit(0);
+
+  // ── Baseline compatibility ──────────────────────────────────────
+
+  /// Whether the running Flutter engine has code push support.
+  ///
+  /// Returns `true` only if the `flutter/codepush` method channel is
+  /// registered and responds to a cheap probe within 2 seconds. On a
+  /// stock Flutter engine the channel has no handler and the probe
+  /// either throws [MissingPluginException] or times out — both map
+  /// to `false`.
+  ///
+  /// The SDK uses this internally before loading any downloaded patch
+  /// to prevent the `DRT_AllocateObject` SIGSEGV that occurs when an
+  /// AOT snapshot's class layout disagrees with the running VM. Apps
+  /// can also call it directly to hide "check for updates" UI on
+  /// devices that don't have a code-push-enabled baseline installed.
+  static Future<bool> get hasCodePushEngine async {
+    return (await _probeEngineFingerprint()) != null;
+  }
+
+  /// Probes the running engine for its code push compatibility
+  /// fingerprint.
+  ///
+  /// Returns:
+  ///   * A fingerprint string if the engine exposes a
+  ///     `CodePush.getEngineAbi` handler (future code-push engines).
+  ///   * The literal string `"unknown"` if the engine has code push
+  ///     support but does not expose an ABI probe yet — still enough
+  ///     to satisfy the Phase 1 "engine is present" check.
+  ///   * `null` if the engine has no code push support at all (no
+  ///     handler on the channel, or the probe times out).
+  ///
+  /// The implementation tries `CodePush.getEngineAbi` first (Phase 2
+  /// ABI match), then falls back to `CodePush.getReleaseVersion`
+  /// which has been on every code-push engine since the first
+  /// release (Phase 1 presence check). Both calls are bounded with a
+  /// 2-second timeout so a misbehaving channel can't wedge the SDK.
+  static Future<String?> _probeEngineFingerprint() async {
+    // Phase 2 probe — new engines can expose a real ABI string.
+    try {
+      final abi = await _channel
+          .invokeMethod<String>('CodePush.getEngineAbi')
+          .timeout(const Duration(seconds: 2));
+      if (abi != null && abi.isNotEmpty) return abi;
+    } catch (_) {
+      // Fall through to Phase 1 probe — engine may be older.
+    }
+
+    // Phase 1 probe — "is a code-push engine present at all?".
+    // getReleaseVersion has existed on every code-push engine build
+    // and is cheap (just reads an NSDictionary entry / Java field).
+    try {
+      await _channel
+          .invokeMethod<String>('CodePush.getReleaseVersion')
+          .timeout(const Duration(seconds: 2));
+      return 'unknown';
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Best-effort telemetry POST to let the server know a device was
+  /// stranded on an incompatible baseline. Swallows every error so
+  /// telemetry failure can never cascade into an app crash — this is
+  /// already the unhappy path.
+  static Future<void> _reportIncompatibleBaseline({
+    required String serverUrl,
+    required String appId,
+    required String? patchId,
+    required String reason,
+    required String? expectedFingerprint,
+    required String? actualFingerprint,
+  }) async {
+    try {
+      final payload = <String, dynamic>{
+        'app_id': appId,
+        'kind': 'incompatible_baseline',
+        'reason': reason,
+        'platform': _platform,
+        if (patchId != null) 'patch_id': patchId,
+        if (expectedFingerprint != null)
+          'expected_engine_fingerprint': expectedFingerprint,
+        if (actualFingerprint != null)
+          'actual_engine_fingerprint': actualFingerprint,
+      };
+      final client = HttpClient();
+      try {
+        final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
+        final req =
+            await client.postUrl(uri).timeout(const Duration(seconds: 5));
+        req.headers.set('Content-Type', 'application/json');
+        req.write(jsonEncode(payload));
+        await req.close().timeout(const Duration(seconds: 5));
+      } finally {
+        client.close(force: true);
+      }
+    } catch (_) {
+      // Telemetry is best-effort. Never crash over it.
+    }
+  }
 
   // ── Low-level engine API ────────────────────────────────────────
 
@@ -418,7 +578,8 @@ abstract final class CodePush {
   /// which breaks Apple Clang LTO.
   static Future<void> _installPatchFromDart(Uint8List patchBytes) async {
     // Ask the engine for its configured patch directory path.
-    final patchDir = await _channel.invokeMethod<String>('CodePush.getPatchDir');
+    final patchDir =
+        await _channel.invokeMethod<String>('CodePush.getPatchDir');
     if (patchDir == null || patchDir.isEmpty) {
       throw CodePushException('Engine returned no patch directory.');
     }
@@ -667,8 +828,9 @@ class CodePushOverlay extends StatefulWidget {
 
   /// Optional custom banner builder. If null, uses the default banner.
   /// Return `null` to hide the banner.
-  final Widget Function(BuildContext context, VoidCallback onRestart,
-      VoidCallback onDismiss)? bannerBuilder;
+  final Widget Function(
+          BuildContext context, VoidCallback onRestart, VoidCallback onDismiss)?
+      bannerBuilder;
 
   /// Whether to show the debug status bar at the top. Defaults to false.
   final bool showDebugBar;
@@ -750,27 +912,30 @@ class _CodePushOverlayState extends State<CodePushOverlay>
                     color: const Color(0xFF1A237E),
                     padding: const EdgeInsets.fromLTRB(12, 50, 12, 6),
                     child: Text('CP: $status',
-                        style: const TextStyle(color: Colors.white, fontSize: 11, decoration: TextDecoration.none)),
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 11,
+                            decoration: TextDecoration.none)),
                   ),
                 ),
               ),
             ),
           if (_updateReady)
-          Positioned(
-            left: 16,
-            right: 16,
-            bottom: MediaQuery.of(context).padding.bottom + 16,
-            child: widget.bannerBuilder != null
-                ? widget.bannerBuilder!(
-                    context,
-                    CodePush.restart,
-                    () => setState(() => _updateReady = false),
-                  )!
-                : _DefaultUpdateBanner(
-                    onRestart: CodePush.restart,
-                    onDismiss: () => setState(() => _updateReady = false),
-                  ),
-          ),
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: MediaQuery.of(context).padding.bottom + 16,
+              child: widget.bannerBuilder != null
+                  ? widget.bannerBuilder!(
+                      context,
+                      CodePush.restart,
+                      () => setState(() => _updateReady = false),
+                    )!
+                  : _DefaultUpdateBanner(
+                      onRestart: CodePush.restart,
+                      onDismiss: () => setState(() => _updateReady = false),
+                    ),
+            ),
         ],
       ),
     );
@@ -848,7 +1013,8 @@ class CodePushPatchBuilder extends StatelessWidget {
   final String? patchKey;
 
   /// Builder called with the patch data string (or null if no patch).
-  final Widget Function(BuildContext context, String? patchData, Widget? child) builder;
+  final Widget Function(BuildContext context, String? patchData, Widget? child)
+      builder;
 
   /// Optional child widget passed to the builder (typically the default/baseline UI).
   final Widget? child;
@@ -861,7 +1027,8 @@ class CodePushPatchBuilder extends StatelessWidget {
         if (result is String && result.isNotEmpty) {
           if (patchKey != null) {
             if (result.startsWith('$patchKey:')) {
-              return builder(context, result.substring(patchKey!.length + 1), child);
+              return builder(
+                  context, result.substring(patchKey!.length + 1), child);
             }
             return builder(context, null, child);
           }
@@ -887,8 +1054,8 @@ Future<_HttpResult> _httpGet(String url) async {
   try {
     final request = await client.getUrl(Uri.parse(url));
     final response = await request.close();
-    final bytes = await response.fold<List<int>>(
-        <int>[], (prev, chunk) => prev..addAll(chunk));
+    final bytes = await response
+        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
     client.close();
@@ -900,8 +1067,8 @@ Future<_HttpResult> _httpGetBytes(String url) async {
   try {
     final request = await client.getUrl(Uri.parse(url));
     final response = await request.close();
-    final bytes = await response.fold<List<int>>(
-        <int>[], (prev, chunk) => prev..addAll(chunk));
+    final bytes = await response
+        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
     return _HttpResult(response.statusCode, '', bytes);
   } finally {
     client.close();
@@ -917,8 +1084,8 @@ Future<_HttpResult> _httpPostJson(String url, Map<String, dynamic> body) async {
     request.contentLength = encoded.length;
     request.add(encoded);
     final response = await request.close();
-    final bytes = await response.fold<List<int>>(
-        <int>[], (prev, chunk) => prev..addAll(chunk));
+    final bytes = await response
+        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
     client.close();
