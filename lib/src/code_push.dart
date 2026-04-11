@@ -4,6 +4,7 @@ import 'dart:io' show Directory, File, HttpClient, Platform, exit;
 
 import 'dart:ui' as ui;
 
+import 'package:crypto/crypto.dart' show sha256;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -122,12 +123,29 @@ abstract final class CodePush {
 
     _timer?.cancel();
 
-    // Crash protection runs async because it needs the engine's patch dir
-    // via platform channel. We fire-and-forget — it must not block init.
+    // Crash protection runs async because it needs the engine's patch
+    // dir via platform channel. We chain the first checkAndInstall off
+    // it so that, on a boot where a previously-downloaded bad patch is
+    // on disk, the three-strike auto-rollback machinery has already
+    // run before we download and overwrite that file with a fresh
+    // (possibly equally bad) patch. Prior versions fired checkAndInstall
+    // unconditionally on init which left no room for the boot counter
+    // to trip — see CHANGELOG 0.1.7 for the race condition this fixes.
     _runCrashProtection().then((_) {
       // Start launch success timer only after crash protection completes,
       // so a rollback doesn't get immediately overwritten by a success report.
       _startLaunchTimer();
+
+      // Immediate check is now *after* crash protection so a bad patch
+      // on disk gets a chance to increment the boot counter before we
+      // replace it.
+      checkAndInstall(
+        serverUrl: serverUrl,
+        appId: appId,
+        releaseVersion: releaseVersion,
+        channel: channel,
+        onUpdateReady: onUpdateReady,
+      );
     });
 
     _timer = Timer.periodic(interval, (_) {
@@ -139,14 +157,6 @@ abstract final class CodePush {
         onUpdateReady: onUpdateReady,
       );
     });
-    // Check immediately on init.
-    checkAndInstall(
-      serverUrl: serverUrl,
-      appId: appId,
-      releaseVersion: releaseVersion,
-      channel: channel,
-      onUpdateReady: onUpdateReady,
-    );
   }
 
   /// Stops automatic update checking and cancels the launch timer.
@@ -169,11 +179,20 @@ abstract final class CodePush {
   }) async {
     try {
       status.value = 'Checking server...';
+      // Compute the baseline hash once, up front, so it can be
+      // included in the /updates query. The server uses it as a
+      // belt-and-suspenders gate: if the patch on file has a
+      // recorded baseline hash that disagrees with ours, the server
+      // returns 204 instead of a crash-inducing patch. Older servers
+      // ignore the parameter and the SDK-side load-time check
+      // (further down) still protects us.
+      final deviceBaselineHash = await _computeBaselineHash();
       final url = '$serverUrl/api/v1/updates'
           '?app_id=$appId'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
-          '&channel=$channel';
+          '&channel=$channel'
+          '${deviceBaselineHash != null ? '&baseline_hash=$deviceBaselineHash' : ''}';
 
       final r = await _httpGet(url);
       if (r.statusCode == 204 || r.statusCode != 200) {
@@ -242,6 +261,42 @@ abstract final class CodePush {
           actualFingerprint: actualEngineFingerprint,
         );
         return false;
+      }
+
+      // Phase 3 (0.1.7+): baseline-hash content check. The engine ABI
+      // fingerprint above only verifies Flutter SDK version — it does
+      // NOT catch the case where baseline and patch were built against
+      // different versions of `flutterplaza_code_push` (or any other
+      // Dart package whose class layout changed). When that happens,
+      // the server returns a patch whose AOT snapshot references class
+      // offsets that don't exist in the running baseline, and the VM
+      // aborts on the first class allocation inside
+      // `DN_Internal_loadDynamicModule`. The fix is to compare the
+      // SHA-256 of the running `App.framework/App` (iOS) against the
+      // hash the server recorded when the patch was uploaded.
+      //
+      // If the server doesn't supply a baseline_hash (older CLI /
+      // older server), this check is skipped — the engine ABI check
+      // above still provides the coarse guard.
+      final expectedBaselineHash = data['baseline_hash'] as String?;
+      if (expectedBaselineHash != null) {
+        final actualBaselineHash = await _computeBaselineHash();
+        if (actualBaselineHash != null &&
+            actualBaselineHash != expectedBaselineHash) {
+          status.value = 'Incompatible baseline: hash mismatch';
+          await _reportIncompatibleBaseline(
+            serverUrl: serverUrl,
+            appId: appId,
+            patchId: patchId,
+            reason: 'Baseline hash mismatch (package-level layout '
+                'drift — e.g. different flutterplaza_code_push '
+                'version or different transitive Dart deps between '
+                'the patch and the running baseline)',
+            expectedFingerprint: expectedBaselineHash,
+            actualFingerprint: actualBaselineHash,
+          );
+          return false;
+        }
       }
 
       status.value = 'Downloading patch...';
@@ -453,6 +508,62 @@ abstract final class CodePush {
       }
     } catch (_) {
       // Telemetry is best-effort. Never crash over it.
+    }
+  }
+
+  /// In-memory cache of the running app's baseline hash.
+  /// Computed lazily on first use and reused for the rest of the
+  /// session, since the AOT snapshot can't change while the app is
+  /// running.
+  static String? _cachedBaselineHash;
+
+  /// Returns the SHA-256 hex of the currently-running baseline's
+  /// `App.framework/App` (iOS) or `libapp.so` (Android).
+  ///
+  /// This is the authoritative identity of the Dart code that's
+  /// loaded into the VM — bumping any Dart package (including this
+  /// one) changes the AOT class layout and produces a different
+  /// hash. We use it as the compatibility key for patches:
+  /// if `sha256(running baseline) != sha256(baseline the patch was
+  /// built against)`, the patch's class offsets are wrong and
+  /// `ui.codePushLoadModule` will abort the VM on the first class
+  /// allocation. The check at the top of [checkAndInstall] refuses
+  /// to load a patch whose recorded baseline hash disagrees with
+  /// this value.
+  ///
+  /// Cached in memory after first computation. Reading the few-MB
+  /// AOT blob and hashing it takes ~20–50 ms on a modern device —
+  /// once per session is fine. Non-iOS is a no-op for now (the
+  /// Android engine loads patches differently and the crash path
+  /// the hash guards against is iOS-specific).
+  static Future<String?> _computeBaselineHash() async {
+    if (_cachedBaselineHash != null) return _cachedBaselineHash;
+    try {
+      if (!Platform.isIOS) return null;
+
+      // On iOS, Platform.resolvedExecutable points at
+      // `Runner.app/Runner`. Its sibling at
+      // `Runner.app/Frameworks/App.framework/App` is the Dart AOT
+      // snapshot — the file whose bytes define the class layout.
+      final executablePath = Platform.resolvedExecutable;
+      if (executablePath.isEmpty) return null;
+      final runnerFile = File(executablePath);
+      final bundleDir = runnerFile.parent.path;
+      final appFrameworkPath = '$bundleDir/Frameworks/App.framework/App';
+      final appFrameworkFile = File(appFrameworkPath);
+      if (!appFrameworkFile.existsSync()) return null;
+
+      // Stream + incremental digest keeps peak memory bounded even
+      // though the file is only a few MB. sha256.bind(stream) is the
+      // idiomatic async streaming form from package:crypto.
+      final digest = await sha256.bind(appFrameworkFile.openRead()).first;
+      _cachedBaselineHash = digest.toString();
+      return _cachedBaselineHash;
+    } catch (_) {
+      // Hashing must never crash the app. If we can't compute the
+      // hash for any reason, return null and let callers fall back
+      // to their existing logic.
+      return null;
     }
   }
 
