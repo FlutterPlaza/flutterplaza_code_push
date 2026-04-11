@@ -89,6 +89,10 @@ abstract final class CodePush {
     String channel = 'production',
     VoidCallback? onUpdateReady,
   }) {
+    // MUST run synchronously before any await or microtask yields. See
+    // `_cleanupStalePatchSync` for the crash this prevents.
+    _cleanupStalePatchSync();
+
     _timer?.cancel();
 
     // Crash protection runs async because it needs the engine's patch dir
@@ -324,6 +328,106 @@ abstract final class CodePush {
   /// This is the only way to apply a patch — warm resumes don't
   /// re-initialize the Dart VM.
   static void restart() => exit(0);
+
+  // ── Stale-patch cleanup ─────────────────────────────────────────
+
+  /// Synchronously delete any `patch.vmcode` file on disk that was
+  /// written by a previous install of this app.
+  ///
+  /// This guards against a crash path that the 0.1.3 compatibility
+  /// probe cannot reach: the custom Flutter engine's C++ boot flow
+  /// schedules a dynamic-module load of `patch.vmcode` during isolate
+  /// initialization, *before* the SDK's `checkAndInstall` runs. If
+  /// the patch on disk was built against a different baseline
+  /// (common after a store-delivered app update, when the Documents
+  /// directory survives the reinstall but the app binary is fresh),
+  /// the Dart VM aborts inside `DN_Internal_loadDynamicModule` with a
+  /// release-mode `SIGABRT` and the app crash-loops. The engine has a
+  /// three-strike auto-rollback (`kMaxBootAttempts = 3` in the C++
+  /// Updater) that will eventually delete the patch and recover, but
+  /// the first three boots after the upgrade still crash.
+  ///
+  /// This cleanup runs **synchronously** — it must finish before
+  /// `init()` returns and before the isolate's event loop starts
+  /// draining microtasks, which is when the engine-scheduled load
+  /// fires. We use only `dart:io` (no method channels, no FFI, no
+  /// path_provider) so that nothing yields before the file is gone.
+  ///
+  /// Heuristic: compare the patch file's mtime against the running
+  /// app's main executable mtime. On iOS, the Documents directory is
+  /// preserved across app updates but the `.app` bundle is replaced,
+  /// so a newer executable mtime than the patch file means the patch
+  /// was written by a previous install and is therefore untrusted.
+  /// On a steady-state run where the user installed a patch a few
+  /// minutes ago, the patch mtime is newer than the executable and
+  /// the cleanup is a no-op.
+  ///
+  /// Any exception is swallowed — cleanup is best-effort and must
+  /// never crash the app itself.
+  ///
+  /// Non-iOS platforms are a no-op for now: the crash is iOS-specific
+  /// (the Android engine uses a different load path with its own
+  /// in-process recovery).
+  static void _cleanupStalePatchSync() {
+    try {
+      if (!Platform.isIOS) return;
+
+      // iOS sets HOME in the process environment to the app sandbox
+      // root. The custom Flutter engine's FlutterDartProject.mm
+      // hardcodes the patch dir as `<Documents>/code_push_patches/`
+      // (see engine patches), so we can derive the absolute patch
+      // path without a method-channel round trip.
+      final home = Platform.environment['HOME'];
+      if (home == null || home.isEmpty) return;
+
+      final patchPath = '$home/Documents/code_push_patches/patch.vmcode';
+      final patchFile = File(patchPath);
+      if (!patchFile.existsSync()) return;
+
+      // Compare against the main executable's mtime. iOS replaces the
+      // `.app` bundle (including the executable) on every install or
+      // upgrade, so its mtime is the latest install time.
+      final executablePath = Platform.resolvedExecutable;
+      if (executablePath.isEmpty) return;
+      final executableFile = File(executablePath);
+      if (!executableFile.existsSync()) return;
+
+      final executableMtime = executableFile.statSync().modified;
+      final patchMtime = patchFile.statSync().modified;
+
+      if (executableMtime.isAfter(patchMtime)) {
+        // Bundle is newer than the patch → the patch was written by
+        // a previous install and may be incompatible with the
+        // currently-running engine. Delete it before the engine's
+        // boot-scheduled `DN_Internal_loadDynamicModule` fires.
+        patchFile.deleteSync();
+
+        // Best-effort cleanup of the siblings the engine writes
+        // alongside the patch — boot_counter, launch_status.json,
+        // patch_info.json — so the next launch starts from a clean
+        // state instead of replaying a stale crash tally.
+        for (final sibling in [
+          'boot_counter',
+          'launch_status.json',
+          'patch_info.json',
+          'patch.vmcode.tmp',
+        ]) {
+          try {
+            final siblingFile =
+                File('$home/Documents/code_push_patches/$sibling');
+            if (siblingFile.existsSync()) siblingFile.deleteSync();
+          } catch (_) {
+            // Ignore individual sibling failures.
+          }
+        }
+      }
+    } catch (_) {
+      // Cleanup must never crash the app. If any of the file ops
+      // above throw (permissions, missing executable path on a
+      // simulator, etc.) we fall through to the engine's own
+      // three-strike auto-rollback safety net.
+    }
+  }
 
   // ── Baseline compatibility ──────────────────────────────────────
 
