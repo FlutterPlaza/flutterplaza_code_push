@@ -384,18 +384,53 @@ abstract final class CodePush {
       final patchFile = File(patchPath);
       if (!patchFile.existsSync()) return;
 
-      // Compare against the main executable's mtime. iOS replaces the
-      // `.app` bundle (including the executable) on every install or
-      // upgrade, so its mtime is the latest install time.
+      // Compare against the *newest* thing in the app bundle that
+      // actually changes on every rebuild. `Platform.resolvedExecutable`
+      // on iOS returns `Runner.app/Runner` — the thin Objective-C /
+      // Swift shell, which Flutter's incremental iOS build only touches
+      // when native code changes. A pure Dart rebuild (including
+      // `fcp codepush patch --build`) rewrites
+      // `Runner.app/Frameworks/App.framework/App` (the AOT snapshot)
+      // but leaves `Runner` alone, so using only the Runner mtime left
+      // the cleanup skipping stale patches across Dart-only rebuilds.
+      //
+      // We take the MAX of both mtimes:
+      //   * `Runner.app/Runner`                            — native shell
+      //   * `Runner.app/Frameworks/App.framework/App`      — AOT snapshot
+      //
+      // Whichever is newer represents "when the current code was last
+      // touched." Either file missing is tolerated — we just use the
+      // other. If both are missing or unreadable, we skip the cleanup
+      // entirely and fall through to the engine's built-in three-strike
+      // auto-rollback.
+      DateTime? latestBundleMtime;
       final executablePath = Platform.resolvedExecutable;
-      if (executablePath.isEmpty) return;
-      final executableFile = File(executablePath);
-      if (!executableFile.existsSync()) return;
+      if (executablePath.isNotEmpty) {
+        final runnerFile = File(executablePath);
+        if (runnerFile.existsSync()) {
+          latestBundleMtime = runnerFile.statSync().modified;
+        }
 
-      final executableMtime = executableFile.statSync().modified;
+        // Derive Runner.app/Frameworks/App.framework/App from the
+        // resolved executable path. On iOS this is a sibling under
+        // the same Runner.app bundle.
+        final runnerDir = runnerFile.parent;
+        final appFramework =
+            File('${runnerDir.path}/Frameworks/App.framework/App');
+        if (appFramework.existsSync()) {
+          final aotMtime = appFramework.statSync().modified;
+          if (latestBundleMtime == null ||
+              aotMtime.isAfter(latestBundleMtime)) {
+            latestBundleMtime = aotMtime;
+          }
+        }
+      }
+
+      if (latestBundleMtime == null) return;
+
       final patchMtime = patchFile.statSync().modified;
 
-      if (executableMtime.isAfter(patchMtime)) {
+      if (latestBundleMtime.isAfter(patchMtime)) {
         // Bundle is newer than the patch → the patch was written by
         // a previous install and may be incompatible with the
         // currently-running engine. Delete it before the engine's
