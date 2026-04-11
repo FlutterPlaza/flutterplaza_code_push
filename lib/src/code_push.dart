@@ -327,63 +327,74 @@ abstract final class CodePush {
           // Format guard: the Dart VM's dynamic module loader
           // (`DN_Internal_loadDynamicModule`, reached via
           // `ui.codePushLoadModule` → `Isolate.loadDynamicModule`)
-          // accepts ONE format: an AOT dynamic-module ELF blob
-          // (magic `7F 45 4C 46`). Anything else aborts the VM
-          // inside the native with SIGABRT and no recoverable
-          // error. We explicitly diagnose the two historical
-          // wrong-formats so users upgrading from older CLI
-          // versions get a clear diagnostic + immediate rollback
-          // instead of a process kill:
+          // accepts a platform-specific AOT dynamic-module format:
           //
-          //   * **Mach-O** (fe ed fa cf / cf fa ed fe) — what
-          //     `flutter_compile` 0.19.10 and earlier shipped by
-          //     accident (`Runner.app/Frameworks/App.framework/App`,
-          //     the baseline's native binary, not the patch payload
-          //     it was mistaken for).
-          //   * **Dart kernel** (90 AB CD EF) — what 0.19.11 and
-          //     0.19.12 shipped after the Mach-O fix. Kernel is the
-          //     *input* to the snapshot step, not the output —
-          //     passing raw kernel to `loadDynamicModule` still
-          //     aborts. `flutter_compile` 0.19.13+ runs the
-          //     `fcp-tool snapshot` step to compile kernel → ELF
-          //     dynamic-module blob.
-          final magicOk = payload.length > 4 &&
-              payload[0] == 0x7f &&
-              payload[1] == 0x45 &&
-              payload[2] == 0x4c &&
-              payload[3] == 0x46;
-          if (!magicOk && payload.length > 4) {
+          //   * **iOS / macOS**: Mach-O 64-bit dylib
+          //     (`gen_snapshot --snapshot_kind=app-aot-macho-dylib`).
+          //     Magic bytes: `CF FA ED FE` (LE) or `FE ED FA CF`
+          //     (BE) for a 64-bit Mach-O.
+          //   * **Android / Linux**: ELF
+          //     (`gen_snapshot --snapshot_kind=app-aot-elf`).
+          //     Magic bytes: `7F 45 4C 46`.
+          //
+          // This branch runs on iOS only (the enclosing
+          // `Platform.isIOS` check is above), so we require
+          // Mach-O 64-bit here. Anything else aborts the VM
+          // inside the native with SIGABRT and no recoverable
+          // error — we diagnose the historical wrong formats so
+          // users upgrading from older CLI versions get a clear
+          // status message + immediate rollback instead of a
+          // process kill:
+          //
+          //   * `flutter_compile` ≤ 0.19.10 shipped Mach-O via
+          //     `App.framework/App`, but it was the *baseline*
+          //     binary — unrelated code, wrong symbols, still
+          //     aborted.
+          //   * `flutter_compile` 0.19.11 / 0.19.12 shipped raw
+          //     Dart kernel (`90 AB CD EF`).
+          //   * `flutter_compile` 0.19.13 shipped an ELF blob
+          //     (`7F 45 4C 46`) — right idea, wrong target
+          //     format for iOS.
+          //   * `flutter_compile` 0.19.14+ ships Mach-O dylib via
+          //     `fcp-tool snapshot --target ios`.
+          final isMachO64 = payload.length > 4 &&
+              ((payload[0] == 0xfe &&
+                      payload[1] == 0xed &&
+                      payload[2] == 0xfa &&
+                      payload[3] == 0xcf) ||
+                  (payload[0] == 0xcf &&
+                      payload[1] == 0xfa &&
+                      payload[2] == 0xed &&
+                      payload[3] == 0xfe));
+          if (!isMachO64 && payload.length > 4) {
             final magicHex = payload
                 .take(4)
                 .map((b) => b.toRadixString(16).padLeft(2, '0'))
                 .join('');
-            final isMachO = (payload[0] == 0xfe &&
-                    payload[1] == 0xed &&
-                    payload[2] == 0xfa &&
-                    payload[3] == 0xcf) ||
-                (payload[0] == 0xcf &&
-                    payload[1] == 0xfa &&
-                    payload[2] == 0xed &&
-                    payload[3] == 0xfe);
+            final isELF = payload[0] == 0x7f &&
+                payload[1] == 0x45 &&
+                payload[2] == 0x4c &&
+                payload[3] == 0x46;
             final isKernel = payload[0] == 0x90 &&
                 payload[1] == 0xab &&
                 payload[2] == 0xcd &&
                 payload[3] == 0xef;
             final String diagnosis;
-            if (isMachO) {
-              diagnosis = 'Patch is Mach-O (magic $magicHex) — '
-                  'expected ELF dynamic-module snapshot. '
-                  'Upgrade flutter_compile to 0.19.13+.';
+            if (isELF) {
+              diagnosis = 'Patch is ELF (magic $magicHex) — iOS '
+                  'expects a Mach-O dylib. The CLI is targeting '
+                  'the wrong snapshot kind. Upgrade '
+                  'flutter_compile to 0.19.14+.';
             } else if (isKernel) {
               diagnosis = 'Patch is raw Dart kernel (magic '
-                  '$magicHex) — expected ELF dynamic-module '
-                  'snapshot. The CLI needs to run `fcp-tool '
-                  'snapshot` on the kernel before packaging. '
-                  'Upgrade flutter_compile to 0.19.13+.';
+                  '$magicHex) — iOS expects a Mach-O dylib. The '
+                  'CLI needs to run `fcp-tool snapshot --target '
+                  'ios` on the kernel before packaging. Upgrade '
+                  'flutter_compile to 0.19.14+.';
             } else {
               diagnosis = 'Patch has unknown magic bytes '
-                  '$magicHex — expected ELF dynamic-module '
-                  'snapshot (7f 45 4c 46).';
+                  '$magicHex — expected Mach-O 64-bit dylib '
+                  '(cf fa ed fe).';
             }
             status.value = diagnosis;
             await _iosImmediateRollback(
@@ -391,7 +402,8 @@ abstract final class CodePush {
               appId: appId,
               patchId: patchId,
               errorMessage: 'Patch magic mismatch (0x$magicHex, '
-                  'not ELF) — rejected before loadDynamicModule',
+                  'not Mach-O 64-bit) — rejected before '
+                  'loadDynamicModule',
             );
             return false;
           }

@@ -1,6 +1,6 @@
 name: flutterplaza_code_push
 description: Over-the-air code push updates for Flutter apps. Check for updates, download patches, and roll back — all at runtime.
-version: 0.1.9
+version: 0.1.10
 homepage: https://codepush.flutterplaza.com
 repository: https://github.com/FlutterPlaza/flutterplaza_code_push
 issue_tracker: https://github.com/FlutterPlaza/flutterplaza_code_push/issues
