@@ -46,6 +46,20 @@ const MethodChannel _channel =
 /// )
 /// ```
 abstract final class CodePush {
+  /// Default code push server URL. Apps that target the FlutterPlaza
+  /// production service can omit `serverUrl` in [init] and
+  /// [CodePushConfig] and this constant will be used.
+  static const String defaultServerUrl =
+      'https://api.codepush.flutterplaza.com';
+
+  /// The config passed to the most recent [init] call, if any.
+  ///
+  /// [CodePushOverlay] reads this as a fallback when its own `config`
+  /// parameter is omitted, so callers that run `CodePush.init(...)` at
+  /// the top of `main()` don't have to repeat the same config in their
+  /// `CodePushOverlay(...)` wrapper.
+  static CodePushConfig? lastConfig;
+
   static Timer? _timer;
   static Timer? _launchTimer;
 
@@ -82,16 +96,29 @@ abstract final class CodePush {
   /// When a patch is installed, [onUpdateReady] is called so you can
   /// prompt the user to restart.
   static void init({
-    required String serverUrl,
+    String serverUrl = defaultServerUrl,
     required String appId,
     required String releaseVersion,
     Duration interval = const Duration(hours: 4),
     String channel = 'production',
     VoidCallback? onUpdateReady,
   }) {
-    // MUST run synchronously before any await or microtask yields. See
-    // `_cleanupStalePatchSync` for the crash this prevents.
-    _cleanupStalePatchSync();
+    // Store the config so `CodePushOverlay` can reuse it without
+    // forcing the caller to repeat every field at the widget level.
+    lastConfig = CodePushConfig(
+      serverUrl: serverUrl,
+      appId: appId,
+      releaseVersion: releaseVersion,
+      checkInterval: interval,
+      channel: channel,
+    );
+
+    // NOTE: Any stale-patch cleanup from prior versions (0.1.4/0.1.5)
+    // was unreachable on iOS — it ran inside `init()`, which runs
+    // inside `main()`, and on the crash path `main()` never executes.
+    // The 0.1.6 fix moved cleanup to native iOS `+load`
+    // (FlutterplazaCodePushBootCleanup.m) which runs during dyld image
+    // load, before the Flutter engine boots. See CHANGELOG.
 
     _timer?.cancel();
 
@@ -328,141 +355,6 @@ abstract final class CodePush {
   /// This is the only way to apply a patch — warm resumes don't
   /// re-initialize the Dart VM.
   static void restart() => exit(0);
-
-  // ── Stale-patch cleanup ─────────────────────────────────────────
-
-  /// Synchronously delete any `patch.vmcode` file on disk that was
-  /// written by a previous install of this app.
-  ///
-  /// This guards against a crash path that the 0.1.3 compatibility
-  /// probe cannot reach: the custom Flutter engine's C++ boot flow
-  /// schedules a dynamic-module load of `patch.vmcode` during isolate
-  /// initialization, *before* the SDK's `checkAndInstall` runs. If
-  /// the patch on disk was built against a different baseline
-  /// (common after a store-delivered app update, when the Documents
-  /// directory survives the reinstall but the app binary is fresh),
-  /// the Dart VM aborts inside `DN_Internal_loadDynamicModule` with a
-  /// release-mode `SIGABRT` and the app crash-loops. The engine has a
-  /// three-strike auto-rollback (`kMaxBootAttempts = 3` in the C++
-  /// Updater) that will eventually delete the patch and recover, but
-  /// the first three boots after the upgrade still crash.
-  ///
-  /// This cleanup runs **synchronously** — it must finish before
-  /// `init()` returns and before the isolate's event loop starts
-  /// draining microtasks, which is when the engine-scheduled load
-  /// fires. We use only `dart:io` (no method channels, no FFI, no
-  /// path_provider) so that nothing yields before the file is gone.
-  ///
-  /// Heuristic: compare the patch file's mtime against the running
-  /// app's main executable mtime. On iOS, the Documents directory is
-  /// preserved across app updates but the `.app` bundle is replaced,
-  /// so a newer executable mtime than the patch file means the patch
-  /// was written by a previous install and is therefore untrusted.
-  /// On a steady-state run where the user installed a patch a few
-  /// minutes ago, the patch mtime is newer than the executable and
-  /// the cleanup is a no-op.
-  ///
-  /// Any exception is swallowed — cleanup is best-effort and must
-  /// never crash the app itself.
-  ///
-  /// Non-iOS platforms are a no-op for now: the crash is iOS-specific
-  /// (the Android engine uses a different load path with its own
-  /// in-process recovery).
-  static void _cleanupStalePatchSync() {
-    try {
-      if (!Platform.isIOS) return;
-
-      // iOS sets HOME in the process environment to the app sandbox
-      // root. The custom Flutter engine's FlutterDartProject.mm
-      // hardcodes the patch dir as `<Documents>/code_push_patches/`
-      // (see engine patches), so we can derive the absolute patch
-      // path without a method-channel round trip.
-      final home = Platform.environment['HOME'];
-      if (home == null || home.isEmpty) return;
-
-      final patchPath = '$home/Documents/code_push_patches/patch.vmcode';
-      final patchFile = File(patchPath);
-      if (!patchFile.existsSync()) return;
-
-      // Compare against the *newest* thing in the app bundle that
-      // actually changes on every rebuild. `Platform.resolvedExecutable`
-      // on iOS returns `Runner.app/Runner` — the thin Objective-C /
-      // Swift shell, which Flutter's incremental iOS build only touches
-      // when native code changes. A pure Dart rebuild (including
-      // `fcp codepush patch --build`) rewrites
-      // `Runner.app/Frameworks/App.framework/App` (the AOT snapshot)
-      // but leaves `Runner` alone, so using only the Runner mtime left
-      // the cleanup skipping stale patches across Dart-only rebuilds.
-      //
-      // We take the MAX of both mtimes:
-      //   * `Runner.app/Runner`                            — native shell
-      //   * `Runner.app/Frameworks/App.framework/App`      — AOT snapshot
-      //
-      // Whichever is newer represents "when the current code was last
-      // touched." Either file missing is tolerated — we just use the
-      // other. If both are missing or unreadable, we skip the cleanup
-      // entirely and fall through to the engine's built-in three-strike
-      // auto-rollback.
-      DateTime? latestBundleMtime;
-      final executablePath = Platform.resolvedExecutable;
-      if (executablePath.isNotEmpty) {
-        final runnerFile = File(executablePath);
-        if (runnerFile.existsSync()) {
-          latestBundleMtime = runnerFile.statSync().modified;
-        }
-
-        // Derive Runner.app/Frameworks/App.framework/App from the
-        // resolved executable path. On iOS this is a sibling under
-        // the same Runner.app bundle.
-        final runnerDir = runnerFile.parent;
-        final appFramework =
-            File('${runnerDir.path}/Frameworks/App.framework/App');
-        if (appFramework.existsSync()) {
-          final aotMtime = appFramework.statSync().modified;
-          if (latestBundleMtime == null ||
-              aotMtime.isAfter(latestBundleMtime)) {
-            latestBundleMtime = aotMtime;
-          }
-        }
-      }
-
-      if (latestBundleMtime == null) return;
-
-      final patchMtime = patchFile.statSync().modified;
-
-      if (latestBundleMtime.isAfter(patchMtime)) {
-        // Bundle is newer than the patch → the patch was written by
-        // a previous install and may be incompatible with the
-        // currently-running engine. Delete it before the engine's
-        // boot-scheduled `DN_Internal_loadDynamicModule` fires.
-        patchFile.deleteSync();
-
-        // Best-effort cleanup of the siblings the engine writes
-        // alongside the patch — boot_counter, launch_status.json,
-        // patch_info.json — so the next launch starts from a clean
-        // state instead of replaying a stale crash tally.
-        for (final sibling in [
-          'boot_counter',
-          'launch_status.json',
-          'patch_info.json',
-          'patch.vmcode.tmp',
-        ]) {
-          try {
-            final siblingFile =
-                File('$home/Documents/code_push_patches/$sibling');
-            if (siblingFile.existsSync()) siblingFile.deleteSync();
-          } catch (_) {
-            // Ignore individual sibling failures.
-          }
-        }
-      }
-    } catch (_) {
-      // Cleanup must never crash the app. If any of the file ops
-      // above throw (permissions, missing executable path on a
-      // simulator, etc.) we fall through to the engine's own
-      // three-strike auto-rollback safety net.
-    }
-  }
 
   // ── Baseline compatibility ──────────────────────────────────────
 
@@ -917,11 +809,15 @@ abstract final class CodePush {
   }
 }
 
-/// Configuration for [CodePushOverlay].
+/// Configuration for [CodePushOverlay] and [CodePush.init].
+///
+/// `serverUrl` defaults to [CodePush.defaultServerUrl] so apps pointed
+/// at the FlutterPlaza production service only need to supply `appId`
+/// and `releaseVersion`.
 @immutable
 class CodePushConfig {
   const CodePushConfig({
-    required this.serverUrl,
+    this.serverUrl = CodePush.defaultServerUrl,
     required this.appId,
     required this.releaseVersion,
     this.checkInterval = const Duration(hours: 4),
@@ -953,14 +849,24 @@ class CodePushConfig {
 class CodePushOverlay extends StatefulWidget {
   const CodePushOverlay({
     super.key,
-    required this.config,
+    this.config,
     required this.child,
     this.bannerBuilder,
     this.showDebugBar = false,
   });
 
   /// Code push configuration.
-  final CodePushConfig config;
+  ///
+  /// Optional from 0.1.6 onward. When omitted, the overlay falls back
+  /// to [CodePush.lastConfig] — the config stored by the most recent
+  /// call to [CodePush.init]. This lets apps configure the SDK once in
+  /// `main()` and then just write `CodePushOverlay(child: ...)`
+  /// without repeating every field.
+  ///
+  /// Passing a non-null [config] here always wins, for cases where the
+  /// overlay needs different settings from whatever `init` was called
+  /// with (e.g. a different channel for a debug build).
+  final CodePushConfig? config;
 
   /// The app widget.
   final Widget child;
@@ -983,17 +889,34 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   bool _updateReady = false;
   bool _patchActive = false;
 
+  /// Effective config: an explicit `widget.config` always wins, then
+  /// falls back to `CodePush.lastConfig` (set by an earlier
+  /// `CodePush.init(...)` call, typically at the top of `main()`).
+  CodePushConfig get _config {
+    final explicit = widget.config;
+    if (explicit != null) return explicit;
+    final stored = CodePush.lastConfig;
+    if (stored != null) return stored;
+    throw StateError(
+      'CodePushOverlay: no config provided and CodePush.init has not '
+      'been called. Either pass a `config:` argument to CodePushOverlay '
+      'or call CodePush.init(appId: ..., releaseVersion: ...) before '
+      'runApp(...).',
+    );
+  }
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     CodePush.moduleResult.addListener(_onModuleLoaded);
+    final cfg = _config;
     CodePush.init(
-      serverUrl: widget.config.serverUrl,
-      appId: widget.config.appId,
-      releaseVersion: widget.config.releaseVersion,
-      interval: widget.config.checkInterval,
-      channel: widget.config.channel,
+      serverUrl: cfg.serverUrl,
+      appId: cfg.appId,
+      releaseVersion: cfg.releaseVersion,
+      interval: cfg.checkInterval,
+      channel: cfg.channel,
       onUpdateReady: () {
         if (mounted) setState(() => _updateReady = true);
       },
@@ -1017,11 +940,12 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      final cfg = _config;
       CodePush.checkAndInstall(
-        serverUrl: widget.config.serverUrl,
-        appId: widget.config.appId,
-        releaseVersion: widget.config.releaseVersion,
-        channel: widget.config.channel,
+        serverUrl: cfg.serverUrl,
+        appId: cfg.appId,
+        releaseVersion: cfg.releaseVersion,
+        channel: cfg.channel,
         onUpdateReady: () {
           if (mounted) setState(() => _updateReady = true);
         },

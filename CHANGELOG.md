@@ -1,3 +1,42 @@
+## 0.1.6
+
+- **crash fix (the big one)**: moves the stale-patch cleanup out of Dart and into iOS native code. 0.1.3/0.1.4/0.1.5 all tried to clean up inside `CodePush.init()`, which runs inside `main()` — but on the reported crash path **`main()` never runs**. The custom Flutter engine loads `patch.vmcode` as the isolate's snapshot data during isolate initialization, before `Dart_InvokeMain` is ever called; if the on-disk patch is incompatible with the running baseline, the VM aborts with `SIGABRT` inside `DN_Internal_loadDynamicModule` and the process dies without executing a single line of Dart.
+  - 0.1.6 converts `flutterplaza_code_push` into a Flutter plugin with iOS native code. A new Objective-C class registers a `+load` method that runs during dyld image loading — **before** `main()` in the ObjC entry point, **before** `UIApplicationMain`, **before** the Flutter engine is instantiated, **before** any Dart code runs. This is the earliest hook available to a Flutter plugin.
+  - The `+load` cleanup computes `<NSDocumentDirectory>/code_push_patches/patch.vmcode`, compares its mtime against the max of `Runner.app/Runner` and `Runner.app/Frameworks/App.framework/App` (so the check works for native-only rebuilds, Dart-only rebuilds, and full builds), and deletes the patch plus its sibling files (`boot_counter`, `launch_status.json`, `patch_info.json`, `patch.vmcode.tmp`) if the bundle is newer. Steady-state runs where the patch is newer than the bundle are a no-op.
+  - Apps upgrading from 0.1.5 get automatic CocoaPods integration on their next `flutter pub get` + `cd ios && pod install`. No `AppDelegate` or `main.dart` changes required. Users who previously added the 0.1.5 Dart-side `CodePush.init(...)` as the first line of `main()` can leave it there — it's now redundant for crash prevention but still configures the SDK normally.
+  - The unreachable Dart-side `_cleanupStalePatchSync` is removed. Its doc comment was correct about the crash mechanism but wrong about the fix layer; keeping dead code that can't possibly fire is worse than deleting it.
+  - Non-iOS is unchanged. Android's engine uses a different load path and does not hit this crash.
+
+- **API improvement — config reuse**: `CodePushOverlay` already calls `CodePush.init(...)` internally from its `initState`, which meant apps that wrapped their root widget in `CodePushOverlay` and **also** called `CodePush.init(...)` at the top of `main()` were double-initializing with identical config. 0.1.6 fixes the duplication three ways:
+  - `CodePush.init` stores its config in a new `CodePush.lastConfig` static field on every call.
+  - `CodePushOverlay.config` is now **optional**. When omitted, the overlay falls back to `CodePush.lastConfig` — so apps that want to configure at the top of `main()` can now write `CodePushOverlay(child: ...)` without repeating every field. An explicit `config:` on the overlay still wins for cases where the overlay needs different settings.
+  - `CodePush.init` and `CodePushConfig` both make `serverUrl` **optional** now, defaulting to the new `CodePush.defaultServerUrl` constant (`https://api.codepush.flutterplaza.com`). Apps targeting the production service only need to supply `appId` and `releaseVersion`.
+  - Typical new shape:
+    ```dart
+    void main() {
+      CodePush.init(
+        appId: Platform.isIOS ? '...ios-app-id...' : '...android-app-id...',
+        releaseVersion: '1.2.0+15',
+      );
+      runApp(CodePushOverlay(child: MyApp()));
+    }
+    ```
+    …or, if you prefer one call site:
+    ```dart
+    void main() {
+      runApp(CodePushOverlay(
+        config: CodePushConfig(
+          appId: Platform.isIOS ? '...ios...' : '...android...',
+          releaseVersion: '1.2.0+15',
+        ),
+        child: MyApp(),
+      ));
+    }
+    ```
+    Both work. `serverUrl` can still be overridden explicitly if you're pointing at a self-hosted server.
+
+- **breaking-ish**: this release adds a CocoaPod dependency to your iOS build. On first `flutter pub get` you'll need to run `cd ios && pod install` (or let Flutter do it on the next build). If your app already has `flutter_compile`-built code push working, `pod install` should be a no-op beyond adding the `flutterplaza_code_push` pod itself.
+
 ## 0.1.5
 
 - **fix**: `_cleanupStalePatchSync` in 0.1.4 compared `patch.vmcode` against `Platform.resolvedExecutable`, which on iOS resolves to `Runner.app/Runner` — the thin Objective-C / Swift shell. Flutter's incremental iOS build only rewrites `Runner` when native code changes; a pure Dart rebuild (including `fcp codepush patch --build`) updates `Runner.app/Frameworks/App.framework/App` (the AOT snapshot) but leaves `Runner` alone. Result: stale patches from previous rebuilds were never detected because the Runner mtime stayed frozen in the past while the AOT blob and the patch both advanced. The crash scenario that 0.1.4 was supposed to prevent still fired.
