@@ -325,56 +325,73 @@ abstract final class CodePush {
           final payload = patchBytes.sublist(payloadOffset);
 
           // Format guard: the Dart VM's dynamic module loader
-          // ONLY accepts Dart kernel files (magic 90 AB CD EF).
-          // Anything else — ELF, Mach-O, random bytes — either
-          // returns a soft failure (we handle with rollback) or
-          // aborts the VM inside DN_Internal_loadDynamicModule
-          // with SIGABRT and no recoverable error. We guard the
-          // two most likely wrong-format cases explicitly so the
-          // user gets a clear diagnostic instead of a process
-          // kill.
-          final isELF = payload.length > 4 &&
+          // (`DN_Internal_loadDynamicModule`, reached via
+          // `ui.codePushLoadModule` → `Isolate.loadDynamicModule`)
+          // accepts ONE format: an AOT dynamic-module ELF blob
+          // (magic `7F 45 4C 46`). Anything else aborts the VM
+          // inside the native with SIGABRT and no recoverable
+          // error. We explicitly diagnose the two historical
+          // wrong-formats so users upgrading from older CLI
+          // versions get a clear diagnostic + immediate rollback
+          // instead of a process kill:
+          //
+          //   * **Mach-O** (fe ed fa cf / cf fa ed fe) — what
+          //     `flutter_compile` 0.19.10 and earlier shipped by
+          //     accident (`Runner.app/Frameworks/App.framework/App`,
+          //     the baseline's native binary, not the patch payload
+          //     it was mistaken for).
+          //   * **Dart kernel** (90 AB CD EF) — what 0.19.11 and
+          //     0.19.12 shipped after the Mach-O fix. Kernel is the
+          //     *input* to the snapshot step, not the output —
+          //     passing raw kernel to `loadDynamicModule` still
+          //     aborts. `flutter_compile` 0.19.13+ runs the
+          //     `fcp-tool snapshot` step to compile kernel → ELF
+          //     dynamic-module blob.
+          final magicOk = payload.length > 4 &&
               payload[0] == 0x7f &&
               payload[1] == 0x45 &&
               payload[2] == 0x4c &&
               payload[3] == 0x46;
-          if (isELF) {
-            status.value =
-                'Patch is ELF (needs bytecode for iOS). Restart required.';
-            onUpdateReady?.call();
-            return true;
-          }
-
-          // Defensive: reject Mach-O explicitly. This is what older
-          // flutter_compile CLIs (< 0.19.11) incorrectly shipped as
-          // iOS patches — the baseline's App.framework/App Mach-O
-          // binary. Passing it to `ui.codePushLoadModule` aborts
-          // the VM. Devices on a new SDK running against an old CLI
-          // get a clear diagnostic + immediate rollback instead of
-          // an unrecoverable crash loop.
-          final isMachO = payload.length > 4 &&
-              ((payload[0] == 0xfe &&
-                      payload[1] == 0xed &&
-                      payload[2] == 0xfa &&
-                      payload[3] == 0xcf) ||
-                  (payload[0] == 0xcf &&
-                      payload[1] == 0xfa &&
-                      payload[2] == 0xed &&
-                      payload[3] == 0xfe));
-          if (isMachO) {
+          if (!magicOk && payload.length > 4) {
             final magicHex = payload
                 .take(4)
                 .map((b) => b.toRadixString(16).padLeft(2, '0'))
                 .join('');
-            status.value = 'Patch is Mach-O (magic $magicHex) — expected Dart '
-                'kernel. Upgrade flutter_compile to 0.19.11+ and '
-                'rebuild the patch.';
+            final isMachO = (payload[0] == 0xfe &&
+                    payload[1] == 0xed &&
+                    payload[2] == 0xfa &&
+                    payload[3] == 0xcf) ||
+                (payload[0] == 0xcf &&
+                    payload[1] == 0xfa &&
+                    payload[2] == 0xed &&
+                    payload[3] == 0xfe);
+            final isKernel = payload[0] == 0x90 &&
+                payload[1] == 0xab &&
+                payload[2] == 0xcd &&
+                payload[3] == 0xef;
+            final String diagnosis;
+            if (isMachO) {
+              diagnosis = 'Patch is Mach-O (magic $magicHex) — '
+                  'expected ELF dynamic-module snapshot. '
+                  'Upgrade flutter_compile to 0.19.13+.';
+            } else if (isKernel) {
+              diagnosis = 'Patch is raw Dart kernel (magic '
+                  '$magicHex) — expected ELF dynamic-module '
+                  'snapshot. The CLI needs to run `fcp-tool '
+                  'snapshot` on the kernel before packaging. '
+                  'Upgrade flutter_compile to 0.19.13+.';
+            } else {
+              diagnosis = 'Patch has unknown magic bytes '
+                  '$magicHex — expected ELF dynamic-module '
+                  'snapshot (7f 45 4c 46).';
+            }
+            status.value = diagnosis;
             await _iosImmediateRollback(
               serverUrl: serverUrl,
               appId: appId,
               patchId: patchId,
-              errorMessage: 'Patch is Mach-O (0x$magicHex) not Dart kernel — '
-                  'rejected before loadDynamicModule',
+              errorMessage: 'Patch magic mismatch (0x$magicHex, '
+                  'not ELF) — rejected before loadDynamicModule',
             );
             return false;
           }
