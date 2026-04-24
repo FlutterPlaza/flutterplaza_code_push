@@ -1,6 +1,6 @@
 import 'dart:async' show Timer;
 import 'dart:convert' show base64Encode, jsonDecode, jsonEncode, utf8;
-import 'dart:io' show Directory, File, HttpClient, Platform, exit;
+import 'dart:io' show Directory, File, FileMode, HttpClient, Platform, exit;
 
 import 'dart:ui' as ui;
 
@@ -12,10 +12,11 @@ import 'package:flutter/services.dart';
 import 'models.dart';
 
 /// The platform channel used to communicate with the code push engine.
-/// The engine handler parses messages as JSON, so we must use JSONMethodCodec
-/// instead of the default StandardMethodCodec (binary).
 const MethodChannel _channel =
     MethodChannel('flutter/codepush', JSONMethodCodec());
+
+/// Channel for the SDK's own native plugin (reads Info.plist, etc.).
+const MethodChannel _pluginChannel = MethodChannel('flutterplaza_code_push');
 
 /// Service for managing over-the-air code push updates.
 ///
@@ -73,6 +74,20 @@ abstract final class CodePush {
   /// Cached patch directory path from the engine.
   static String? _cachedPatchDir;
 
+  /// On-disk filename of the active patch. Differs by platform so
+  /// each platform's load path can find its own artifact.
+  static String get _patchFilename =>
+      Platform.isIOS ? 'patch.bytecode' : 'patch.vmcode';
+
+  /// Expected first 4 bytes of every iOS patch payload after
+  /// unwrapping the on-disk header. Opaque format marker.
+  static const List<int> _iosPayloadHeader = <int>[
+    0x33,
+    0x43,
+    0x42,
+    0x44,
+  ];
+
   /// Debug status notifier — shows what code push is doing.
   static final ValueNotifier<String> status = ValueNotifier('init');
 
@@ -82,7 +97,6 @@ abstract final class CodePush {
   /// into a `Map<String, dynamic>`. Apps can listen to this to apply
   /// OTA patches to their UI.
   static final ValueNotifier<Object?> moduleResult = ValueNotifier(null);
-  static Object? _lastModuleResult;
   static bool _moduleLoaded = false;
 
   /// Initializes automatic code push update checking with crash protection.
@@ -104,6 +118,7 @@ abstract final class CodePush {
     String channel = 'production',
     VoidCallback? onUpdateReady,
   }) {
+    print('[CP-INIT] CodePush.init called');
     // Store the config so `CodePushOverlay` can reuse it without
     // forcing the caller to repeat every field at the widget level.
     lastConfig = CodePushConfig(
@@ -178,6 +193,7 @@ abstract final class CodePush {
     VoidCallback? onUpdateReady,
   }) async {
     try {
+      print('[CP] checkAndInstall start');
       status.value = 'Checking server...';
       // Compute the baseline hash once, up front, so it can be
       // included in the /updates query. The server uses it as a
@@ -187,12 +203,14 @@ abstract final class CodePush {
       // ignore the parameter and the SDK-side load-time check
       // (further down) still protects us.
       final deviceBaselineHash = await _computeBaselineHash();
+      final deviceBaselineId = await _readBaselineId();
       final url = '$serverUrl/api/v1/updates'
           '?app_id=$appId'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
           '&channel=$channel'
-          '${deviceBaselineHash != null ? '&baseline_hash=$deviceBaselineHash' : ''}';
+          '${deviceBaselineHash != null ? '&baseline_hash=$deviceBaselineHash' : ''}'
+          '${deviceBaselineId != null ? '&baseline_id=$deviceBaselineId' : ''}';
 
       final r = await _httpGet(url);
       if (r.statusCode == 204 || r.statusCode != 200) {
@@ -213,21 +231,59 @@ abstract final class CodePush {
         return false;
       }
 
+      // Check if this patch was previously rolled back.  The rollback
+      // marker persists across cold starts so the same bad patch isn't
+      // re-downloaded in a crash loop.
+      if (Platform.isIOS) {
+        final patchDir = await _getPatchDir();
+        if (patchDir != null) {
+          final rbFile = File('$patchDir/rolled_back_patch');
+          if (rbFile.existsSync()) {
+            try {
+              final rb = jsonDecode(rbFile.readAsStringSync())
+                  as Map<String, dynamic>;
+              final rbId = rb['patch_id']?.toString();
+              final rbHash = rb['patch_hash']?.toString();
+              final serverPatchId = patchId;
+              final serverPatchHash = data['patch_hash']?.toString();
+              final idMatch = rbId != null && rbId == serverPatchId;
+              final hashMatch = rbHash != null &&
+                  serverPatchHash != null &&
+                  rbHash == serverPatchHash;
+              print('[CP] rollback check: rbId=$rbId serverId=$serverPatchId '
+                  'idMatch=$idMatch rbHash=${rbHash?.substring(0, 8)}... '
+                  'serverHash=${serverPatchHash?.substring(0, 8)}... '
+                  'hashMatch=$hashMatch');
+              if (idMatch || hashMatch) {
+                status.value = 'Skipping rolled-back patch $patchId';
+                print('[CP] SKIPPING rolled-back patch');
+                return false;
+              }
+              // Different patch — clear the old rollback marker.
+              rbFile.deleteSync();
+            } catch (e) {
+              // Corrupt marker — delete and continue.
+              print('[CP] rollback marker read error: $e');
+              try {
+                rbFile.deleteSync();
+              } catch (_) {}
+            }
+          }
+        }
+      }
+
       // ── Baseline compatibility guard ────────────────────────────
       //
       // Before touching any bytes, verify that the running Flutter
-      // engine is the code-push-enabled variant and — if the server
-      // supplies an `engine_fingerprint` — that the patch was compiled
-      // for the same Flutter SDK version.
-      //
-      // Without this guard, loading a patch onto a baseline that was
-      // built with a stock Flutter engine SIGSEGVs inside the Dart VM
-      // (`DRT_AllocateObject` reading from `0x10`) because the AOT
-      // snapshot's class layout disagrees with the running VM. The
-      // crash is a release-mode null deref with no user-visible
-      // diagnostic — the app just dies on the next allocation.
+      // engine is a code-push-capable Flutter engine and — if the
+      // server supplies an `engine_fingerprint` — that the patch was
+      // built for the same Flutter SDK version.
       final actualEngineFingerprint = await _probeEngineFingerprint();
       final expectedEngineFingerprint = data['engine_fingerprint'] as String?;
+      print(
+        '[CP] fingerprint=$actualEngineFingerprint '
+        'expected=$expectedEngineFingerprint',
+      );
 
       if (actualEngineFingerprint == null) {
         status.value = 'Incompatible baseline: engine has no code push support';
@@ -263,43 +319,34 @@ abstract final class CodePush {
         return false;
       }
 
-      // Phase 3 (0.1.7+): baseline-hash content check. The engine ABI
-      // fingerprint above only verifies Flutter SDK version — it does
-      // NOT catch the case where baseline and patch were built against
-      // different versions of `flutterplaza_code_push` (or any other
-      // Dart package whose class layout changed). When that happens,
-      // the server returns a patch whose AOT snapshot references class
-      // offsets that don't exist in the running baseline, and the VM
-      // aborts on the first class allocation inside
-      // `DN_Internal_loadDynamicModule`. The fix is to compare the
-      // SHA-256 of the running `App.framework/App` (iOS) against the
-      // hash the server recorded when the patch was uploaded.
+      // Phase 3 (0.1.7+): baseline content hash check.
       //
-      // If the server doesn't supply a baseline_hash (older CLI /
-      // older server), this check is skipped — the engine ABI check
-      // above still provides the coarse guard.
+      // Soft gate: log a mismatch for telemetry but don't block the
+      // patch download. sha256(binary) is invalid for TestFlight /
+      // App Store builds because Apple's processing modifies the
+      // binary after upload. Downgraded from a hard reject to a
+      // warning until a distribution-proof identity replaces binary
+      // hashing. The engine ABI fingerprint (Phase 2 above) remains
+      // the hard safety gate.
       final expectedBaselineHash = data['baseline_hash'] as String?;
       if (expectedBaselineHash != null) {
         final actualBaselineHash = await _computeBaselineHash();
         if (actualBaselineHash != null &&
             actualBaselineHash != expectedBaselineHash) {
-          status.value = 'Incompatible baseline: hash mismatch';
           await _reportIncompatibleBaseline(
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            reason: 'Baseline hash mismatch (package-level layout '
-                'drift — e.g. different flutterplaza_code_push '
-                'version or different transitive Dart deps between '
-                'the patch and the running baseline)',
+            reason: 'Baseline hash mismatch (soft gate — proceeding '
+                'with download; engine ABI check is the hard gate)',
             expectedFingerprint: expectedBaselineHash,
             actualFingerprint: actualBaselineHash,
           );
-          return false;
         }
       }
 
       status.value = 'Downloading patch...';
+      print('[CP] downloading from $patchUrl');
       final dlR = await _httpGetBytes(patchUrl);
       if (dlR.statusCode != 200) {
         status.value = 'Download failed (${dlR.statusCode})';
@@ -318,122 +365,95 @@ abstract final class CodePush {
           return false; // Already loaded this session.
         }
         await _installPatchFromDart(patchBytes);
+        final patchDir = await _getPatchDir();
+
+        // Persist patch metadata so rollback can record which patch
+        // was bad.  Written before module load so it's available even
+        // if the load crashes the process.
+        if (patchDir != null) {
+          try {
+            final patchHash = sha256
+                .convert(patchBytes)
+                .toString();
+            File('$patchDir/patch_info.json').writeAsStringSync(
+              jsonEncode(<String, Object?>{
+                'patch_id': patchId,
+                'patch_hash': patchHash,
+                'installed_at': DateTime.now().toIso8601String(),
+              }),
+            );
+          } catch (_) {}
+        }
+
         try {
           // Extract the payload from the patch wrapper.
           final offsetBytes = patchBytes.buffer.asByteData();
           final payloadOffset = offsetBytes.getUint32(12, Endian.little);
           final payload = patchBytes.sublist(payloadOffset);
+          if (patchDir != null) {
+            _iosAppendDebugLog(
+              patchDir,
+              'BEFORE_LOAD patchId=$patchId bytes=${patchBytes.length} '
+              'payload=${payload.length}',
+            );
+          }
 
-          // Format guard: the Dart VM's dynamic module loader
-          // (`DN_Internal_loadDynamicModule`, reached via
-          // `ui.codePushLoadModule` → `Isolate.loadDynamicModule`)
-          // accepts a platform-specific AOT dynamic-module format:
-          //
-          //   * **iOS / macOS**: Mach-O 64-bit dylib
-          //     (`gen_snapshot --snapshot_kind=app-aot-macho-dylib`).
-          //     Magic bytes: `CF FA ED FE` (LE) or `FE ED FA CF`
-          //     (BE) for a 64-bit Mach-O.
-          //   * **Android / Linux**: ELF
-          //     (`gen_snapshot --snapshot_kind=app-aot-elf`).
-          //     Magic bytes: `7F 45 4C 46`.
-          //
-          // This branch runs on iOS only (the enclosing
-          // `Platform.isIOS` check is above), so we require
-          // Mach-O 64-bit here. Anything else aborts the VM
-          // inside the native with SIGABRT and no recoverable
-          // error — we diagnose the historical wrong formats so
-          // users upgrading from older CLI versions get a clear
-          // status message + immediate rollback instead of a
-          // process kill:
-          //
-          //   * `flutter_compile` ≤ 0.19.10 shipped Mach-O via
-          //     `App.framework/App`, but it was the *baseline*
-          //     binary — unrelated code, wrong symbols, still
-          //     aborted.
-          //   * `flutter_compile` 0.19.11 / 0.19.12 shipped raw
-          //     Dart kernel (`90 AB CD EF`).
-          //   * `flutter_compile` 0.19.13 shipped an ELF blob
-          //     (`7F 45 4C 46`) — right idea, wrong target
-          //     format for iOS.
-          //   * `flutter_compile` 0.19.14+ ships Mach-O dylib via
-          //     `fcp-tool snapshot --target ios`.
-          final isMachO64 = payload.length > 4 &&
-              ((payload[0] == 0xfe &&
-                      payload[1] == 0xed &&
-                      payload[2] == 0xfa &&
-                      payload[3] == 0xcf) ||
-                  (payload[0] == 0xcf &&
-                      payload[1] == 0xfa &&
-                      payload[2] == 0xed &&
-                      payload[3] == 0xfe));
-          if (!isMachO64 && payload.length > 4) {
-            final magicHex = payload
-                .take(4)
-                .map((b) => b.toRadixString(16).padLeft(2, '0'))
-                .join('');
-            final isELF = payload[0] == 0x7f &&
-                payload[1] == 0x45 &&
-                payload[2] == 0x4c &&
-                payload[3] == 0x46;
-            final isKernel = payload[0] == 0x90 &&
-                payload[1] == 0xab &&
-                payload[2] == 0xcd &&
-                payload[3] == 0xef;
-            final String diagnosis;
-            if (isELF) {
-              diagnosis = 'Patch is ELF (magic $magicHex) — iOS '
-                  'expects a Mach-O dylib. The CLI is targeting '
-                  'the wrong snapshot kind. Upgrade '
-                  'flutter_compile to 0.19.14+.';
-            } else if (isKernel) {
-              diagnosis = 'Patch is raw Dart kernel (magic '
-                  '$magicHex) — iOS expects a Mach-O dylib. The '
-                  'CLI needs to run `fcp-tool snapshot --target '
-                  'ios` on the kernel before packaging. Upgrade '
-                  'flutter_compile to 0.19.14+.';
-            } else {
-              diagnosis = 'Patch has unknown magic bytes '
-                  '$magicHex — expected Mach-O 64-bit dylib '
-                  '(cf fa ed fe).';
+          // Format guard: reject a patch payload that doesn't match
+          // the expected iOS header before handing it to the runtime.
+          // A mismatched payload cannot load cleanly, so we delete it
+          // and surface an upgrade hint instead.
+          bool headerMatches() {
+            if (payload.length < _iosPayloadHeader.length) return false;
+            for (var i = 0; i < _iosPayloadHeader.length; i++) {
+              if (payload[i] != _iosPayloadHeader[i]) return false;
             }
-            status.value = diagnosis;
+            return true;
+          }
+
+          if (!headerMatches()) {
+            if (patchDir != null) {
+              _iosAppendDebugLog(
+                patchDir,
+                'HEADER_MISMATCH patchId=$patchId payload=${payload.length}',
+              );
+            }
+            status.value = 'Patch format is unexpected — rolling back. '
+                'Upgrade flutter_compile to the latest version and '
+                'rebuild the patch.';
             await _iosImmediateRollback(
               serverUrl: serverUrl,
               appId: appId,
               patchId: patchId,
-              errorMessage: 'Patch magic mismatch (0x$magicHex, '
-                  'not Mach-O 64-bit) — rejected before '
-                  'loadDynamicModule',
+              errorMessage: 'Patch format mismatch — rejected before load',
             );
             return false;
           }
 
           status.value = 'Loading module...';
-          // `codePushLoadModule` is a runtime hook added by the custom
-          // code-push-enabled Flutter engine. It does not exist on the
-          // stock `dart:ui`, so the static analyzer can't see it. The
-          // presence check at the top of checkAndInstall
+          if (patchDir != null) {
+            _iosAppendDebugLog(
+              patchDir,
+              'CALL_LOAD patchId=$patchId payload=${payload.length}',
+            );
+          }
+          // Invoke the runtime hook exposed by the code-push-capable
+          // engine. The presence check above
           // (`_probeEngineFingerprint`) guarantees we only reach this
           // point on an engine that actually exposes the hook.
+          //
+          // Return-value semantics: the hook throws on real load
+          // failures (bad format, verification failure, etc.). Any
+          // non-throw return — including `null` — is a successful
+          // load. `null` in particular comes back when the payload
+          // loaded cleanly but had no entry-point function to invoke
+          // (for example, a delta whose contents are all already
+          // present in the baseline). That is a valid no-op, not a
+          // failure, and must NOT trigger rollback — rolling back
+          // would cause the next check to re-download, re-load, and
+          // loop tightly.
           final rawResult = await ui
               // ignore: undefined_function
               .codePushLoadModule(Uint8List.fromList(payload));
-
-          // If the engine returns null/false, the module failed to load
-          // (bad bytecode, version mismatch, verification failure).
-          // Delete the patch immediately instead of waiting for 3-boot
-          // auto-rollback.
-          if (rawResult == null || rawResult == false) {
-            status.value = 'Module load failed — rolling back patch';
-            await _iosImmediateRollback(
-              serverUrl: serverUrl,
-              appId: appId,
-              patchId: patchId,
-              errorMessage:
-                  'loadDynamicModule returned ${rawResult ?? "null"} — deleted immediately',
-            );
-            return false;
-          }
 
           // Module loaded live — no restart needed on iOS.
           // Auto-parse JSON strings into Map/List for structured data.
@@ -446,20 +466,41 @@ abstract final class CodePush {
               // Not JSON — keep as raw string.
             }
           }
-          _lastModuleResult = result;
           _moduleLoaded = true;
           moduleResult.value = result;
           status.value = 'Patch active';
+          // Clear any previous rollback marker — this patch works.
+          if (patchDir != null) {
+            try {
+              final rbFile = File('$patchDir/rolled_back_patch');
+              if (rbFile.existsSync()) rbFile.deleteSync();
+            } catch (_) {}
+          }
+          if (patchDir != null) {
+            _iosAppendDebugLog(
+              patchDir,
+              'AFTER_LOAD patchId=$patchId result=$result '
+              'moduleLoaded=$_moduleLoaded',
+            );
+          }
+          print('[CP] MODULE LOADED OK — result=$result moduleLoaded=$_moduleLoaded');
           return true;
         } catch (e) {
+          if (patchDir != null) {
+            _iosAppendDebugLog(
+              patchDir,
+              'LOAD_THROW patchId=$patchId error=$e',
+            );
+          }
+          print('[CP] MODULE LOAD THREW — $e');
           status.value = 'Module error: $e — rolling back patch';
-          // Patch is bad (corrupt bytecode, exception during load, etc.).
-          // Delete immediately instead of retrying for 3 boots.
+          // Real load failure. Delete immediately instead of waiting
+          // for the three-strike auto-rollback.
           await _iosImmediateRollback(
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            errorMessage: 'loadDynamicModule threw $e — deleted immediately',
+            errorMessage: 'Patch load threw $e — deleted immediately',
           );
           return false;
         }
@@ -485,54 +526,31 @@ abstract final class CodePush {
 
   // ── Baseline compatibility ──────────────────────────────────────
 
-  /// Whether the running Flutter engine has code push support.
+  /// Whether the running Flutter engine supports code push.
   ///
   /// Returns `true` only if the `flutter/codepush` method channel is
-  /// registered and responds to a cheap probe within 2 seconds. On a
-  /// stock Flutter engine the channel has no handler and the probe
-  /// either throws [MissingPluginException] or times out — both map
-  /// to `false`.
-  ///
-  /// The SDK uses this internally before loading any downloaded patch
-  /// to prevent the `DRT_AllocateObject` SIGSEGV that occurs when an
-  /// AOT snapshot's class layout disagrees with the running VM. Apps
-  /// can also call it directly to hide "check for updates" UI on
-  /// devices that don't have a code-push-enabled baseline installed.
+  /// registered and responds to a cheap probe within 2 seconds. Apps
+  /// can call this to hide "check for updates" UI on devices whose
+  /// baseline wasn't built for code push.
   static Future<bool> get hasCodePushEngine async {
     return (await _probeEngineFingerprint()) != null;
   }
 
-  /// Probes the running engine for its code push compatibility
-  /// fingerprint.
-  ///
-  /// Returns:
-  ///   * A fingerprint string if the engine exposes a
-  ///     `CodePush.getEngineAbi` handler (future code-push engines).
-  ///   * The literal string `"unknown"` if the engine has code push
-  ///     support but does not expose an ABI probe yet — still enough
-  ///     to satisfy the Phase 1 "engine is present" check.
-  ///   * `null` if the engine has no code push support at all (no
-  ///     handler on the channel, or the probe times out).
-  ///
-  /// The implementation tries `CodePush.getEngineAbi` first (Phase 2
-  /// ABI match), then falls back to `CodePush.getReleaseVersion`
-  /// which has been on every code-push engine since the first
-  /// release (Phase 1 presence check). Both calls are bounded with a
-  /// 2-second timeout so a misbehaving channel can't wedge the SDK.
+  /// Probes the running engine for a code push compatibility
+  /// fingerprint. Returns a fingerprint string on success, `"unknown"`
+  /// as a fallback for older baselines that respond to the probe but
+  /// don't yet expose an ABI identifier, or `null` when no code push
+  /// support is present. Bounded with a 2-second timeout.
   static Future<String?> _probeEngineFingerprint() async {
-    // Phase 2 probe — new engines can expose a real ABI string.
     try {
       final abi = await _channel
           .invokeMethod<String>('CodePush.getEngineAbi')
           .timeout(const Duration(seconds: 2));
       if (abi != null && abi.isNotEmpty) return abi;
     } catch (_) {
-      // Fall through to Phase 1 probe — engine may be older.
+      // Fall through to the fallback probe.
     }
 
-    // Phase 1 probe — "is a code-push engine present at all?".
-    // getReleaseVersion has existed on every code-push engine build
-    // and is cheap (just reads an NSDictionary entry / Java field).
     try {
       await _channel
           .invokeMethod<String>('CodePush.getReleaseVersion')
@@ -608,6 +626,28 @@ abstract final class CodePush {
   /// once per session is fine. Non-iOS is a no-op for now (the
   /// Android engine loads patches differently and the crash path
   /// the hash guards against is iOS-specific).
+  static String? _cachedBaselineId;
+
+  /// Read the distribution-proof baseline UUID from Info.plist
+  /// (`FCPBaselineId` key, written by `fcp codepush release`).
+  /// Returns null when the key is absent (older CLI or non-iOS).
+  static Future<String?> _readBaselineId() async {
+    if (_cachedBaselineId != null) return _cachedBaselineId;
+    try {
+      if (!Platform.isIOS) return null;
+      final id = await _pluginChannel
+          .invokeMethod<String>('getBaselineId')
+          .timeout(const Duration(seconds: 2));
+      if (id != null && id.isNotEmpty) {
+        _cachedBaselineId = id;
+        return id;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   static Future<String?> _computeBaselineHash() async {
     if (_cachedBaselineHash != null) return _cachedBaselineHash;
     try {
@@ -730,7 +770,7 @@ abstract final class CodePush {
     if (patchDir == null) {
       throw CodePushException('No patch directory configured.');
     }
-    final patchFile = File('$patchDir/patch.vmcode');
+    final patchFile = File('$patchDir/$_patchFilename');
     if (!patchFile.existsSync()) {
       throw CodePushException('No active patch to roll back.');
     }
@@ -739,7 +779,6 @@ abstract final class CodePush {
     if (infoFile.existsSync()) infoFile.deleteSync();
     _iosResetBootCounter(patchDir);
     _moduleLoaded = false;
-    _lastModuleResult = null;
     moduleResult.value = null;
   }
 
@@ -803,7 +842,7 @@ abstract final class CodePush {
       dir.createSync(recursive: true);
     }
 
-    final file = File('$patchDir/patch.vmcode');
+    final file = File('$patchDir/$_patchFilename');
     await file.writeAsBytes(patchBytes, flush: true);
   }
 
@@ -829,7 +868,7 @@ abstract final class CodePush {
     try {
       final patchDir = await _getPatchDir();
       if (patchDir == null) return;
-      final patchFile = File('$patchDir/patch.vmcode');
+      final patchFile = File('$patchDir/$_patchFilename');
       if (!patchFile.existsSync()) return; // No patch, nothing to protect.
 
       if (_iosCheckAndAutoRollback(patchDir)) {
@@ -877,12 +916,34 @@ abstract final class CodePush {
     required String? patchId,
     required String errorMessage,
   }) async {
-    // 1. Delete the patch files from disk.
+    // 1. Record which patch was rolled back, then delete files.
     try {
       final patchDir = await _getPatchDir();
       if (patchDir != null) {
-        final patchFile = File('$patchDir/patch.vmcode');
-        if (await patchFile.exists()) await patchFile.delete();
+        // Read patch metadata before deleting so we can record the
+        // rolled-back ID + hash.  This marker persists across cold
+        // starts to prevent re-downloading the same bad patch.
+        try {
+          final infoFile = File('$patchDir/patch_info.json');
+          if (infoFile.existsSync()) {
+            final info = jsonDecode(infoFile.readAsStringSync())
+                as Map<String, dynamic>;
+            File('$patchDir/rolled_back_patch').writeAsStringSync(
+              jsonEncode(<String, Object?>{
+                'patch_id': info['patch_id'],
+                'patch_hash': info['patch_hash'],
+                'rolled_back_at': DateTime.now().toIso8601String(),
+              }),
+            );
+          }
+        } catch (_) {}
+
+        // Delete both the new (patch.bytecode) and legacy (patch.vmcode)
+        // filenames to be safe across SDK upgrades.
+        for (final name in const ['patch.bytecode', 'patch.vmcode']) {
+          final f = File('$patchDir/$name');
+          if (await f.exists()) await f.delete();
+        }
         final infoFile = File('$patchDir/patch_info.json');
         if (await infoFile.exists()) await infoFile.delete();
         _iosResetBootCounter(patchDir);
@@ -898,7 +959,6 @@ abstract final class CodePush {
 
     // 3. Reset in-memory module state so the app runs on baseline.
     _moduleLoaded = false;
-    _lastModuleResult = null;
     moduleResult.value = null;
 
     // 4. Report the failure to the server (fire-and-forget).
@@ -975,16 +1035,49 @@ abstract final class CodePush {
     _iosWriteBootCounter(patchDir, 0);
   }
 
+  static void _iosAppendDebugLog(String patchDir, String line) {
+    try {
+      final dir = Directory(patchDir);
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      final stamp = DateTime.now().toIso8601String();
+      File('$patchDir/cp_debug.log').writeAsStringSync(
+        '[$stamp] $line\n',
+        mode: FileMode.append,
+        flush: true,
+      );
+    } catch (_) {}
+  }
+
   /// Returns true if a rollback was performed.
   static bool _iosCheckAndAutoRollback(String patchDir) {
     final count = _iosReadBootCounter(patchDir);
     if (count < _maxBootAttempts) return false;
 
-    // Auto-rollback: remove the patch and reset the counter.
+    // Auto-rollback: record which patch was bad, then remove files.
     try {
-      final patchFile = File('$patchDir/patch.vmcode');
-      if (patchFile.existsSync()) patchFile.deleteSync();
+      // Record the rolled-back patch ID + hash before deleting.
       final infoFile = File('$patchDir/patch_info.json');
+      if (infoFile.existsSync()) {
+        try {
+          final info = jsonDecode(infoFile.readAsStringSync())
+              as Map<String, dynamic>;
+          File('$patchDir/rolled_back_patch').writeAsStringSync(
+            jsonEncode(<String, Object?>{
+              'patch_id': info['patch_id'],
+              'patch_hash': info['patch_hash'],
+              'rolled_back_at': DateTime.now().toIso8601String(),
+            }),
+          );
+        } catch (_) {}
+      }
+
+      // Delete both the new (patch.bytecode) and legacy (patch.vmcode)
+      // filenames defensively — a device upgrading from 0.1.10 might
+      // still have the legacy file on disk.
+      for (final name in const ['patch.bytecode', 'patch.vmcode']) {
+        final f = File('$patchDir/$name');
+        if (f.existsSync()) f.deleteSync();
+      }
       if (infoFile.existsSync()) infoFile.deleteSync();
       _iosResetBootCounter(patchDir);
     } catch (_) {}
@@ -1092,6 +1185,7 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    CodePush.status.addListener(_onModuleLoaded);
     CodePush.moduleResult.addListener(_onModuleLoaded);
     final cfg = _config;
     CodePush.init(
@@ -1107,13 +1201,14 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   }
 
   void _onModuleLoaded() {
-    if (CodePush.moduleResult.value != null && mounted) {
+    if (mounted && !_patchActive && CodePush.status.value == 'Patch active') {
       setState(() => _patchActive = true);
     }
   }
 
   @override
   void dispose() {
+    CodePush.status.removeListener(_onModuleLoaded);
     CodePush.moduleResult.removeListener(_onModuleLoaded);
     CodePush.dispose();
     WidgetsBinding.instance.removeObserver(this);
@@ -1142,7 +1237,10 @@ class _CodePushOverlayState extends State<CodePushOverlay>
       textDirection: TextDirection.ltr,
       child: Stack(
         children: [
-          widget.child,
+          KeyedSubtree(
+            key: ValueKey<bool>(_patchActive),
+            child: widget.child,
+          ),
           if (widget.showDebugBar && !_patchActive)
             Positioned(
               top: 0,
@@ -1176,7 +1274,7 @@ class _CodePushOverlayState extends State<CodePushOverlay>
                       context,
                       CodePush.restart,
                       () => setState(() => _updateReady = false),
-                    )!
+                    )
                   : _DefaultUpdateBanner(
                       onRestart: CodePush.restart,
                       onDismiss: () => setState(() => _updateReady = false),
