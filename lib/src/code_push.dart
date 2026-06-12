@@ -12,8 +12,10 @@ import 'package:flutter/services.dart';
 import 'models.dart';
 
 /// The platform channel used to communicate with the code push engine.
-const MethodChannel _channel =
-    MethodChannel('flutter/codepush', JSONMethodCodec());
+const MethodChannel _channel = MethodChannel(
+  'flutter/codepush',
+  JSONMethodCodec(),
+);
 
 /// Channel for the SDK's own native plugin (reads Info.plist, etc.).
 const MethodChannel _pluginChannel = MethodChannel('flutterplaza_code_push');
@@ -81,12 +83,7 @@ abstract final class CodePush {
 
   /// Expected first 4 bytes of every iOS patch payload after
   /// unwrapping the on-disk header. Opaque format marker.
-  static const List<int> _iosPayloadHeader = <int>[
-    0x33,
-    0x43,
-    0x42,
-    0x44,
-  ];
+  static const List<int> _iosPayloadHeader = <int>[0x33, 0x43, 0x42, 0x44];
 
   /// Debug status notifier — shows what code push is doing.
   static final ValueNotifier<String> status = ValueNotifier('init');
@@ -151,6 +148,11 @@ abstract final class CodePush {
       // so a rollback doesn't get immediately overwritten by a success report.
       _startLaunchTimer();
 
+      // Report any rollback that was recorded natively before Dart started
+      // (crash-loop protection runs before main(), so without this the
+      // server never hears about it). Best-effort, fire-and-forget.
+      _reportPendingNativeRollback(serverUrl: serverUrl, appId: appId);
+
       // Immediate check is now *after* crash protection so a bad patch
       // on disk gets a chance to increment the boot counter before we
       // replace it.
@@ -204,7 +206,8 @@ abstract final class CodePush {
       // (further down) still protects us.
       final deviceBaselineHash = await _computeBaselineHash();
       final deviceBaselineId = await _readBaselineId();
-      final url = '$serverUrl/api/v1/updates'
+      final url =
+          '$serverUrl/api/v1/updates'
           '?app_id=$appId'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
@@ -240,20 +243,23 @@ abstract final class CodePush {
           final rbFile = File('$patchDir/rolled_back_patch');
           if (rbFile.existsSync()) {
             try {
-              final rb = jsonDecode(rbFile.readAsStringSync())
-                  as Map<String, dynamic>;
+              final rb =
+                  jsonDecode(rbFile.readAsStringSync()) as Map<String, dynamic>;
               final rbId = rb['patch_id']?.toString();
               final rbHash = rb['patch_hash']?.toString();
               final serverPatchId = patchId;
               final serverPatchHash = data['patch_hash']?.toString();
               final idMatch = rbId != null && rbId == serverPatchId;
-              final hashMatch = rbHash != null &&
+              final hashMatch =
+                  rbHash != null &&
                   serverPatchHash != null &&
                   rbHash == serverPatchHash;
-              print('[CP] rollback check: rbId=$rbId serverId=$serverPatchId '
-                  'idMatch=$idMatch rbHash=${rbHash?.substring(0, 8)}... '
-                  'serverHash=${serverPatchHash?.substring(0, 8)}... '
-                  'hashMatch=$hashMatch');
+              print(
+                '[CP] rollback check: rbId=$rbId serverId=$serverPatchId '
+                'idMatch=$idMatch rbHash=${rbHash?.substring(0, 8)}... '
+                'serverHash=${serverPatchHash?.substring(0, 8)}... '
+                'hashMatch=$hashMatch',
+              );
               if (idMatch || hashMatch) {
                 status.value = 'Skipping rolled-back patch $patchId';
                 print('[CP] SKIPPING rolled-back patch');
@@ -291,7 +297,8 @@ abstract final class CodePush {
           serverUrl: serverUrl,
           appId: appId,
           patchId: patchId,
-          reason: 'Engine has no code push support (stock Flutter engine '
+          reason:
+              'Engine has no code push support (stock Flutter engine '
               'or missing flutter/codepush method channel).',
           expectedFingerprint: expectedEngineFingerprint,
           actualFingerprint: null,
@@ -306,7 +313,8 @@ abstract final class CodePush {
       if (expectedEngineFingerprint != null &&
           actualEngineFingerprint != 'unknown' &&
           expectedEngineFingerprint != actualEngineFingerprint) {
-        status.value = 'Incompatible baseline: engine ABI mismatch '
+        status.value =
+            'Incompatible baseline: engine ABI mismatch '
             '($actualEngineFingerprint vs $expectedEngineFingerprint)';
         await _reportIncompatibleBaseline(
           serverUrl: serverUrl,
@@ -337,7 +345,8 @@ abstract final class CodePush {
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            reason: 'Baseline hash mismatch (soft gate — proceeding '
+            reason:
+                'Baseline hash mismatch (soft gate — proceeding '
                 'with download; engine ABI check is the hard gate)',
             expectedFingerprint: expectedBaselineHash,
             actualFingerprint: actualBaselineHash,
@@ -372,9 +381,7 @@ abstract final class CodePush {
         // if the load crashes the process.
         if (patchDir != null) {
           try {
-            final patchHash = sha256
-                .convert(patchBytes)
-                .toString();
+            final patchHash = sha256.convert(patchBytes).toString();
             File('$patchDir/patch_info.json').writeAsStringSync(
               jsonEncode(<String, Object?>{
                 'patch_id': patchId,
@@ -417,7 +424,8 @@ abstract final class CodePush {
                 'HEADER_MISMATCH patchId=$patchId payload=${payload.length}',
               );
             }
-            status.value = 'Patch format is unexpected — rolling back. '
+            status.value =
+                'Patch format is unexpected — rolling back. '
                 'Upgrade flutter_compile to the latest version and '
                 'rebuild the patch.';
             await _iosImmediateRollback(
@@ -483,7 +491,9 @@ abstract final class CodePush {
               'moduleLoaded=$_moduleLoaded',
             );
           }
-          print('[CP] MODULE LOADED OK — result=$result moduleLoaded=$_moduleLoaded');
+          print(
+            '[CP] MODULE LOADED OK — result=$result moduleLoaded=$_moduleLoaded',
+          );
           return true;
         } catch (e) {
           if (patchDir != null) {
@@ -588,11 +598,71 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req =
-            await client.postUrl(uri).timeout(const Duration(seconds: 5));
+        final req = await client
+            .postUrl(uri)
+            .timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json');
         req.write(jsonEncode(payload));
         await req.close().timeout(const Duration(seconds: 5));
+      } finally {
+        client.close(force: true);
+      }
+    } catch (_) {
+      // Telemetry is best-effort. Never crash over it.
+    }
+  }
+
+  /// Best-effort: report a rollback that the native side recorded in the
+  /// patch directory (automatic crash-loop rollbacks happen before any
+  /// Dart code runs, so they can only be reported after the fact). The
+  /// marker is cleared once the server has received the report; if the
+  /// device is offline, we retry on the next launch.
+  static Future<void> _reportPendingNativeRollback({
+    required String serverUrl,
+    required String appId,
+  }) async {
+    try {
+      final patchDir = await _getPatchDir();
+      if (patchDir == null) return;
+      final marker = File('$patchDir/rollback_info.json');
+      if (!marker.existsSync()) return;
+
+      Map<String, dynamic> info;
+      try {
+        info = jsonDecode(marker.readAsStringSync()) as Map<String, dynamic>;
+      } catch (_) {
+        // Unreadable marker — clear it so it can't wedge future launches.
+        try {
+          marker.deleteSync();
+        } catch (_) {}
+        return;
+      }
+
+      final payload = <String, dynamic>{
+        'app_id': appId,
+        'kind': 'auto_rollback',
+        'reason': info['reason'] ?? 'unknown',
+        'platform': _platform,
+        if (info['patch_version'] != null)
+          'patch_version': info['patch_version'],
+        if (info['boot_count'] != null) 'boot_count': info['boot_count'],
+        if (info['rolled_back_at'] != null)
+          'rolled_back_at': info['rolled_back_at'],
+      };
+      final client = HttpClient();
+      try {
+        final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
+        final req = await client
+            .postUrl(uri)
+            .timeout(const Duration(seconds: 5));
+        req.headers.set('Content-Type', 'application/json');
+        req.write(jsonEncode(payload));
+        final res = await req.close().timeout(const Duration(seconds: 5));
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try {
+            marker.deleteSync();
+          } catch (_) {}
+        }
       } finally {
         client.close(force: true);
       }
@@ -684,10 +754,8 @@ abstract final class CodePush {
   /// Checks the engine for available updates (delegates to Dart side HTTP).
   static Future<UpdateInfo> checkForUpdate() async {
     try {
-      final Map<String, dynamic>? result =
-          await _channel.invokeMapMethod<String, dynamic>(
-        'CodePush.checkForUpdate',
-      );
+      final Map<String, dynamic>? result = await _channel
+          .invokeMapMethod<String, dynamic>('CodePush.checkForUpdate');
       if (result == null) {
         throw CodePushException(
           'Failed to check for update: no response from engine.',
@@ -730,10 +798,8 @@ abstract final class CodePush {
   /// Returns information about the currently installed patch, or null if
   /// no patch is active.
   static Future<PatchInfo?> get currentPatch async {
-    final Map<String, dynamic>? result =
-        await _channel.invokeMapMethod<String, dynamic>(
-      'CodePush.getCurrentPatch',
-    );
+    final Map<String, dynamic>? result = await _channel
+        .invokeMapMethod<String, dynamic>('CodePush.getCurrentPatch');
     if (result == null) return null;
     return PatchInfo(
       version: result['version'] as String,
@@ -760,8 +826,9 @@ abstract final class CodePush {
   static Future<void> rollback() async {
     // Try engine-side rollback first (works on Android/desktop).
     try {
-      final bool? success =
-          await _channel.invokeMethod<bool>('CodePush.rollback');
+      final bool? success = await _channel.invokeMethod<bool>(
+        'CodePush.rollback',
+      );
       if (success == true) return;
     } catch (_) {}
 
@@ -792,8 +859,9 @@ abstract final class CodePush {
   ///
   /// Throws [CodePushException] if the download or application fails.
   static Future<void> downloadAndApply() async {
-    final result =
-        await _channel.invokeMethod<bool>('CodePush.downloadAndApply');
+    final result = await _channel.invokeMethod<bool>(
+      'CodePush.downloadAndApply',
+    );
     if (result != true) {
       throw CodePushException('Failed to download and apply patch.');
     }
@@ -831,8 +899,9 @@ abstract final class CodePush {
   /// which breaks Apple Clang LTO.
   static Future<void> _installPatchFromDart(Uint8List patchBytes) async {
     // Ask the engine for its configured patch directory path.
-    final patchDir =
-        await _channel.invokeMethod<String>('CodePush.getPatchDir');
+    final patchDir = await _channel.invokeMethod<String>(
+      'CodePush.getPatchDir',
+    );
     if (patchDir == null || patchDir.isEmpty) {
       throw CodePushException('Engine returned no patch directory.');
     }
@@ -926,8 +995,8 @@ abstract final class CodePush {
         try {
           final infoFile = File('$patchDir/patch_info.json');
           if (infoFile.existsSync()) {
-            final info = jsonDecode(infoFile.readAsStringSync())
-                as Map<String, dynamic>;
+            final info =
+                jsonDecode(infoFile.readAsStringSync()) as Map<String, dynamic>;
             File('$patchDir/rolled_back_patch').writeAsStringSync(
               jsonEncode(<String, Object?>{
                 'patch_id': info['patch_id'],
@@ -1059,8 +1128,8 @@ abstract final class CodePush {
       final infoFile = File('$patchDir/patch_info.json');
       if (infoFile.existsSync()) {
         try {
-          final info = jsonDecode(infoFile.readAsStringSync())
-              as Map<String, dynamic>;
+          final info =
+              jsonDecode(infoFile.readAsStringSync()) as Map<String, dynamic>;
           File('$patchDir/rolled_back_patch').writeAsStringSync(
             jsonEncode(<String, Object?>{
               'patch_id': info['patch_id'],
@@ -1150,8 +1219,11 @@ class CodePushOverlay extends StatefulWidget {
   /// Optional custom banner builder. If null, uses the default banner.
   /// Return `null` to hide the banner.
   final Widget Function(
-          BuildContext context, VoidCallback onRestart, VoidCallback onDismiss)?
-      bannerBuilder;
+    BuildContext context,
+    VoidCallback onRestart,
+    VoidCallback onDismiss,
+  )?
+  bannerBuilder;
 
   /// Whether to show the debug status bar at the top. Defaults to false.
   final bool showDebugBar;
@@ -1237,10 +1309,7 @@ class _CodePushOverlayState extends State<CodePushOverlay>
       textDirection: TextDirection.ltr,
       child: Stack(
         children: [
-          KeyedSubtree(
-            key: ValueKey<bool>(_patchActive),
-            child: widget.child,
-          ),
+          KeyedSubtree(key: ValueKey<bool>(_patchActive), child: widget.child),
           if (widget.showDebugBar && !_patchActive)
             Positioned(
               top: 0,
@@ -1255,11 +1324,14 @@ class _CodePushOverlayState extends State<CodePushOverlay>
                   child: Container(
                     color: const Color(0xFF1A237E),
                     padding: const EdgeInsets.fromLTRB(12, 50, 12, 6),
-                    child: Text('CP: $status',
-                        style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 11,
-                            decoration: TextDecoration.none)),
+                    child: Text(
+                      'CP: $status',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        decoration: TextDecoration.none,
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -1308,18 +1380,10 @@ class _DefaultUpdateBanner extends StatelessWidget {
           children: [
             const Icon(Icons.system_update, size: 20),
             const SizedBox(width: 12),
-            const Expanded(
-              child: Text('Update ready. Restart to apply.'),
-            ),
-            TextButton(
-              onPressed: onDismiss,
-              child: const Text('LATER'),
-            ),
+            const Expanded(child: Text('Update ready. Restart to apply.')),
+            TextButton(onPressed: onDismiss, child: const Text('LATER')),
             const SizedBox(width: 4),
-            FilledButton(
-              onPressed: onRestart,
-              child: const Text('RESTART'),
-            ),
+            FilledButton(onPressed: onRestart, child: const Text('RESTART')),
           ],
         ),
       ),
@@ -1358,7 +1422,7 @@ class CodePushPatchBuilder extends StatelessWidget {
 
   /// Builder called with the patch data string (or null if no patch).
   final Widget Function(BuildContext context, String? patchData, Widget? child)
-      builder;
+  builder;
 
   /// Optional child widget passed to the builder (typically the default/baseline UI).
   final Widget? child;
@@ -1372,7 +1436,10 @@ class CodePushPatchBuilder extends StatelessWidget {
           if (patchKey != null) {
             if (result.startsWith('$patchKey:')) {
               return builder(
-                  context, result.substring(patchKey!.length + 1), child);
+                context,
+                result.substring(patchKey!.length + 1),
+                child,
+              );
             }
             return builder(context, null, child);
           }
@@ -1398,8 +1465,10 @@ Future<_HttpResult> _httpGet(String url) async {
   try {
     final request = await client.getUrl(Uri.parse(url));
     final response = await request.close();
-    final bytes = await response
-        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
+    final bytes = await response.fold<List<int>>(
+      <int>[],
+      (prev, chunk) => prev..addAll(chunk),
+    );
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
     client.close();
@@ -1411,8 +1480,10 @@ Future<_HttpResult> _httpGetBytes(String url) async {
   try {
     final request = await client.getUrl(Uri.parse(url));
     final response = await request.close();
-    final bytes = await response
-        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
+    final bytes = await response.fold<List<int>>(
+      <int>[],
+      (prev, chunk) => prev..addAll(chunk),
+    );
     return _HttpResult(response.statusCode, '', bytes);
   } finally {
     client.close();
@@ -1428,8 +1499,10 @@ Future<_HttpResult> _httpPostJson(String url, Map<String, dynamic> body) async {
     request.contentLength = encoded.length;
     request.add(encoded);
     final response = await request.close();
-    final bytes = await response
-        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
+    final bytes = await response.fold<List<int>>(
+      <int>[],
+      (prev, chunk) => prev..addAll(chunk),
+    );
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
     client.close();
