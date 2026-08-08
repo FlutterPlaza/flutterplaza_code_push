@@ -206,8 +206,7 @@ abstract final class CodePush {
       // (further down) still protects us.
       final deviceBaselineHash = await _computeBaselineHash();
       final deviceBaselineId = await _readBaselineId();
-      final url =
-          '$serverUrl/api/v1/updates'
+      final url = '$serverUrl/api/v1/updates'
           '?app_id=$appId'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
@@ -250,8 +249,7 @@ abstract final class CodePush {
               final serverPatchId = patchId;
               final serverPatchHash = data['patch_hash']?.toString();
               final idMatch = rbId != null && rbId == serverPatchId;
-              final hashMatch =
-                  rbHash != null &&
+              final hashMatch = rbHash != null &&
                   serverPatchHash != null &&
                   rbHash == serverPatchHash;
               print(
@@ -297,8 +295,7 @@ abstract final class CodePush {
           serverUrl: serverUrl,
           appId: appId,
           patchId: patchId,
-          reason:
-              'Engine has no code push support (stock Flutter engine '
+          reason: 'Engine has no code push support (stock Flutter engine '
               'or missing flutter/codepush method channel).',
           expectedFingerprint: expectedEngineFingerprint,
           actualFingerprint: null,
@@ -313,8 +310,7 @@ abstract final class CodePush {
       if (expectedEngineFingerprint != null &&
           actualEngineFingerprint != 'unknown' &&
           expectedEngineFingerprint != actualEngineFingerprint) {
-        status.value =
-            'Incompatible baseline: engine ABI mismatch '
+        status.value = 'Incompatible baseline: engine ABI mismatch '
             '($actualEngineFingerprint vs $expectedEngineFingerprint)';
         await _reportIncompatibleBaseline(
           serverUrl: serverUrl,
@@ -345,8 +341,7 @@ abstract final class CodePush {
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            reason:
-                'Baseline hash mismatch (soft gate — proceeding '
+            reason: 'Baseline hash mismatch (soft gate — proceeding '
                 'with download; engine ABI check is the hard gate)',
             expectedFingerprint: expectedBaselineHash,
             actualFingerprint: actualBaselineHash,
@@ -424,8 +419,7 @@ abstract final class CodePush {
                 'HEADER_MISMATCH patchId=$patchId payload=${payload.length}',
               );
             }
-            status.value =
-                'Patch format is unexpected — rolling back. '
+            status.value = 'Patch format is unexpected — rolling back. '
                 'Upgrade flutter_compile to the latest version and '
                 'rebuild the patch.';
             await _iosImmediateRollback(
@@ -598,9 +592,8 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req = await client
-            .postUrl(uri)
-            .timeout(const Duration(seconds: 5));
+        final req =
+            await client.postUrl(uri).timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json');
         req.write(jsonEncode(payload));
         await req.close().timeout(const Duration(seconds: 5));
@@ -652,9 +645,8 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req = await client
-            .postUrl(uri)
-            .timeout(const Duration(seconds: 5));
+        final req =
+            await client.postUrl(uri).timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json');
         req.write(jsonEncode(payload));
         final res = await req.close().timeout(const Duration(seconds: 5));
@@ -676,6 +668,35 @@ abstract final class CodePush {
   /// session, since the AOT snapshot can't change while the app is
   /// running.
   static String? _cachedBaselineHash;
+
+  /// When the last hash computation failed (null result), the failure is
+  /// remembered here so one check cycle doesn't pay the platform-channel
+  /// timeout twice — [checkAndInstall] computes the hash at both the query
+  /// step and the soft-gate step. Retried after [_baselineHashRetryAfter]:
+  /// a transient first-boot failure (slow storage, cold cache) must not
+  /// disable the baseline gate for the whole session.
+  static DateTime? _baselineHashFailedAt;
+
+  /// How long a failed hash computation short-circuits before retrying.
+  static const Duration _baselineHashRetryAfter = Duration(minutes: 1);
+
+  /// In-flight hash computation, shared so concurrent callers don't stack
+  /// duplicate platform-channel invocations (and duplicate native hashing
+  /// threads) while one is already running.
+  static Future<String?>? _baselineHashInFlight;
+
+  /// Test-only: forces the Android branch of the baseline-hash path in
+  /// host unit tests, where `Platform.isAndroid` is always false.
+  @visibleForTesting
+  static bool debugForceAndroidPlatform = false;
+
+  /// Test-only: clears the baseline-hash session state between tests.
+  @visibleForTesting
+  static void debugResetBaselineHashCache() {
+    _cachedBaselineHash = null;
+    _baselineHashFailedAt = null;
+    _baselineHashInFlight = null;
+  }
 
   /// Cached distribution-proof baseline UUID (see [_readBaselineId]).
   static String? _cachedBaselineId;
@@ -718,10 +739,30 @@ abstract final class CodePush {
   /// AOT blob takes ~20–50 ms on a modern device — once per session
   /// is fine. On iOS the blob is read from the app bundle; on Android
   /// it is read from the platform side.
-  static Future<String?> _computeBaselineHash() async {
-    if (_cachedBaselineHash != null) return _cachedBaselineHash;
+  ///
+  /// Failures are memoized briefly (see [_baselineHashFailedAt]) and
+  /// concurrent callers share one in-flight computation, so a device that
+  /// can't produce a hash pays the platform-channel timeout at most once
+  /// per retry window instead of on every call.
+  static Future<String?> _computeBaselineHash() {
+    if (_cachedBaselineHash != null) {
+      return Future.value(_cachedBaselineHash);
+    }
+    final failedAt = _baselineHashFailedAt;
+    if (failedAt != null &&
+        DateTime.now().difference(failedAt) < _baselineHashRetryAfter) {
+      return Future.value(null);
+    }
+    return _baselineHashInFlight ??=
+        _computeBaselineHashUncached().then((hash) {
+      if (hash == null) _baselineHashFailedAt = DateTime.now();
+      return hash;
+    }).whenComplete(() => _baselineHashInFlight = null);
+  }
+
+  static Future<String?> _computeBaselineHashUncached() async {
     try {
-      if (Platform.isAndroid) {
+      if (debugForceAndroidPlatform || Platform.isAndroid) {
         // Android packages the AOT snapshot as lib/<abi>/libapp.so inside
         // the APK; the platform side reads and hashes it. Generous timeout:
         // a first-boot hash of a multi-MB entry on slow storage with a cold
@@ -1236,8 +1277,7 @@ class CodePushOverlay extends StatefulWidget {
     BuildContext context,
     VoidCallback onRestart,
     VoidCallback onDismiss,
-  )?
-  bannerBuilder;
+  )? bannerBuilder;
 
   /// Whether to show the debug status bar at the top. Defaults to false.
   final bool showDebugBar;
@@ -1436,7 +1476,7 @@ class CodePushPatchBuilder extends StatelessWidget {
 
   /// Builder called with the patch data string (or null if no patch).
   final Widget Function(BuildContext context, String? patchData, Widget? child)
-  builder;
+      builder;
 
   /// Optional child widget passed to the builder (typically the default/baseline UI).
   final Widget? child;

@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -65,8 +66,14 @@ class FlutterplazaCodePushPlugin : FlutterPlugin, MethodChannel.MethodCallHandle
    * APK on a 64-bit device hashes the armeabi-v7a entry, not a nonexistent
    * arm64 one). Each archive is tried independently: one unreadable APK
    * doesn't abort the scan of the rest.
+   *
+   * Work is bounded: the read loop stops early once the plugin detaches
+   * or [HASH_BUDGET_MS] elapses (the Dart caller has given up by then),
+   * so an abandoned request can't keep streaming a large APK on slow
+   * storage indefinitely.
    */
   private fun computeAppLibHash(): String? {
+    val deadline = SystemClock.elapsedRealtime() + HASH_BUDGET_MS
     val info = context.applicationInfo
     val apks = buildList {
       info.sourceDir?.let { add(it) }
@@ -75,21 +82,23 @@ class FlutterplazaCodePushPlugin : FlutterPlugin, MethodChannel.MethodCallHandle
     for (abi in Build.SUPPORTED_ABIS) {
       val entryName = "lib/$abi/libapp.so"
       for (apk in apks) {
-        val hash = runCatching { hashZipEntry(apk, entryName) }.getOrNull()
+        val hash = runCatching { hashZipEntry(apk, entryName, deadline) }.getOrNull()
         if (hash != null) return hash
       }
     }
     return null
   }
 
-  /** Streams SHA-256 over [entryName] inside [apkPath]; null if absent. */
-  private fun hashZipEntry(apkPath: String, entryName: String): String? {
+  /** Streams SHA-256 over [entryName] inside [apkPath]; null if absent,
+   * or if the plugin detaches / [deadline] passes mid-read. */
+  private fun hashZipEntry(apkPath: String, entryName: String, deadline: Long): String? {
     ZipFile(apkPath).use { zip ->
       val entry = zip.getEntry(entryName) ?: return null
       val digest = MessageDigest.getInstance("SHA-256")
       zip.getInputStream(entry).use { input ->
         val buf = ByteArray(64 * 1024)
         while (true) {
+          if (!attached || SystemClock.elapsedRealtime() > deadline) return null
           val n = input.read(buf)
           if (n < 0) break
           digest.update(buf, 0, n)
@@ -97,5 +106,11 @@ class FlutterplazaCodePushPlugin : FlutterPlugin, MethodChannel.MethodCallHandle
       }
       return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
+  }
+
+  private companion object {
+    /** Slightly past the Dart caller's 10 s timeout: once this elapses
+     * the reply can no longer be used, so the stream is abandoned. */
+    const val HASH_BUDGET_MS = 12_000L
   }
 }
