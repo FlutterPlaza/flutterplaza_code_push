@@ -621,11 +621,10 @@ abstract final class CodePush {
   /// to load a patch whose recorded baseline hash disagrees with
   /// this value.
   ///
-  /// Cached in memory after first computation. Reading the few-MB
-  /// AOT blob and hashing it takes ~20–50 ms on a modern device —
-  /// once per session is fine. Non-iOS is a no-op for now (the
-  /// Android engine loads patches differently and the crash path
-  /// the hash guards against is iOS-specific).
+  /// Cached in memory after first computation. Hashing the few-MB
+  /// AOT blob takes ~20–50 ms on a modern device — once per session
+  /// is fine. On iOS the blob is read from the app bundle; on Android
+  /// it is read from the platform side.
   static String? _cachedBaselineId;
 
   /// Read the distribution-proof baseline UUID from Info.plist
@@ -651,6 +650,18 @@ abstract final class CodePush {
   static Future<String?> _computeBaselineHash() async {
     if (_cachedBaselineHash != null) return _cachedBaselineHash;
     try {
+      if (Platform.isAndroid) {
+        // Android packages the AOT snapshot as lib/<abi>/libapp.so inside
+        // the APK; the platform side reads and hashes it.
+        final hash = await _pluginChannel
+            .invokeMethod<String>('getAppLibHash')
+            .timeout(const Duration(seconds: 3));
+        if (hash != null && hash.isNotEmpty) {
+          _cachedBaselineHash = hash;
+          return hash;
+        }
+        return null;
+      }
       if (!Platform.isIOS) return null;
 
       // On iOS, Platform.resolvedExecutable points at
