@@ -18,6 +18,29 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Route the review model by PR complexity: small mechanical diffs get
+      # Haiku, standard changes get Sonnet, and large or sensitive-path
+      # changes (device-shipping native/plugin code, the core Dart update
+      # path, CI) get Opus.
+      - name: Pick review model by complexity
+        id: model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CHANGED=$(( ${{ github.event.pull_request.additions }} + ${{ github.event.pull_request.deletions }} ))
+          SENSITIVE=$(gh pr view ${{ github.event.pull_request.number }} \
+            --repo "${{ github.repository }}" --json files \
+            -q '[.files[].path | select(test("^(android/|ios/|lib/src/code_push\\.dart|\\.github/workflows/)"))] | length' || echo 1)
+          if [ "$CHANGED" -le 60 ] && [ "$SENSITIVE" -eq 0 ]; then
+            MODEL=claude-haiku-4-5-20251001
+          elif [ "$CHANGED" -le 1200 ] && [ "$SENSITIVE" -eq 0 ]; then
+            MODEL=claude-sonnet-5
+          else
+            MODEL=claude-opus-4-8
+          fi
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED sensitive=$SENSITIVE model=$MODEL"
+
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -25,16 +48,52 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            Review this pull request as a senior Dart/Flutter engineer. Focus on:
-            - Correctness bugs and edge cases in the changed code
-            - API misuse and error-handling gaps
-            - Security issues (credential handling, injection, unsafe file I/O)
-            - Backwards compatibility for existing users of this package
+            Review this Flutter plugin pull request. This plugin provides
+            over-the-air code push updates for Flutter apps — update checks,
+            patch download and install, and rollback — on Android and iOS.
 
-            Use `gh pr comment` for overall feedback and
-            `mcp__github_inline_comment__create_inline_comment` (with confirmed: true)
-            for line-specific issues. Only post GitHub comments — do not submit
-            review text as plain messages. Be concise; skip pure style nits.
+            Focus on:
+            - Correctness bugs and edge cases
+            - Platform-channel consistency (Dart API vs the Android/iOS
+              implementations)
+            - Breaking changes to the public API for existing package users
+            - Failure-soft behavior: the update path must never crash or
+              brick a host app
+            - Test coverage for new behavior
+            - Security (network handling, file I/O, patch validation)
+
+            Before raising a finding, read the PR's existing comments
+            (`gh pr view <n> --comments`). Do not re-raise a finding the
+            author has already refuted or explicitly tabled there unless you
+            have new evidence. When claiming a control-flow gap (e.g. a
+            missing try/finally), read the entire enclosing function first
+            and cite the line numbers that demonstrate it.
+
+            Post your review as a SINGLE comment using one `gh pr comment`
+            call — do not post multiple comments or inline comments.
+
+            Structure the comment with exactly these sections, in this order:
+
+            ## 🔴 Critical
+            Bugs, crashes, security issues, breaking changes — anything that
+            must be fixed before merging. Only Critical findings block the
+            merge. Write "None" if there are none.
+
+            ## 🟠 Medium
+            Issues that should be addressed but don't block the merge
+            (missing edge-case handling, missing tests). The team may table
+            these as tracked follow-ups. Write "None" if there are none.
+
+            ## 🟡 Low
+            Minor improvements and suggestions. Write "None" if there are none.
+
+            ## 🟢 Positives
+            What the PR does well.
+
+            For each finding, reference the file and line (e.g. `lib/foo.dart:42`)
+            and explain briefly why it matters. Keep it concise and only flag
+            issues that matter — skip style nitpicks already covered by
+            `dart format` and `dart analyze`.
           claude_args: |
-            --model claude-sonnet-4-6
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --model ${{ steps.model.outputs.model }}
+            --allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
