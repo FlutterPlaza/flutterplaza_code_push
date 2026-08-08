@@ -336,7 +336,14 @@ abstract final class CodePush {
       if (expectedBaselineHash != null) {
         final actualBaselineHash = await _computeBaselineHash();
         if (actualBaselineHash != null &&
-            actualBaselineHash != expectedBaselineHash) {
+            actualBaselineHash != expectedBaselineHash &&
+            // Report each distinct mismatch pair once per session —
+            // checkAndInstall runs on a periodic timer, and a stable
+            // mismatch (e.g. an ABI whose hash the server doesn't have)
+            // would otherwise POST identical telemetry on every tick.
+            _reportedBaselineMismatches.add(
+              '$expectedBaselineHash|$actualBaselineHash',
+            )) {
           await _reportIncompatibleBaseline(
             serverUrl: serverUrl,
             appId: appId,
@@ -690,12 +697,18 @@ abstract final class CodePush {
   @visibleForTesting
   static bool debugForceAndroidPlatform = false;
 
+  /// Baseline-hash mismatch pairs (`expected|actual`) already reported to
+  /// the server this session, so periodic checks don't repeat identical
+  /// telemetry every poll cycle.
+  static final Set<String> _reportedBaselineMismatches = <String>{};
+
   /// Test-only: clears the baseline-hash session state between tests.
   @visibleForTesting
   static void debugResetBaselineHashCache() {
     _cachedBaselineHash = null;
     _baselineHashFailedAt = null;
     _baselineHashInFlight = null;
+    _reportedBaselineMismatches.clear();
   }
 
   /// Cached distribution-proof baseline UUID (see [_readBaselineId]).
