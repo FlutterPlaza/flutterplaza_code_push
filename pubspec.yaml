@@ -27,5 +27,8 @@ dev_dependencies:
 flutter:
   plugin:
     platforms:
+      android:
+        package: com.flutterplaza.flutterplaza_code_push
+        pluginClass: FlutterplazaCodePushPlugin
       ios:
         pluginClass: FlutterplazaCodePushPlugin
