@@ -339,8 +339,10 @@ abstract final class CodePush {
         // checkAndInstall runs on a periodic timer, and a stable
         // mismatch (e.g. an ABI whose hash the server doesn't have)
         // would otherwise POST identical telemetry on every tick. The
-        // pair is recorded only after the server acknowledges the
-        // report, so a transient telemetry failure retries next cycle.
+        // pair is recorded once the report completes an HTTP round
+        // trip, whatever the status: a persistently failing endpoint
+        // must not turn every mismatching device into a per-poll
+        // beacon. Only a transport failure (offline, timeout) retries.
         final mismatchKey = '$expectedBaselineHash|$actualBaselineHash';
         if (actualBaselineHash != null &&
             actualBaselineHash != expectedBaselineHash &&
@@ -579,9 +581,10 @@ abstract final class CodePush {
   /// Best-effort telemetry POST to let the server know a device was
   /// stranded on an incompatible baseline. Swallows every error so
   /// telemetry failure can never cascade into an app crash — this is
-  /// already the unhappy path. Returns true only when the server
-  /// acknowledged the report (2xx), so callers can decide whether to
-  /// retry later.
+  /// already the unhappy path. Returns true when the request completed
+  /// an HTTP round trip (any status — the report was delivered even if
+  /// the server refused it); false only on transport failure, so
+  /// callers can retry when the device was offline.
   static Future<bool> _reportIncompatibleBaseline({
     required String serverUrl,
     required String appId,
@@ -615,7 +618,7 @@ abstract final class CodePush {
         req.add(utf8.encode(jsonEncode(payload)));
         final res = await req.close().timeout(const Duration(seconds: 5));
         await res.drain<void>();
-        return res.statusCode >= 200 && res.statusCode < 300;
+        return true;
       } finally {
         client.close(force: true);
       }
@@ -667,8 +670,11 @@ abstract final class CodePush {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
         final req =
             await client.postUrl(uri).timeout(const Duration(seconds: 5));
-        req.headers.set('Content-Type', 'application/json');
-        req.write(jsonEncode(payload));
+        req.headers.set('Content-Type', 'application/json; charset=utf-8');
+        // Encoded bytes, not a string: write() defaults to Latin-1 and
+        // throws on any non-Latin-1 character in the native-written
+        // reason, which would silently strand the marker forever.
+        req.add(utf8.encode(jsonEncode(payload)));
         final res = await req.close().timeout(const Duration(seconds: 5));
         if (res.statusCode >= 200 && res.statusCode < 300) {
           try {
