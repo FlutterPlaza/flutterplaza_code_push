@@ -335,16 +335,17 @@ abstract final class CodePush {
       final expectedBaselineHash = data['baseline_hash'] as String?;
       if (expectedBaselineHash != null) {
         final actualBaselineHash = await _computeBaselineHash();
+        // Report each distinct mismatch pair once per session —
+        // checkAndInstall runs on a periodic timer, and a stable
+        // mismatch (e.g. an ABI whose hash the server doesn't have)
+        // would otherwise POST identical telemetry on every tick. The
+        // pair is recorded only after the server acknowledges the
+        // report, so a transient telemetry failure retries next cycle.
+        final mismatchKey = '$expectedBaselineHash|$actualBaselineHash';
         if (actualBaselineHash != null &&
             actualBaselineHash != expectedBaselineHash &&
-            // Report each distinct mismatch pair once per session —
-            // checkAndInstall runs on a periodic timer, and a stable
-            // mismatch (e.g. an ABI whose hash the server doesn't have)
-            // would otherwise POST identical telemetry on every tick.
-            _reportedBaselineMismatches.add(
-              '$expectedBaselineHash|$actualBaselineHash',
-            )) {
-          await _reportIncompatibleBaseline(
+            !_reportedBaselineMismatches.contains(mismatchKey)) {
+          final reported = await _reportIncompatibleBaseline(
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
@@ -353,6 +354,9 @@ abstract final class CodePush {
             expectedFingerprint: expectedBaselineHash,
             actualFingerprint: actualBaselineHash,
           );
+          if (reported) {
+            _reportedBaselineMismatches.add(mismatchKey);
+          }
         }
       }
 
@@ -575,8 +579,10 @@ abstract final class CodePush {
   /// Best-effort telemetry POST to let the server know a device was
   /// stranded on an incompatible baseline. Swallows every error so
   /// telemetry failure can never cascade into an app crash — this is
-  /// already the unhappy path.
-  static Future<void> _reportIncompatibleBaseline({
+  /// already the unhappy path. Returns true only when the server
+  /// acknowledged the report (2xx), so callers can decide whether to
+  /// retry later.
+  static Future<bool> _reportIncompatibleBaseline({
     required String serverUrl,
     required String appId,
     required String? patchId,
@@ -601,14 +607,21 @@ abstract final class CodePush {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
         final req =
             await client.postUrl(uri).timeout(const Duration(seconds: 5));
-        req.headers.set('Content-Type', 'application/json');
-        req.write(jsonEncode(payload));
-        await req.close().timeout(const Duration(seconds: 5));
+        req.headers.set('Content-Type', 'application/json; charset=utf-8');
+        // Send encoded bytes, not a string: HttpClientRequest.write()
+        // defaults to Latin-1, which throws on any non-Latin-1 character
+        // in the payload (e.g. an em dash in a reason string) and would
+        // silently drop the report.
+        req.add(utf8.encode(jsonEncode(payload)));
+        final res = await req.close().timeout(const Duration(seconds: 5));
+        await res.drain<void>();
+        return res.statusCode >= 200 && res.statusCode < 300;
       } finally {
         client.close(force: true);
       }
     } catch (_) {
       // Telemetry is best-effort. Never crash over it.
+      return false;
     }
   }
 

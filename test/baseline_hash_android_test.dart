@@ -1,3 +1,4 @@
+import 'dart:convert' show jsonEncode;
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -36,16 +37,22 @@ void main() {
         releaseVersion: '1.0.0+1',
       );
 
+  // Per-test server behavior; the default answers every request 204.
+  late void Function(HttpRequest req) handleRequest;
+
   setUp(() async {
     hashCalls = 0;
     requests = <Uri>[];
     CodePush.debugForceAndroidPlatform = true;
     CodePush.debugResetBaselineHashCache();
+    handleRequest = (HttpRequest req) {
+      req.response.statusCode = HttpStatus.noContent;
+      req.response.close();
+    };
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     server.listen((HttpRequest req) {
       requests.add(req.uri);
-      req.response.statusCode = HttpStatus.noContent;
-      req.response.close();
+      handleRequest(req);
     });
   });
 
@@ -107,6 +114,63 @@ void main() {
         requests.last.queryParameters.containsKey('baseline_hash'),
         isFalse,
       );
+    });
+
+    test(
+        'soft-gate mismatch: hash computed once within a check, telemetry '
+        'reported once across checks', () async {
+      mockAppLibHash(fakeHash);
+
+      // A code-push-capable engine, so the flow reaches the soft gate.
+      const engineChannel = MethodChannel(
+        'flutter/codepush',
+        JSONMethodCodec(),
+      );
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(engineChannel, (MethodCall call) async {
+        if (call.method == 'CodePush.getEngineAbi') return 'test-abi';
+        return null;
+      });
+      addTearDown(() {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(engineChannel, null);
+      });
+
+      var telemetryPosts = 0;
+      final mismatchingHash = 'b' * 64;
+      handleRequest = (HttpRequest req) {
+        if (req.uri.path.endsWith('/api/v1/updates')) {
+          req.response
+            ..statusCode = HttpStatus.ok
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode(<String, dynamic>{
+              'patch_available': true,
+              'patch_id': 'p1',
+              'patch_url': 'http://127.0.0.1:${server.port}/patch',
+              'baseline_hash': mismatchingHash,
+            }));
+        } else if (req.uri.path.endsWith('/api/v1/telemetry/client-error')) {
+          telemetryPosts++;
+          req.response.statusCode = HttpStatus.ok;
+        } else {
+          // Patch download — fail it so the check exits after the gate.
+          req.response.statusCode = HttpStatus.notFound;
+        }
+        req.response.close();
+      };
+
+      // Within one check the hash is computed at the query step AND the
+      // soft-gate step — the shared cache/in-flight future must collapse
+      // that to a single platform-channel invocation.
+      await check();
+      expect(hashCalls, 1);
+      expect(telemetryPosts, 1);
+
+      // A second check sees the same mismatch pair — already reported,
+      // so no further telemetry.
+      await check();
+      expect(hashCalls, 1);
+      expect(telemetryPosts, 1);
     });
   });
 }
