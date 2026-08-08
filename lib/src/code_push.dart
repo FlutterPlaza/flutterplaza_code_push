@@ -677,24 +677,7 @@ abstract final class CodePush {
   /// running.
   static String? _cachedBaselineHash;
 
-  /// Returns the SHA-256 hex of the currently-running baseline's
-  /// `App.framework/App` (iOS) or `libapp.so` (Android).
-  ///
-  /// This is the authoritative identity of the Dart code that's
-  /// loaded into the VM — bumping any Dart package (including this
-  /// one) changes the AOT class layout and produces a different
-  /// hash. We use it as the compatibility key for patches:
-  /// if `sha256(running baseline) != sha256(baseline the patch was
-  /// built against)`, the patch's class offsets are wrong and
-  /// `ui.codePushLoadModule` will abort the VM on the first class
-  /// allocation. The check at the top of [checkAndInstall] refuses
-  /// to load a patch whose recorded baseline hash disagrees with
-  /// this value.
-  ///
-  /// Cached in memory after first computation. Hashing the few-MB
-  /// AOT blob takes ~20–50 ms on a modern device — once per session
-  /// is fine. On iOS the blob is read from the app bundle; on Android
-  /// it is read from the platform side.
+  /// Cached distribution-proof baseline UUID (see [_readBaselineId]).
   static String? _cachedBaselineId;
 
   /// Read the distribution-proof baseline UUID from Info.plist
@@ -717,15 +700,35 @@ abstract final class CodePush {
     }
   }
 
+  /// Returns the SHA-256 hex of the currently-running baseline's
+  /// `App.framework/App` (iOS) or `libapp.so` (Android).
+  ///
+  /// This is the authoritative identity of the Dart code that's
+  /// loaded into the VM — bumping any Dart package (including this
+  /// one) changes the AOT class layout and produces a different
+  /// hash. We use it as the compatibility key for patches:
+  /// if `sha256(running baseline) != sha256(baseline the patch was
+  /// built against)`, the patch's class offsets are wrong and
+  /// `ui.codePushLoadModule` will abort the VM on the first class
+  /// allocation. The check at the top of [checkAndInstall] refuses
+  /// to load a patch whose recorded baseline hash disagrees with
+  /// this value.
+  ///
+  /// Cached in memory after first computation. Hashing the few-MB
+  /// AOT blob takes ~20–50 ms on a modern device — once per session
+  /// is fine. On iOS the blob is read from the app bundle; on Android
+  /// it is read from the platform side.
   static Future<String?> _computeBaselineHash() async {
     if (_cachedBaselineHash != null) return _cachedBaselineHash;
     try {
       if (Platform.isAndroid) {
         // Android packages the AOT snapshot as lib/<abi>/libapp.so inside
-        // the APK; the platform side reads and hashes it.
+        // the APK; the platform side reads and hashes it. Generous timeout:
+        // a first-boot hash of a multi-MB entry on slow storage with a cold
+        // page cache can take several seconds.
         final hash = await _pluginChannel
             .invokeMethod<String>('getAppLibHash')
-            .timeout(const Duration(seconds: 3));
+            .timeout(const Duration(seconds: 10));
         if (hash != null && hash.isNotEmpty) {
           _cachedBaselineHash = hash;
           return hash;
