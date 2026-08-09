@@ -50,9 +50,26 @@ class FlutterplazaCodePushPlugin : FlutterPlugin, MethodChannel.MethodCallHandle
           }
         }.start()
       }
+      "getInstallerSource" -> result.success(installerSource())
       else -> result.notImplemented()
     }
   }
+
+  /**
+   * Package name of the installer that placed this app (for example
+   * "com.android.vending" for the Play Store), or null when unknown or
+   * sideloaded. Lets the Dart side honor a developer's choice to keep
+   * OTA updates off for store-installed builds.
+   */
+  private fun installerSource(): String? = runCatching {
+    val pm = context.packageManager
+    if (Build.VERSION.SDK_INT >= 30) {
+      pm.getInstallSourceInfo(context.packageName).installingPackageName
+    } else {
+      @Suppress("DEPRECATION")
+      pm.getInstallerPackageName(context.packageName)
+    }
+  }.getOrNull()
 
   /**
    * SHA-256 (lowercase hex) of lib/<abi>/libapp.so as packaged in the

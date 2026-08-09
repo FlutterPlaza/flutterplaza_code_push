@@ -1,4 +1,4 @@
-import 'dart:async' show Timer;
+import 'dart:async' show Timer, unawaited;
 import 'dart:convert' show base64Encode, jsonDecode, jsonEncode, utf8;
 import 'dart:io' show Directory, File, FileMode, HttpClient, Platform, exit;
 
@@ -114,6 +114,7 @@ abstract final class CodePush {
     Duration interval = const Duration(hours: 4),
     String channel = 'production',
     VoidCallback? onUpdateReady,
+    bool disableOnPlayStoreInstalls = false,
   }) {
     print('[CP-INIT] CodePush.init called');
     // Store the config so `CodePushOverlay` can reuse it without
@@ -124,6 +125,7 @@ abstract final class CodePush {
       releaseVersion: releaseVersion,
       checkInterval: interval,
       channel: channel,
+      disableOnPlayStoreInstalls: disableOnPlayStoreInstalls,
     );
 
     // NOTE: Any stale-patch cleanup from prior versions (0.1.4/0.1.5)
@@ -135,6 +137,47 @@ abstract final class CodePush {
 
     _timer?.cancel();
 
+    unawaited(() async {
+      // Developer-selected store-only mode: when enabled and this build
+      // was installed from the Play Store, OTA stays off for the whole
+      // session — no server checks — and any patch left over from
+      // before the setting shipped is removed so the device runs the
+      // store baseline. Detection failure leaves OTA enabled: a build
+      // without the plugin (debug, sideload) is not a store install.
+      if (disableOnPlayStoreInstalls && await isPlayStoreInstall()) {
+        status.value = 'OTA off (store-installed build)';
+        try {
+          if (await isPatched) {
+            await rollback();
+            status.value = 'OTA off (store-installed build) — patch removed';
+          }
+        } catch (_) {
+          // Best-effort: nothing to revert on a clean device.
+        }
+        return;
+      }
+      _startUpdateFlow(
+        serverUrl: serverUrl,
+        appId: appId,
+        releaseVersion: releaseVersion,
+        interval: interval,
+        channel: channel,
+        onUpdateReady: onUpdateReady,
+      );
+    }());
+  }
+
+  /// Starts crash protection, the first update check, and the periodic
+  /// check timer. Split out of [init] so the store-install gate can
+  /// decide whether the flow starts at all.
+  static void _startUpdateFlow({
+    required String serverUrl,
+    required String appId,
+    required String releaseVersion,
+    required Duration interval,
+    required String channel,
+    VoidCallback? onUpdateReady,
+  }) {
     // Crash protection runs async because it needs the engine's patch
     // dir via platform channel. We chain the first checkAndInstall off
     // it so that, on a boot where a previously-downloaded bad patch is
@@ -221,6 +264,25 @@ abstract final class CodePush {
       }
 
       final data = jsonDecode(r.body) as Map<String, dynamic>;
+
+      // Fleet-wide OTA kill switch (server-controlled). When the server
+      // says OTA is off for this app, stop offering updates AND revert
+      // any installed patch, so the fleet returns to the store baseline
+      // within one check interval of the switch being flipped.
+      if (data['ota_disabled'] == true) {
+        status.value = 'OTA disabled by server';
+        try {
+          if (await isPatched) {
+            await rollback();
+            status.value =
+                'OTA disabled by server — patch removed (restart to apply)';
+          }
+        } catch (_) {
+          // Best-effort: a clean device has nothing to revert.
+        }
+        return false;
+      }
+
       if (data['patch_available'] != true) {
         status.value = 'No patch available';
         return false;
@@ -728,10 +790,39 @@ abstract final class CodePush {
     _baselineHashFailedAt = null;
     _baselineHashInFlight = null;
     _reportedBaselineMismatches.clear();
+    _cachedIsPlayInstall = null;
   }
 
   /// Cached distribution-proof baseline UUID (see [_readBaselineId]).
   static String? _cachedBaselineId;
+
+  /// Cached installer-source verdict for the session.
+  static bool? _cachedIsPlayInstall;
+
+  /// Whether this build was installed by the Google Play Store.
+  ///
+  /// Backs [init]'s `disableOnPlayStoreInstalls`: developers who want
+  /// store-only updates for Play-installed builds set that flag, and
+  /// this check decides whether it applies to the running install.
+  /// Only meaningful on Android; false elsewhere and on any failure
+  /// (a build without the plugin — debug, sideload — is not a store
+  /// install, so failing open keeps OTA available where it is allowed).
+  @visibleForTesting
+  static Future<bool> isPlayStoreInstall() async {
+    final cached = _cachedIsPlayInstall;
+    if (cached != null) return cached;
+    try {
+      if (!(debugForceAndroidPlatform || Platform.isAndroid)) {
+        return _cachedIsPlayInstall = false;
+      }
+      final installer = await _pluginChannel
+          .invokeMethod<String>('getInstallerSource')
+          .timeout(const Duration(seconds: 2));
+      return _cachedIsPlayInstall = installer == 'com.android.vending';
+    } catch (_) {
+      return _cachedIsPlayInstall = false;
+    }
+  }
 
   /// Read the distribution-proof baseline UUID from Info.plist
   /// (`FCPBaselineId` key, written by `fcp codepush release`).
@@ -1254,6 +1345,7 @@ class CodePushConfig {
     required this.releaseVersion,
     this.checkInterval = const Duration(hours: 4),
     this.channel = 'production',
+    this.disableOnPlayStoreInstalls = false,
   });
 
   final String serverUrl;
@@ -1261,6 +1353,12 @@ class CodePushConfig {
   final String releaseVersion;
   final Duration checkInterval;
   final String channel;
+
+  /// Keep OTA updates off for builds installed from the Play Store, so
+  /// those installs only ever change through store updates. Off-store
+  /// installs (sideload, other stores, MDM) are unaffected. Off by
+  /// default.
+  final bool disableOnPlayStoreInstalls;
 }
 
 /// A widget that wraps your app and shows an update-ready banner
@@ -1352,6 +1450,7 @@ class _CodePushOverlayState extends State<CodePushOverlay>
       releaseVersion: cfg.releaseVersion,
       interval: cfg.checkInterval,
       channel: cfg.channel,
+      disableOnPlayStoreInstalls: cfg.disableOnPlayStoreInstalls,
       onUpdateReady: () {
         if (mounted) setState(() => _updateReady = true);
       },
