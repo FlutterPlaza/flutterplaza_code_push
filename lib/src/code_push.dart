@@ -151,6 +151,12 @@ abstract final class CodePush {
       // store baseline. Detection failure leaves OTA enabled: a build
       // without the plugin (debug, sideload) is not a store install.
       if (disableOnPlayStoreInstalls && await isPlayStoreInstall()) {
+        // Stale-session check after EVERY await in this branch: its
+        // side effects (a telemetry POST, a patch deletion) must never
+        // fire for a session that was disposed or superseded while a
+        // lookup was in flight — a stale rollback could even delete a
+        // patch a newer session just installed.
+        if (epoch != _initEpoch) return;
         status.value = 'OTA off (store-installed build)';
         // A native crash-loop rollback recorded before Dart started is
         // still history worth reporting (and its marker worth
@@ -159,6 +165,7 @@ abstract final class CodePush {
           serverUrl: serverUrl,
           appId: appId,
         );
+        if (epoch != _initEpoch) return;
         try {
           // rollback() removes the patch wherever the platform keeps it
           // (engine on Android/desktop, direct file removal on iOS) and

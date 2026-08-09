@@ -181,6 +181,42 @@ void main() {
       expect(requests, isEmpty);
     });
 
+    test(
+        'dispose during the lookup also quiesces the Play/store-off branch: '
+        'no telemetry, no rollback', () async {
+      CodePush.debugForceAndroidPlatform = true;
+      final engineLog = <String>[];
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(pluginChannel,
+          (MethodCall call) async {
+        if (call.method == 'getInstallerSource') {
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          return 'com.android.vending';
+        }
+        return null;
+      });
+      messenger.setMockMethodCallHandler(engineChannel,
+          (MethodCall call) async {
+        engineLog.add(call.method);
+        if (call.method == 'CodePush.rollback') return true;
+        return null;
+      });
+
+      CodePush.init(
+        serverUrl: 'http://127.0.0.1:${server.port}',
+        appId: 'test-app',
+        releaseVersion: '1.0.0+1',
+        disableOnPlayStoreInstalls: true,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      CodePush.dispose();
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+
+      expect(requests, isEmpty);
+      expect(engineLog, isNot(contains('CodePush.rollback')));
+    });
+
     test('non-Play install + flag: the update flow runs normally', () async {
       CodePush.debugForceAndroidPlatform = true;
       mockChannels(installer: null);

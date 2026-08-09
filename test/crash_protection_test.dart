@@ -425,7 +425,8 @@ void main() {
       expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
     });
 
-    test('after immediate rollback, new patch can be installed fresh', () async {
+    test('after immediate rollback, new patch can be installed fresh',
+        () async {
       // Bad patch triggers immediate rollback.
       File('$patchDir/patch.bytecode').writeAsBytesSync([0xBA, 0xD0]);
       _writeBootCounter(patchDir, 1);

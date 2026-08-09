@@ -50,7 +50,23 @@ class FlutterplazaCodePushPlugin : FlutterPlugin, MethodChannel.MethodCallHandle
           }
         }.start()
       }
-      "getInstallerSource" -> result.success(installerSource())
+      "getInstallerSource" -> {
+        // Off the platform thread like getAppLibHash: the package-manager
+        // binder call is normally fast, but it should never be able to
+        // stall the main thread during startup.
+        val handler = Handler(Looper.getMainLooper())
+        Thread {
+          val installer = installerSource()
+          handler.post {
+            if (!attached) return@post
+            try {
+              result.success(installer)
+            } catch (_: Exception) {
+              // Messenger torn down; the Dart side times out on its own.
+            }
+          }
+        }.start()
+      }
       else -> result.notImplemented()
     }
   }
