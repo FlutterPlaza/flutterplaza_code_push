@@ -152,6 +152,13 @@ abstract final class CodePush {
       // without the plugin (debug, sideload) is not a store install.
       if (disableOnPlayStoreInstalls && await isPlayStoreInstall()) {
         status.value = 'OTA off (store-installed build)';
+        // A native crash-loop rollback recorded before Dart started is
+        // still history worth reporting (and its marker worth
+        // clearing), even though OTA is off from here on.
+        await _reportPendingNativeRollback(
+          serverUrl: serverUrl,
+          appId: appId,
+        );
         try {
           // rollback() removes the patch wherever the platform keeps it
           // (engine on Android/desktop, direct file removal on iOS) and
