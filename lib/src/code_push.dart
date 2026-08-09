@@ -67,6 +67,11 @@ abstract final class CodePush {
   static Timer? _timer;
   static Timer? _launchTimer;
 
+  /// Bumped by every [init] and [dispose]; async init work checks it
+  /// after each await so a stale closure can't start timers for a
+  /// session that was disposed or re-initialized mid-flight.
+  static int _initEpoch = 0;
+
   /// Maximum consecutive failed boots before auto-rollback.
   static const int _maxBootAttempts = 3;
 
@@ -137,6 +142,7 @@ abstract final class CodePush {
 
     _timer?.cancel();
 
+    final epoch = ++_initEpoch;
     unawaited(() async {
       // Developer-selected store-only mode: when enabled and this build
       // was installed from the Play Store, OTA stays off for the whole
@@ -147,15 +153,20 @@ abstract final class CodePush {
       if (disableOnPlayStoreInstalls && await isPlayStoreInstall()) {
         status.value = 'OTA off (store-installed build)';
         try {
-          if (await isPatched) {
-            await rollback();
-            status.value = 'OTA off (store-installed build) — patch removed';
-          }
+          // rollback() removes the patch wherever the platform keeps it
+          // (engine on Android/desktop, direct file removal on iOS) and
+          // throws when there is nothing to remove — the common,
+          // healthy case, swallowed below.
+          await rollback();
+          status.value = 'OTA off (store-installed build) — patch removed';
         } catch (_) {
-          // Best-effort: nothing to revert on a clean device.
+          // Nothing to revert.
         }
         return;
       }
+      // A dispose() or a newer init() during the await above owns the
+      // session now — don't start timers for a stale one.
+      if (epoch != _initEpoch) return;
       _startUpdateFlow(
         serverUrl: serverUrl,
         appId: appId,
@@ -221,6 +232,7 @@ abstract final class CodePush {
 
   /// Stops automatic update checking and cancels the launch timer.
   static void dispose() {
+    _initEpoch++;
     _timer?.cancel();
     _timer = null;
     _launchTimer?.cancel();
@@ -272,11 +284,14 @@ abstract final class CodePush {
       if (data['ota_disabled'] == true) {
         status.value = 'OTA disabled by server';
         try {
-          if (await isPatched) {
-            await rollback();
-            status.value =
-                'OTA disabled by server — patch removed (restart to apply)';
-          }
+          // Unconditional: rollback() knows where each platform keeps
+          // the patch (engine on Android/desktop, file removal on iOS
+          // where the engine channel is disabled and isPatched would
+          // always answer false) and throws harmlessly when the device
+          // is already clean.
+          await rollback();
+          status.value =
+              'OTA disabled by server — patch removed (restart to apply)';
         } catch (_) {
           // Best-effort: a clean device has nothing to revert.
         }
@@ -820,7 +835,10 @@ abstract final class CodePush {
           .timeout(const Duration(seconds: 2));
       return _cachedIsPlayInstall = installer == 'com.android.vending';
     } catch (_) {
-      return _cachedIsPlayInstall = false;
+      // Transient failure (slow first boot, torn-down messenger): fail
+      // open for this call but do NOT cache it, so the next init or
+      // check re-asks instead of pinning the wrong answer all session.
+      return false;
     }
   }
 

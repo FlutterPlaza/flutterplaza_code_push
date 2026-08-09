@@ -59,13 +59,15 @@ void main() {
   });
 
   group('server kill switch', () {
-    test('unpatched device: stops quietly, no rollback attempted', () async {
+    test('clean device: stops quietly, revert attempt no-ops', () async {
       serveOtaDisabled();
       final engineCalls = <String>[];
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(engineChannel, (MethodCall call) async {
         engineCalls.add(call.method);
-        if (call.method == 'CodePush.isPatched') return false;
+        // Engine says the rollback did not apply; the Dart file
+        // fallback then finds no patch dir and throws (swallowed).
+        if (call.method == 'CodePush.rollback') return false;
         return null;
       });
 
@@ -73,8 +75,7 @@ void main() {
 
       expect(installed, isFalse);
       expect(CodePush.status.value, contains('OTA disabled'));
-      expect(engineCalls, contains('CodePush.isPatched'));
-      expect(engineCalls, isNot(contains('CodePush.rollback')));
+      expect(CodePush.status.value, isNot(contains('patch removed')));
     });
 
     test('patched device: reverts to the store baseline', () async {
@@ -83,7 +84,6 @@ void main() {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(engineChannel, (MethodCall call) async {
         engineCalls.add(call.method);
-        if (call.method == 'CodePush.isPatched') return true;
         if (call.method == 'CodePush.rollback') return true;
         return null;
       });
@@ -96,6 +96,75 @@ void main() {
         hasLength(1),
       );
       expect(CodePush.status.value, contains('patch removed'));
+    });
+  });
+
+  group('init store-install gate', () {
+    late List<Uri> requests;
+
+    setUp(() {
+      requests = <Uri>[];
+      handleRequest = (HttpRequest req) {
+        requests.add(req.uri);
+        req.response.statusCode = HttpStatus.noContent;
+        req.response.close();
+      };
+    });
+
+    tearDown(CodePush.dispose);
+
+    void mockChannels({required String? installer, List<String>? engineLog}) {
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(pluginChannel,
+          (MethodCall call) async {
+        if (call.method == 'getInstallerSource') return installer;
+        return null;
+      });
+      messenger.setMockMethodCallHandler(engineChannel,
+          (MethodCall call) async {
+        engineLog?.add(call.method);
+        if (call.method == 'CodePush.rollback') return true;
+        return null;
+      });
+    }
+
+    test('Play install + flag: no update flow starts, leftover patch removed',
+        () async {
+      CodePush.debugForceAndroidPlatform = true;
+      final engineLog = <String>[];
+      mockChannels(installer: 'com.android.vending', engineLog: engineLog);
+
+      CodePush.init(
+        serverUrl: 'http://127.0.0.1:${server.port}',
+        appId: 'test-app',
+        releaseVersion: '1.0.0+1',
+        disableOnPlayStoreInstalls: true,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      expect(requests, isEmpty);
+      expect(CodePush.status.value, contains('OTA off'));
+      expect(engineLog, contains('CodePush.rollback'));
+    });
+
+    test('non-Play install + flag: the update flow runs normally', () async {
+      CodePush.debugForceAndroidPlatform = true;
+      mockChannels(installer: null);
+
+      CodePush.init(
+        serverUrl: 'http://127.0.0.1:${server.port}',
+        appId: 'test-app',
+        releaseVersion: '1.0.0+1',
+        disableOnPlayStoreInstalls: true,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+
+      expect(requests, isNotEmpty);
+      expect(
+        requests.first.path.endsWith('/api/v1/updates'),
+        isTrue,
+      );
     });
   });
 
