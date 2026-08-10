@@ -3,7 +3,7 @@
 // The boot counter and auto-rollback methods are private static methods on
 // CodePush, so we cannot call them directly. Instead, we replicate the
 // file I/O logic here and verify behaviour against the same file layout
-// the production code uses (boot_counter file, patch.vmcode, patch_info.json
+// the production code uses (boot_counter file, patch.bytecode, patch_info.json
 // inside a patch directory).
 import 'dart:io';
 
@@ -48,7 +48,7 @@ bool _checkAndAutoRollback(String patchDir) {
 
   // Auto-rollback: remove the patch and reset the counter.
   try {
-    final patchFile = File('$patchDir/patch.vmcode');
+    final patchFile = File('$patchDir/patch.bytecode');
     if (patchFile.existsSync()) patchFile.deleteSync();
     final infoFile = File('$patchDir/patch_info.json');
     if (infoFile.existsSync()) infoFile.deleteSync();
@@ -66,7 +66,7 @@ bool _checkAndAutoRollback(String patchDir) {
 /// POSTs telemetry to the server. Here we only test the filesystem behaviour.
 Future<void> _immediateRollback(String patchDir) async {
   try {
-    final patchFile = File('$patchDir/patch.vmcode');
+    final patchFile = File('$patchDir/patch.bytecode');
     if (await patchFile.exists()) await patchFile.delete();
     final infoFile = File('$patchDir/patch_info.json');
     if (await infoFile.exists()) await infoFile.delete();
@@ -186,31 +186,31 @@ void main() {
   group('iOS auto-rollback', () {
     test('rolls back when counter equals max boot attempts (3)', () {
       // Set up a patch directory with a patch file and a counter at the threshold.
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xDE, 0xAD]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xDE, 0xAD]);
       File('$patchDir/patch_info.json').writeAsStringSync('{"v":"1.0"}');
       _writeBootCounter(patchDir, 3);
 
       final rolled = _checkAndAutoRollback(patchDir);
 
       expect(rolled, isTrue);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
       expect(File('$patchDir/patch_info.json').existsSync(), isFalse);
       expect(_readBootCounter(patchDir), 0);
     });
 
     test('rolls back when counter exceeds max boot attempts', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xDE, 0xAD]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xDE, 0xAD]);
       _writeBootCounter(patchDir, 10);
 
       final rolled = _checkAndAutoRollback(patchDir);
 
       expect(rolled, isTrue);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
       expect(_readBootCounter(patchDir), 0);
     });
 
     test('resets counter to 0 after rollback', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xDE, 0xAD]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xDE, 0xAD]);
       _writeBootCounter(patchDir, 5);
 
       _checkAndAutoRollback(patchDir);
@@ -218,31 +218,31 @@ void main() {
       expect(_readBootCounter(patchDir), 0);
     });
 
-    test('deletes patch_info.json along with patch.vmcode', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xDE, 0xAD]);
+    test('deletes patch_info.json along with patch.bytecode', () {
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xDE, 0xAD]);
       File('$patchDir/patch_info.json').writeAsStringSync('{"v":"1.0"}');
       _writeBootCounter(patchDir, 3);
 
       _checkAndAutoRollback(patchDir);
 
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
       expect(File('$patchDir/patch_info.json').existsSync(), isFalse);
     });
 
     test('handles missing patch_info.json gracefully during rollback', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xDE, 0xAD]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xDE, 0xAD]);
       // No patch_info.json
       _writeBootCounter(patchDir, 3);
 
       final rolled = _checkAndAutoRollback(patchDir);
 
       expect(rolled, isTrue);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
       expect(_readBootCounter(patchDir), 0);
     });
 
-    test('handles missing patch.vmcode gracefully during rollback', () {
-      // No patch.vmcode file, but counter is at threshold.
+    test('handles missing patch.bytecode gracefully during rollback', () {
+      // No patch.bytecode file, but counter is at threshold.
       _writeBootCounter(patchDir, 3);
 
       final rolled = _checkAndAutoRollback(patchDir);
@@ -258,48 +258,48 @@ void main() {
 
   group('Boot counter below threshold (no rollback)', () {
     test('does NOT rollback when counter is 0', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xDE, 0xAD]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xDE, 0xAD]);
       _writeBootCounter(patchDir, 0);
 
       final rolled = _checkAndAutoRollback(patchDir);
 
       expect(rolled, isFalse);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isTrue);
     });
 
     test('does NOT rollback when counter is 1', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xDE, 0xAD]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xDE, 0xAD]);
       _writeBootCounter(patchDir, 1);
 
       final rolled = _checkAndAutoRollback(patchDir);
 
       expect(rolled, isFalse);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isTrue);
     });
 
     test('does NOT rollback when counter is 2 (one below threshold)', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xDE, 0xAD]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xDE, 0xAD]);
       _writeBootCounter(patchDir, 2);
 
       final rolled = _checkAndAutoRollback(patchDir);
 
       expect(rolled, isFalse);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isTrue);
       // Counter is unchanged by checkAndAutoRollback when below threshold.
       expect(_readBootCounter(patchDir), 2);
     });
 
     test('does NOT rollback when no boot_counter file exists', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xDE, 0xAD]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xDE, 0xAD]);
 
       final rolled = _checkAndAutoRollback(patchDir);
 
       expect(rolled, isFalse);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isTrue);
     });
 
     test('preserves patch_info.json when below threshold', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xDE, 0xAD]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xDE, 0xAD]);
       File('$patchDir/patch_info.json').writeAsStringSync('{"v":"2.0"}');
       _writeBootCounter(patchDir, 2);
 
@@ -317,7 +317,7 @@ void main() {
 
   group('Boot cycle simulation', () {
     test('three consecutive failed boots trigger rollback', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xCA, 0xFE]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xCA, 0xFE]);
 
       // Simulate three boot attempts without a success report.
       _incrementBootCounter(patchDir);
@@ -334,12 +334,12 @@ void main() {
       // Third failed boot — should trigger rollback.
       final rolled = _checkAndAutoRollback(patchDir);
       expect(rolled, isTrue);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
       expect(_readBootCounter(patchDir), 0);
     });
 
     test('successful launch resets counter and prevents rollback', () {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xCA, 0xFE]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xCA, 0xFE]);
 
       // Two failed boots.
       _incrementBootCounter(patchDir);
@@ -353,23 +353,23 @@ void main() {
       // Next boot — counter is back to 0, no rollback.
       _incrementBootCounter(patchDir);
       expect(_checkAndAutoRollback(patchDir), isFalse);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isTrue);
     });
 
     test('rollback cleans up then new patch can be installed fresh', () {
       // First patch crashes 3 times.
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xBA, 0xD0]);
       _writeBootCounter(patchDir, 3);
       _checkAndAutoRollback(patchDir);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
       expect(_readBootCounter(patchDir), 0);
 
       // New patch is installed.
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0x60, 0x0D]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0x60, 0x0D]);
       // Counter is fresh at 0 — first boot.
       _incrementBootCounter(patchDir);
       expect(_checkAndAutoRollback(patchDir), isFalse);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isTrue);
       expect(_readBootCounter(patchDir), 1);
     });
   });
@@ -377,29 +377,29 @@ void main() {
   // ── iOS immediate rollback on load failure ──────────────────────────
 
   group('iOS immediate rollback (load failure)', () {
-    test('deletes patch.vmcode on first failed load attempt', () async {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+    test('deletes patch.bytecode on first failed load attempt', () async {
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xBA, 0xD0]);
       _writeBootCounter(patchDir, 1); // Only 1 boot — below 3-boot threshold.
 
       await _immediateRollback(patchDir);
 
       // Patch deleted immediately — no need to wait for 3 boots.
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
       expect(_readBootCounter(patchDir), 0);
     });
 
-    test('deletes patch_info.json alongside patch.vmcode', () async {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+    test('deletes patch_info.json alongside patch.bytecode', () async {
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xBA, 0xD0]);
       File('$patchDir/patch_info.json').writeAsStringSync('{"v":"1.0"}');
 
       await _immediateRollback(patchDir);
 
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
       expect(File('$patchDir/patch_info.json').existsSync(), isFalse);
     });
 
     test('resets boot counter to 0', () async {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xBA, 0xD0]);
       _writeBootCounter(patchDir, 2);
 
       await _immediateRollback(patchDir);
@@ -407,7 +407,7 @@ void main() {
       expect(_readBootCounter(patchDir), 0);
     });
 
-    test('handles missing patch.vmcode gracefully', () async {
+    test('handles missing patch.bytecode gracefully', () async {
       // No patch file on disk — cleanup should not throw.
       _writeBootCounter(patchDir, 1);
 
@@ -417,44 +417,45 @@ void main() {
     });
 
     test('handles missing patch_info.json gracefully', () async {
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xBA, 0xD0]);
       // No patch_info.json.
 
       await _immediateRollback(patchDir);
 
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
     });
 
-    test('after immediate rollback, new patch can be installed fresh', () async {
+    test('after immediate rollback, new patch can be installed fresh',
+        () async {
       // Bad patch triggers immediate rollback.
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xBA, 0xD0]);
       _writeBootCounter(patchDir, 1);
       await _immediateRollback(patchDir);
 
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
       expect(_readBootCounter(patchDir), 0);
 
       // New (good) patch is installed — counter starts fresh.
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0x60, 0x0D]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0x60, 0x0D]);
       _incrementBootCounter(patchDir);
       expect(_readBootCounter(patchDir), 1);
       expect(_checkAndAutoRollback(patchDir), isFalse);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isTrue);
     });
 
     test('immediate rollback is faster than 3-boot auto-rollback', () async {
       // Demonstrate the key difference: auto-rollback needs 3 boots,
       // immediate rollback acts on first failure.
-      File('$patchDir/patch.vmcode').writeAsBytesSync([0xBA, 0xD0]);
+      File('$patchDir/patch.bytecode').writeAsBytesSync([0xBA, 0xD0]);
       _writeBootCounter(patchDir, 0);
 
       // Auto-rollback would NOT act here (counter below threshold).
       expect(_checkAndAutoRollback(patchDir), isFalse);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isTrue);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isTrue);
 
       // Immediate rollback DOES act.
       await _immediateRollback(patchDir);
-      expect(File('$patchDir/patch.vmcode').existsSync(), isFalse);
+      expect(File('$patchDir/patch.bytecode').existsSync(), isFalse);
     });
   });
 }

@@ -65,60 +65,26 @@
   }
 }
 
-+ (void)fcpCleanupStalePatchBeforeEngineBoots {
-  NSFileManager *fileManager = [NSFileManager defaultManager];
-
-  // ── Locate the patch file ────────────────────────────────────────
-  //
-  // The custom Flutter engine hardcodes the patch directory as
-  // `<NSDocumentDirectory>/code_push_patches` (see
-  // FlutterDartProject.mm in the engine fork). Replicate that path
-  // here without any method-channel round-trip.
-  NSArray<NSString *> *documentPaths = NSSearchPathForDirectoriesInDomains(
-      NSDocumentDirectory, NSUserDomainMask, YES);
-  if (documentPaths.count == 0) {
-    return;
-  }
-  NSString *patchDirPath =
-      [documentPaths.firstObject stringByAppendingPathComponent:@"code_push_patches"];
-  NSString *patchPath =
-      [patchDirPath stringByAppendingPathComponent:@"patch.vmcode"];
-
-  if (![fileManager fileExistsAtPath:patchPath]) {
-    return; // Nothing to clean up.
-  }
-
-  NSError *patchAttrError = nil;
-  NSDictionary *patchAttrs =
-      [fileManager attributesOfItemAtPath:patchPath error:&patchAttrError];
-  if (patchAttrError || !patchAttrs) {
-    return;
-  }
-  NSDate *patchMtime = [patchAttrs fileModificationDate];
-  if (!patchMtime) {
-    return;
-  }
-
-  // ── Compute bundle freshness (max of Runner + App.framework/App) ──
-  //
-  // iOS replaces the entire `.app` bundle when a user installs or
-  // upgrades the app, so both the Runner shell and the App.framework
-  // AOT snapshot get fresh mtimes. We take the MAX of the two so the
-  // comparison works in every Flutter incremental-build cadence:
++ (NSDate *)fcpBundleFreshnessDate {
+  // Compute the MAX of the mtimes of the Runner shell and the
+  // App.framework/App AOT snapshot. iOS replaces the entire `.app`
+  // bundle on install/upgrade, so whichever of the two is newest
+  // represents "when the current code was last touched":
   //
   //   * Native-only rebuild → Runner advances
   //   * Dart-only rebuild   → App.framework/App advances
   //   * Full build          → both advance
   //
-  // Either file missing is tolerated — we just use the other.
+  // Either file missing is tolerated; we use whichever we find.
+  NSFileManager *fileManager = [NSFileManager defaultManager];
   NSBundle *mainBundle = [NSBundle mainBundle];
   NSDate *bundleMtime = nil;
 
   NSString *runnerPath = [mainBundle executablePath];
   if (runnerPath) {
-    NSDictionary *runnerAttrs =
-        [fileManager attributesOfItemAtPath:runnerPath error:nil];
-    NSDate *runnerMtime = [runnerAttrs fileModificationDate];
+    NSDate *runnerMtime =
+        [[fileManager attributesOfItemAtPath:runnerPath error:nil]
+            fileModificationDate];
     if (runnerMtime) {
       bundleMtime = runnerMtime;
     }
@@ -127,53 +93,98 @@
   NSString *appFrameworkPath =
       [[mainBundle bundlePath] stringByAppendingPathComponent:
                                    @"Frameworks/App.framework/App"];
-  NSDictionary *appFrameworkAttrs =
-      [fileManager attributesOfItemAtPath:appFrameworkPath error:nil];
-  NSDate *appFrameworkMtime = [appFrameworkAttrs fileModificationDate];
+  NSDate *appFrameworkMtime =
+      [[fileManager attributesOfItemAtPath:appFrameworkPath error:nil]
+          fileModificationDate];
   if (appFrameworkMtime) {
     if (!bundleMtime ||
         [appFrameworkMtime compare:bundleMtime] == NSOrderedDescending) {
       bundleMtime = appFrameworkMtime;
     }
   }
+  return bundleMtime;
+}
 
++ (void)fcpCleanupStalePatchBeforeEngineBoots {
+  NSFileManager *fileManager = [NSFileManager defaultManager];
+
+  // Locate the patch directory. The custom Flutter engine hardcodes
+  // it to `<NSDocumentDirectory>/code_push_patches` (see
+  // FlutterDartProject.mm in the engine fork).
+  NSArray<NSString *> *documentPaths = NSSearchPathForDirectoriesInDomains(
+      NSDocumentDirectory, NSUserDomainMask, YES);
+  if (documentPaths.count == 0) {
+    return;
+  }
+  NSString *patchDirPath =
+      [documentPaths.firstObject stringByAppendingPathComponent:@"code_push_patches"];
+
+  // Delete stale or legacy patch files before the engine boots.
+  // See internal docs for details on the iOS patch lifecycle.
+
+  // Remove legacy patch file unconditionally (crash hazard on iOS).
+  NSString *legacyPatch =
+      [patchDirPath stringByAppendingPathComponent:@"patch.vmcode"];
+  if ([fileManager fileExistsAtPath:legacyPatch]) {
+    NSError *delError = nil;
+    if ([fileManager removeItemAtPath:legacyPatch error:&delError]) {
+      NSLog(@"[FlutterPlaza CodePush] Deleted legacy patch.vmcode "
+            @"(crash hazard on iOS cold boot)");
+    } else {
+      NSLog(@"[FlutterPlaza CodePush] Failed to delete legacy "
+            @"patch.vmcode: %@",
+            delError.localizedDescription);
+    }
+  }
+
+  // Stale-vs-bundle check for the new patch.bytecode filename.
+  NSString *patchPath =
+      [patchDirPath stringByAppendingPathComponent:@"patch.bytecode"];
+  if (![fileManager fileExistsAtPath:patchPath]) {
+    return;
+  }
+  NSDate *patchMtime =
+      [[fileManager attributesOfItemAtPath:patchPath error:nil]
+          fileModificationDate];
+  if (!patchMtime) {
+    return;
+  }
+  NSDate *bundleMtime = [self fcpBundleFreshnessDate];
   if (!bundleMtime) {
-    // Can't determine bundle freshness — fall through to the engine's
+    // Can't determine bundle freshness — fall through to the
     // three-strike auto-rollback safety net.
     return;
   }
+  if ([bundleMtime compare:patchMtime] != NSOrderedDescending) {
+    // Patch is newer than (or same age as) the bundle → keep it.
+    return;
+  }
 
-  // ── Decide and delete ─────────────────────────────────────────────
-  //
   // Bundle newer than patch → patch was written by a previous install
   // and may be incompatible with the current engine/baseline. Delete
   // it and its siblings so the engine boots clean. The SDK will
   // re-download a compatible patch on the next `checkAndInstall`.
-  if ([bundleMtime compare:patchMtime] == NSOrderedDescending) {
-    NSError *delError = nil;
-    if ([fileManager removeItemAtPath:patchPath error:&delError]) {
-      NSLog(@"[FlutterPlaza CodePush] Removed stale patch at boot "
-            @"(bundle newer than patch: %@ > %@)",
-            bundleMtime, patchMtime);
-    } else {
-      NSLog(@"[FlutterPlaza CodePush] Failed to remove stale patch: %@",
-            delError.localizedDescription);
-    }
-
-    // Remove sibling files the engine may have written alongside the
-    // patch so the next launch starts from a clean state. Ignore
-    // individual failures.
-    for (NSString *sibling in @[
-           @"boot_counter",
-           @"launch_status.json",
-           @"patch_info.json",
-           @"patch.vmcode.tmp"
-         ]) {
-      NSString *siblingPath =
-          [patchDirPath stringByAppendingPathComponent:sibling];
-      if ([fileManager fileExistsAtPath:siblingPath]) {
-        [fileManager removeItemAtPath:siblingPath error:nil];
-      }
+  NSError *delError = nil;
+  if ([fileManager removeItemAtPath:patchPath error:&delError]) {
+    NSLog(@"[FlutterPlaza CodePush] Removed stale patch.bytecode at "
+          @"boot (bundle newer than patch: %@ > %@)",
+          bundleMtime, patchMtime);
+  } else {
+    NSLog(@"[FlutterPlaza CodePush] Failed to remove stale "
+          @"patch.bytecode: %@",
+          delError.localizedDescription);
+  }
+  for (NSString *sibling in @[
+         @"boot_counter",
+         @"launch_status.json",
+         @"patch_info.json",
+         @"patch.vmcode.tmp",
+         @"patch.bytecode.tmp"
+       ]) {
+    NSString *siblingPath =
+        [patchDirPath stringByAppendingPathComponent:sibling];
+    if ([fileManager fileExistsAtPath:siblingPath]) {
+      [fileManager removeItemAtPath:siblingPath error:nil];
     }
   }
 }

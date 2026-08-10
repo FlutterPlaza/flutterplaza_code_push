@@ -1,6 +1,7 @@
-import 'dart:async' show Timer;
+import 'dart:async' show Timer, unawaited;
 import 'dart:convert' show base64Encode, jsonDecode, jsonEncode, utf8;
-import 'dart:io' show Directory, File, HttpClient, Platform, exit;
+import 'dart:io' show Directory, File, FileMode, HttpClient, Platform, exit;
+import 'dart:math' show Random;
 
 import 'dart:ui' as ui;
 
@@ -12,10 +13,13 @@ import 'package:flutter/services.dart';
 import 'models.dart';
 
 /// The platform channel used to communicate with the code push engine.
-/// The engine handler parses messages as JSON, so we must use JSONMethodCodec
-/// instead of the default StandardMethodCodec (binary).
-const MethodChannel _channel =
-    MethodChannel('flutter/codepush', JSONMethodCodec());
+const MethodChannel _channel = MethodChannel(
+  'flutter/codepush',
+  JSONMethodCodec(),
+);
+
+/// Channel for the SDK's own native plugin (reads Info.plist, etc.).
+const MethodChannel _pluginChannel = MethodChannel('flutterplaza_code_push');
 
 /// Service for managing over-the-air code push updates.
 ///
@@ -64,6 +68,11 @@ abstract final class CodePush {
   static Timer? _timer;
   static Timer? _launchTimer;
 
+  /// Bumped by every [init] and [dispose]; async init work checks it
+  /// after each await so a stale closure can't start timers for a
+  /// session that was disposed or re-initialized mid-flight.
+  static int _initEpoch = 0;
+
   /// Maximum consecutive failed boots before auto-rollback.
   static const int _maxBootAttempts = 3;
 
@@ -72,6 +81,15 @@ abstract final class CodePush {
 
   /// Cached patch directory path from the engine.
   static String? _cachedPatchDir;
+
+  /// On-disk filename of the active patch. Differs by platform so
+  /// each platform's load path can find its own artifact.
+  static String get _patchFilename =>
+      Platform.isIOS ? 'patch.bytecode' : 'patch.vmcode';
+
+  /// Expected first 4 bytes of every iOS patch payload after
+  /// unwrapping the on-disk header. Opaque format marker.
+  static const List<int> _iosPayloadHeader = <int>[0x33, 0x43, 0x42, 0x44];
 
   /// Debug status notifier — shows what code push is doing.
   static final ValueNotifier<String> status = ValueNotifier('init');
@@ -82,7 +100,6 @@ abstract final class CodePush {
   /// into a `Map<String, dynamic>`. Apps can listen to this to apply
   /// OTA patches to their UI.
   static final ValueNotifier<Object?> moduleResult = ValueNotifier(null);
-  static Object? _lastModuleResult;
   static bool _moduleLoaded = false;
 
   /// Initializes automatic code push update checking with crash protection.
@@ -103,7 +120,9 @@ abstract final class CodePush {
     Duration interval = const Duration(hours: 4),
     String channel = 'production',
     VoidCallback? onUpdateReady,
+    bool disableOnPlayStoreInstalls = false,
   }) {
+    print('[CP-INIT] CodePush.init called');
     // Store the config so `CodePushOverlay` can reuse it without
     // forcing the caller to repeat every field at the widget level.
     lastConfig = CodePushConfig(
@@ -112,6 +131,7 @@ abstract final class CodePush {
       releaseVersion: releaseVersion,
       checkInterval: interval,
       channel: channel,
+      disableOnPlayStoreInstalls: disableOnPlayStoreInstalls,
     );
 
     // NOTE: Any stale-patch cleanup from prior versions (0.1.4/0.1.5)
@@ -123,6 +143,64 @@ abstract final class CodePush {
 
     _timer?.cancel();
 
+    final epoch = ++_initEpoch;
+    unawaited(() async {
+      // Developer-selected store-only mode: when enabled and this build
+      // was installed from the Play Store, OTA stays off for the whole
+      // session — no server checks — and any patch left over from
+      // before the setting shipped is removed so the device runs the
+      // store baseline. Detection failure leaves OTA enabled: a build
+      // without the plugin (debug, sideload) is not a store install.
+      if (disableOnPlayStoreInstalls && await isPlayStoreInstall()) {
+        // Stale-session check after EVERY await in this branch: its
+        // side effects (a telemetry POST, a patch deletion) must never
+        // fire for a session that was disposed or superseded while a
+        // lookup was in flight — a stale rollback could even delete a
+        // patch a newer session just installed.
+        if (epoch != _initEpoch) return;
+        status.value = 'OTA off (store-installed build)';
+        // A native crash-loop rollback recorded before Dart started is
+        // still history worth reporting (and its marker worth
+        // clearing), even though OTA is off from here on.
+        await _reportPendingNativeRollback(serverUrl: serverUrl, appId: appId);
+        if (epoch != _initEpoch) return;
+        try {
+          // rollback() removes the patch wherever the platform keeps it
+          // (engine on Android/desktop, direct file removal on iOS) and
+          // throws when there is nothing to remove — the common,
+          // healthy case, swallowed below.
+          await rollback();
+          status.value = 'OTA off (store-installed build) — patch removed';
+        } catch (_) {
+          // Nothing to revert.
+        }
+        return;
+      }
+      // A dispose() or a newer init() during the await above owns the
+      // session now — don't start timers for a stale one.
+      if (epoch != _initEpoch) return;
+      _startUpdateFlow(
+        serverUrl: serverUrl,
+        appId: appId,
+        releaseVersion: releaseVersion,
+        interval: interval,
+        channel: channel,
+        onUpdateReady: onUpdateReady,
+      );
+    }());
+  }
+
+  /// Starts crash protection, the first update check, and the periodic
+  /// check timer. Split out of [init] so the store-install gate can
+  /// decide whether the flow starts at all.
+  static void _startUpdateFlow({
+    required String serverUrl,
+    required String appId,
+    required String releaseVersion,
+    required Duration interval,
+    required String channel,
+    VoidCallback? onUpdateReady,
+  }) {
     // Crash protection runs async because it needs the engine's patch
     // dir via platform channel. We chain the first checkAndInstall off
     // it so that, on a boot where a previously-downloaded bad patch is
@@ -131,10 +209,24 @@ abstract final class CodePush {
     // (possibly equally bad) patch. Prior versions fired checkAndInstall
     // unconditionally on init which left no room for the boot counter
     // to trip — see CHANGELOG 0.1.7 for the race condition this fixes.
-    _runCrashProtection().then((_) {
+    _runCrashProtection().then((_) async {
       // Start launch success timer only after crash protection completes,
       // so a rollback doesn't get immediately overwritten by a success report.
       _startLaunchTimer();
+
+      // Quarantine any just-rolled-back patch synchronously BEFORE the
+      // first check, so a bad patch isn't re-downloaded even once on this
+      // boot (the fast, no-network half of the rollback handling). The
+      // telemetry POST below is the slow, best-effort half.
+      final quarantineDir = await _getPatchDir();
+      if (quarantineDir != null) {
+        _quarantineFromBreadcrumb(quarantineDir);
+      }
+
+      // Report any rollback that was recorded natively before Dart started
+      // (crash-loop protection runs before main(), so without this the
+      // server never hears about it). Best-effort, fire-and-forget.
+      _reportPendingNativeRollback(serverUrl: serverUrl, appId: appId);
 
       // Immediate check is now *after* crash protection so a bad patch
       // on disk gets a chance to increment the boot counter before we
@@ -161,6 +253,7 @@ abstract final class CodePush {
 
   /// Stops automatic update checking and cancels the launch timer.
   static void dispose() {
+    _initEpoch++;
     _timer?.cancel();
     _timer = null;
     _launchTimer?.cancel();
@@ -178,6 +271,7 @@ abstract final class CodePush {
     VoidCallback? onUpdateReady,
   }) async {
     try {
+      print('[CP] checkAndInstall start');
       status.value = 'Checking server...';
       // Compute the baseline hash once, up front, so it can be
       // included in the /updates query. The server uses it as a
@@ -187,12 +281,16 @@ abstract final class CodePush {
       // ignore the parameter and the SDK-side load-time check
       // (further down) still protects us.
       final deviceBaselineHash = await _computeBaselineHash();
+      final deviceBaselineId = await _readBaselineId();
+      final deviceHash = await _deviceHash();
       final url = '$serverUrl/api/v1/updates'
           '?app_id=$appId'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
           '&channel=$channel'
-          '${deviceBaselineHash != null ? '&baseline_hash=$deviceBaselineHash' : ''}';
+          '${deviceBaselineHash != null ? '&baseline_hash=$deviceBaselineHash' : ''}'
+          '${deviceBaselineId != null ? '&baseline_id=$deviceBaselineId' : ''}'
+          '${deviceHash != null ? '&device_hash=$deviceHash' : ''}';
 
       final r = await _httpGet(url);
       if (r.statusCode == 204 || r.statusCode != 200) {
@@ -201,33 +299,95 @@ abstract final class CodePush {
       }
 
       final data = jsonDecode(r.body) as Map<String, dynamic>;
+
+      // Fleet-wide OTA kill switch (server-controlled). When the server
+      // says OTA is off for this app, stop offering updates AND revert
+      // any installed patch, so the fleet returns to the store baseline
+      // within one check interval of the switch being flipped.
+      if (data['ota_disabled'] == true) {
+        status.value = 'OTA disabled by server';
+        try {
+          // Unconditional: rollback() knows where each platform keeps
+          // the patch (engine on Android/desktop, file removal on iOS
+          // where the engine channel is disabled and isPatched would
+          // always answer false) and throws harmlessly when the device
+          // is already clean.
+          await rollback();
+          status.value =
+              'OTA disabled by server — patch removed (restart to apply)';
+        } catch (_) {
+          // Best-effort: a clean device has nothing to revert.
+        }
+        return false;
+      }
+
       if (data['patch_available'] != true) {
         status.value = 'No patch available';
         return false;
       }
 
       final patchId = data['patch_id']?.toString();
+      final serverPatchHash = data['patch_hash']?.toString();
       final patchUrl = data['patch_url'] as String?;
       if (patchUrl == null || patchUrl.isEmpty) {
         status.value = 'No patch URL';
         return false;
       }
 
+      // Skip a patch this device already rolled back, so a bad patch at
+      // 100% rollout can't crash-loop the device forever (rollback →
+      // refetch → re-crash). The marker persists across cold starts and
+      // works offline — no server round-trip needed. Cross-platform: on
+      // iOS the marker is written by the immediate/three-strike rollback;
+      // on Android it's promoted from the engine's rollback breadcrumb
+      // (see _reportPendingNativeRollback).
+      final quarantineDir = await _getPatchDir();
+      if (quarantineDir != null &&
+          _isPatchQuarantined(
+            patchDir: quarantineDir,
+            patchId: patchId,
+            patchHash: serverPatchHash,
+          )) {
+        // Older servers omit patch_id from the offer, so the match may
+        // have come from the hash — never render a null id.
+        final skippedLabel = patchId ??
+            ((serverPatchHash?.length ?? 0) >= 8
+                ? serverPatchHash!.substring(0, 8)
+                : 'unknown');
+        status.value = 'Skipping rolled-back patch $skippedLabel';
+        return false;
+      }
+
+      // Don't re-offer a patch this device already installed. On Android
+      // a patch applies on the next cold boot, so without this the server
+      // keeps offering the same patch every launch and the SDK
+      // re-downloads it and re-fires "restart to apply" forever. The
+      // install-time identity (finding #7's `installed_patch_identity.json`)
+      // survives the restart, so a matching offer means "already applied".
+      // (iOS latches `_moduleLoaded` and never writes this file, so this
+      // is effectively the Android equivalent of that latch.)
+      if (quarantineDir != null &&
+          _isPatchAlreadyInstalled(
+            patchDir: quarantineDir,
+            patchId: patchId,
+            patchHash: serverPatchHash,
+          )) {
+        status.value = 'Patch already installed';
+        return false;
+      }
+
       // ── Baseline compatibility guard ────────────────────────────
       //
       // Before touching any bytes, verify that the running Flutter
-      // engine is the code-push-enabled variant and — if the server
-      // supplies an `engine_fingerprint` — that the patch was compiled
-      // for the same Flutter SDK version.
-      //
-      // Without this guard, loading a patch onto a baseline that was
-      // built with a stock Flutter engine SIGSEGVs inside the Dart VM
-      // (`DRT_AllocateObject` reading from `0x10`) because the AOT
-      // snapshot's class layout disagrees with the running VM. The
-      // crash is a release-mode null deref with no user-visible
-      // diagnostic — the app just dies on the next allocation.
+      // engine is a code-push-capable Flutter engine and — if the
+      // server supplies an `engine_fingerprint` — that the patch was
+      // built for the same Flutter SDK version.
       final actualEngineFingerprint = await _probeEngineFingerprint();
       final expectedEngineFingerprint = data['engine_fingerprint'] as String?;
+      print(
+        '[CP] fingerprint=$actualEngineFingerprint '
+        'expected=$expectedEngineFingerprint',
+      );
 
       if (actualEngineFingerprint == null) {
         status.value = 'Incompatible baseline: engine has no code push support';
@@ -263,43 +423,47 @@ abstract final class CodePush {
         return false;
       }
 
-      // Phase 3 (0.1.7+): baseline-hash content check. The engine ABI
-      // fingerprint above only verifies Flutter SDK version — it does
-      // NOT catch the case where baseline and patch were built against
-      // different versions of `flutterplaza_code_push` (or any other
-      // Dart package whose class layout changed). When that happens,
-      // the server returns a patch whose AOT snapshot references class
-      // offsets that don't exist in the running baseline, and the VM
-      // aborts on the first class allocation inside
-      // `DN_Internal_loadDynamicModule`. The fix is to compare the
-      // SHA-256 of the running `App.framework/App` (iOS) against the
-      // hash the server recorded when the patch was uploaded.
+      // Phase 3 (0.1.7+): baseline content hash check.
       //
-      // If the server doesn't supply a baseline_hash (older CLI /
-      // older server), this check is skipped — the engine ABI check
-      // above still provides the coarse guard.
+      // Soft gate: log a mismatch for telemetry but don't block the
+      // patch download. sha256(binary) is invalid for TestFlight /
+      // App Store builds because Apple's processing modifies the
+      // binary after upload. Downgraded from a hard reject to a
+      // warning until a distribution-proof identity replaces binary
+      // hashing. The engine ABI fingerprint (Phase 2 above) remains
+      // the hard safety gate.
       final expectedBaselineHash = data['baseline_hash'] as String?;
       if (expectedBaselineHash != null) {
         final actualBaselineHash = await _computeBaselineHash();
+        // Report each distinct mismatch pair once per session —
+        // checkAndInstall runs on a periodic timer, and a stable
+        // mismatch (e.g. an ABI whose hash the server doesn't have)
+        // would otherwise POST identical telemetry on every tick. The
+        // pair is recorded once the report completes an HTTP round
+        // trip, whatever the status: a persistently failing endpoint
+        // must not turn every mismatching device into a per-poll
+        // beacon. Only a transport failure (offline, timeout) retries.
+        final mismatchKey = '$expectedBaselineHash|$actualBaselineHash';
         if (actualBaselineHash != null &&
-            actualBaselineHash != expectedBaselineHash) {
-          status.value = 'Incompatible baseline: hash mismatch';
-          await _reportIncompatibleBaseline(
+            actualBaselineHash != expectedBaselineHash &&
+            !_reportedBaselineMismatches.contains(mismatchKey)) {
+          final reported = await _reportIncompatibleBaseline(
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            reason: 'Baseline hash mismatch (package-level layout '
-                'drift — e.g. different flutterplaza_code_push '
-                'version or different transitive Dart deps between '
-                'the patch and the running baseline)',
+            reason: 'Baseline hash mismatch (soft gate — proceeding '
+                'with download; engine ABI check is the hard gate)',
             expectedFingerprint: expectedBaselineHash,
             actualFingerprint: actualBaselineHash,
           );
-          return false;
+          if (reported) {
+            _reportedBaselineMismatches.add(mismatchKey);
+          }
         }
       }
 
       status.value = 'Downloading patch...';
+      print('[CP] downloading from $patchUrl');
       final dlR = await _httpGetBytes(patchUrl);
       if (dlR.statusCode != 200) {
         status.value = 'Download failed (${dlR.statusCode})';
@@ -318,122 +482,93 @@ abstract final class CodePush {
           return false; // Already loaded this session.
         }
         await _installPatchFromDart(patchBytes);
+        final patchDir = await _getPatchDir();
+
+        // Persist patch metadata so rollback can record which patch
+        // was bad.  Written before module load so it's available even
+        // if the load crashes the process.
+        if (patchDir != null) {
+          try {
+            final patchHash = sha256.convert(patchBytes).toString();
+            File('$patchDir/patch_info.json').writeAsStringSync(
+              jsonEncode(<String, Object?>{
+                'patch_id': patchId,
+                'patch_hash': patchHash,
+                'installed_at': DateTime.now().toIso8601String(),
+              }),
+            );
+          } catch (_) {}
+        }
+
         try {
           // Extract the payload from the patch wrapper.
           final offsetBytes = patchBytes.buffer.asByteData();
           final payloadOffset = offsetBytes.getUint32(12, Endian.little);
           final payload = patchBytes.sublist(payloadOffset);
+          if (patchDir != null) {
+            _iosAppendDebugLog(
+              patchDir,
+              'BEFORE_LOAD patchId=$patchId bytes=${patchBytes.length} '
+              'payload=${payload.length}',
+            );
+          }
 
-          // Format guard: the Dart VM's dynamic module loader
-          // (`DN_Internal_loadDynamicModule`, reached via
-          // `ui.codePushLoadModule` → `Isolate.loadDynamicModule`)
-          // accepts a platform-specific AOT dynamic-module format:
-          //
-          //   * **iOS / macOS**: Mach-O 64-bit dylib
-          //     (`gen_snapshot --snapshot_kind=app-aot-macho-dylib`).
-          //     Magic bytes: `CF FA ED FE` (LE) or `FE ED FA CF`
-          //     (BE) for a 64-bit Mach-O.
-          //   * **Android / Linux**: ELF
-          //     (`gen_snapshot --snapshot_kind=app-aot-elf`).
-          //     Magic bytes: `7F 45 4C 46`.
-          //
-          // This branch runs on iOS only (the enclosing
-          // `Platform.isIOS` check is above), so we require
-          // Mach-O 64-bit here. Anything else aborts the VM
-          // inside the native with SIGABRT and no recoverable
-          // error — we diagnose the historical wrong formats so
-          // users upgrading from older CLI versions get a clear
-          // status message + immediate rollback instead of a
-          // process kill:
-          //
-          //   * `flutter_compile` ≤ 0.19.10 shipped Mach-O via
-          //     `App.framework/App`, but it was the *baseline*
-          //     binary — unrelated code, wrong symbols, still
-          //     aborted.
-          //   * `flutter_compile` 0.19.11 / 0.19.12 shipped raw
-          //     Dart kernel (`90 AB CD EF`).
-          //   * `flutter_compile` 0.19.13 shipped an ELF blob
-          //     (`7F 45 4C 46`) — right idea, wrong target
-          //     format for iOS.
-          //   * `flutter_compile` 0.19.14+ ships Mach-O dylib via
-          //     `fcp-tool snapshot --target ios`.
-          final isMachO64 = payload.length > 4 &&
-              ((payload[0] == 0xfe &&
-                      payload[1] == 0xed &&
-                      payload[2] == 0xfa &&
-                      payload[3] == 0xcf) ||
-                  (payload[0] == 0xcf &&
-                      payload[1] == 0xfa &&
-                      payload[2] == 0xed &&
-                      payload[3] == 0xfe));
-          if (!isMachO64 && payload.length > 4) {
-            final magicHex = payload
-                .take(4)
-                .map((b) => b.toRadixString(16).padLeft(2, '0'))
-                .join('');
-            final isELF = payload[0] == 0x7f &&
-                payload[1] == 0x45 &&
-                payload[2] == 0x4c &&
-                payload[3] == 0x46;
-            final isKernel = payload[0] == 0x90 &&
-                payload[1] == 0xab &&
-                payload[2] == 0xcd &&
-                payload[3] == 0xef;
-            final String diagnosis;
-            if (isELF) {
-              diagnosis = 'Patch is ELF (magic $magicHex) — iOS '
-                  'expects a Mach-O dylib. The CLI is targeting '
-                  'the wrong snapshot kind. Upgrade '
-                  'flutter_compile to 0.19.14+.';
-            } else if (isKernel) {
-              diagnosis = 'Patch is raw Dart kernel (magic '
-                  '$magicHex) — iOS expects a Mach-O dylib. The '
-                  'CLI needs to run `fcp-tool snapshot --target '
-                  'ios` on the kernel before packaging. Upgrade '
-                  'flutter_compile to 0.19.14+.';
-            } else {
-              diagnosis = 'Patch has unknown magic bytes '
-                  '$magicHex — expected Mach-O 64-bit dylib '
-                  '(cf fa ed fe).';
+          // Format guard: reject a patch payload that doesn't match
+          // the expected iOS header before handing it to the runtime.
+          // A mismatched payload cannot load cleanly, so we delete it
+          // and surface an upgrade hint instead.
+          bool headerMatches() {
+            if (payload.length < _iosPayloadHeader.length) return false;
+            for (var i = 0; i < _iosPayloadHeader.length; i++) {
+              if (payload[i] != _iosPayloadHeader[i]) return false;
             }
-            status.value = diagnosis;
+            return true;
+          }
+
+          if (!headerMatches()) {
+            if (patchDir != null) {
+              _iosAppendDebugLog(
+                patchDir,
+                'HEADER_MISMATCH patchId=$patchId payload=${payload.length}',
+              );
+            }
+            status.value = 'Patch format is unexpected — rolling back. '
+                'Upgrade flutter_compile to the latest version and '
+                'rebuild the patch.';
             await _iosImmediateRollback(
               serverUrl: serverUrl,
               appId: appId,
               patchId: patchId,
-              errorMessage: 'Patch magic mismatch (0x$magicHex, '
-                  'not Mach-O 64-bit) — rejected before '
-                  'loadDynamicModule',
+              errorMessage: 'Patch format mismatch — rejected before load',
             );
             return false;
           }
 
           status.value = 'Loading module...';
-          // `codePushLoadModule` is a runtime hook added by the custom
-          // code-push-enabled Flutter engine. It does not exist on the
-          // stock `dart:ui`, so the static analyzer can't see it. The
-          // presence check at the top of checkAndInstall
+          if (patchDir != null) {
+            _iosAppendDebugLog(
+              patchDir,
+              'CALL_LOAD patchId=$patchId payload=${payload.length}',
+            );
+          }
+          // Invoke the runtime hook exposed by the code-push-capable
+          // engine. The presence check above
           // (`_probeEngineFingerprint`) guarantees we only reach this
           // point on an engine that actually exposes the hook.
+          //
+          // Return-value semantics: the hook throws on real load
+          // failures (bad format, verification failure, etc.). Any
+          // non-throw return — including `null` — is a successful
+          // load. `null` in particular comes back when the payload
+          // loaded cleanly but had no entry-point function to invoke
+          // (for example, a delta whose contents are all already
+          // present in the baseline). That is a valid no-op, not a
+          // failure, and must NOT trigger rollback — rolling back
+          // would cause the next check to re-download, re-load, and
+          // loop tightly.
           final rawResult = await ui
               // ignore: undefined_function
               .codePushLoadModule(Uint8List.fromList(payload));
-
-          // If the engine returns null/false, the module failed to load
-          // (bad bytecode, version mismatch, verification failure).
-          // Delete the patch immediately instead of waiting for 3-boot
-          // auto-rollback.
-          if (rawResult == null || rawResult == false) {
-            status.value = 'Module load failed — rolling back patch';
-            await _iosImmediateRollback(
-              serverUrl: serverUrl,
-              appId: appId,
-              patchId: patchId,
-              errorMessage:
-                  'loadDynamicModule returned ${rawResult ?? "null"} — deleted immediately',
-            );
-            return false;
-          }
 
           // Module loaded live — no restart needed on iOS.
           // Auto-parse JSON strings into Map/List for structured data.
@@ -446,26 +581,63 @@ abstract final class CodePush {
               // Not JSON — keep as raw string.
             }
           }
-          _lastModuleResult = result;
           _moduleLoaded = true;
           moduleResult.value = result;
           status.value = 'Patch active';
+          // Clear any previous rollback marker — this patch works.
+          if (patchDir != null) {
+            try {
+              final rbFile = File('$patchDir/rolled_back_patch');
+              if (rbFile.existsSync()) rbFile.deleteSync();
+            } catch (_) {}
+          }
+          if (patchDir != null) {
+            _iosAppendDebugLog(
+              patchDir,
+              'AFTER_LOAD patchId=$patchId result=$result '
+              'moduleLoaded=$_moduleLoaded',
+            );
+          }
+          print(
+            '[CP] MODULE LOADED OK — result=$result moduleLoaded=$_moduleLoaded',
+          );
           return true;
         } catch (e) {
+          if (patchDir != null) {
+            _iosAppendDebugLog(
+              patchDir,
+              'LOAD_THROW patchId=$patchId error=$e',
+            );
+          }
+          print('[CP] MODULE LOAD THREW — $e');
           status.value = 'Module error: $e — rolling back patch';
-          // Patch is bad (corrupt bytecode, exception during load, etc.).
-          // Delete immediately instead of retrying for 3 boots.
+          // Real load failure. Delete immediately instead of waiting
+          // for the three-strike auto-rollback.
           await _iosImmediateRollback(
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            errorMessage: 'loadDynamicModule threw $e — deleted immediately',
+            errorMessage: 'Patch load threw $e — deleted immediately',
           );
           return false;
         }
       } else {
         // Android/desktop: install via engine, restart required.
         await installPatch(patchBytes);
+        // Record this patch's server identity in a file the engine's
+        // rollback does NOT delete. If the patch crash-loops, the engine
+        // rolls it back pre-main and deletes patch_info.json before any
+        // Dart runs — so without this, the next launch couldn't learn
+        // which patch to quarantine. Promoted to the rollback marker by
+        // _reportPendingNativeRollback when the breadcrumb appears.
+        final patchDir = await _getPatchDir();
+        if (patchDir != null) {
+          _recordInstalledIdentity(
+            patchDir: patchDir,
+            patchId: patchId,
+            patchHash: serverPatchHash,
+          );
+        }
         status.value = 'Restart to apply';
         onUpdateReady?.call();
         return true;
@@ -485,54 +657,31 @@ abstract final class CodePush {
 
   // ── Baseline compatibility ──────────────────────────────────────
 
-  /// Whether the running Flutter engine has code push support.
+  /// Whether the running Flutter engine supports code push.
   ///
   /// Returns `true` only if the `flutter/codepush` method channel is
-  /// registered and responds to a cheap probe within 2 seconds. On a
-  /// stock Flutter engine the channel has no handler and the probe
-  /// either throws [MissingPluginException] or times out — both map
-  /// to `false`.
-  ///
-  /// The SDK uses this internally before loading any downloaded patch
-  /// to prevent the `DRT_AllocateObject` SIGSEGV that occurs when an
-  /// AOT snapshot's class layout disagrees with the running VM. Apps
-  /// can also call it directly to hide "check for updates" UI on
-  /// devices that don't have a code-push-enabled baseline installed.
+  /// registered and responds to a cheap probe within 2 seconds. Apps
+  /// can call this to hide "check for updates" UI on devices whose
+  /// baseline wasn't built for code push.
   static Future<bool> get hasCodePushEngine async {
     return (await _probeEngineFingerprint()) != null;
   }
 
-  /// Probes the running engine for its code push compatibility
-  /// fingerprint.
-  ///
-  /// Returns:
-  ///   * A fingerprint string if the engine exposes a
-  ///     `CodePush.getEngineAbi` handler (future code-push engines).
-  ///   * The literal string `"unknown"` if the engine has code push
-  ///     support but does not expose an ABI probe yet — still enough
-  ///     to satisfy the Phase 1 "engine is present" check.
-  ///   * `null` if the engine has no code push support at all (no
-  ///     handler on the channel, or the probe times out).
-  ///
-  /// The implementation tries `CodePush.getEngineAbi` first (Phase 2
-  /// ABI match), then falls back to `CodePush.getReleaseVersion`
-  /// which has been on every code-push engine since the first
-  /// release (Phase 1 presence check). Both calls are bounded with a
-  /// 2-second timeout so a misbehaving channel can't wedge the SDK.
+  /// Probes the running engine for a code push compatibility
+  /// fingerprint. Returns a fingerprint string on success, `"unknown"`
+  /// as a fallback for older baselines that respond to the probe but
+  /// don't yet expose an ABI identifier, or `null` when no code push
+  /// support is present. Bounded with a 2-second timeout.
   static Future<String?> _probeEngineFingerprint() async {
-    // Phase 2 probe — new engines can expose a real ABI string.
     try {
       final abi = await _channel
           .invokeMethod<String>('CodePush.getEngineAbi')
           .timeout(const Duration(seconds: 2));
       if (abi != null && abi.isNotEmpty) return abi;
     } catch (_) {
-      // Fall through to Phase 1 probe — engine may be older.
+      // Fall through to the fallback probe.
     }
 
-    // Phase 1 probe — "is a code-push engine present at all?".
-    // getReleaseVersion has existed on every code-push engine build
-    // and is cheap (just reads an NSDictionary entry / Java field).
     try {
       await _channel
           .invokeMethod<String>('CodePush.getReleaseVersion')
@@ -546,8 +695,11 @@ abstract final class CodePush {
   /// Best-effort telemetry POST to let the server know a device was
   /// stranded on an incompatible baseline. Swallows every error so
   /// telemetry failure can never cascade into an app crash — this is
-  /// already the unhappy path.
-  static Future<void> _reportIncompatibleBaseline({
+  /// already the unhappy path. Returns true when the request completed
+  /// an HTTP round trip (any status — the report was delivered even if
+  /// the server refused it); false only on transport failure, so
+  /// callers can retry when the device was offline.
+  static Future<bool> _reportIncompatibleBaseline({
     required String serverUrl,
     required String appId,
     required String? patchId,
@@ -572,9 +724,82 @@ abstract final class CodePush {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
         final req =
             await client.postUrl(uri).timeout(const Duration(seconds: 5));
-        req.headers.set('Content-Type', 'application/json');
-        req.write(jsonEncode(payload));
-        await req.close().timeout(const Duration(seconds: 5));
+        req.headers.set('Content-Type', 'application/json; charset=utf-8');
+        // Send encoded bytes, not a string: HttpClientRequest.write()
+        // defaults to Latin-1, which throws on any non-Latin-1 character
+        // in the payload (e.g. an em dash in a reason string) and would
+        // silently drop the report.
+        req.add(utf8.encode(jsonEncode(payload)));
+        final res = await req.close().timeout(const Duration(seconds: 5));
+        await res.drain<void>();
+        return true;
+      } finally {
+        client.close(force: true);
+      }
+    } catch (_) {
+      // Telemetry is best-effort. Never crash over it.
+      return false;
+    }
+  }
+
+  /// Best-effort: report a rollback that the native side recorded in the
+  /// patch directory (automatic crash-loop rollbacks happen before any
+  /// Dart code runs, so they can only be reported after the fact). The
+  /// marker is cleared once the server has received the report; if the
+  /// device is offline, we retry on the next launch.
+  static Future<void> _reportPendingNativeRollback({
+    required String serverUrl,
+    required String appId,
+  }) async {
+    try {
+      final patchDir = await _getPatchDir();
+      if (patchDir == null) return;
+      final marker = File('$patchDir/rollback_info.json');
+      if (!marker.existsSync()) return;
+
+      // Quarantine the rolled-back patch BEFORE the (best-effort, maybe
+      // offline) telemetry POST, so the crash-loop breaks even with no
+      // network.
+      _quarantineFromBreadcrumb(patchDir);
+
+      Map<String, dynamic> info;
+      try {
+        info = jsonDecode(marker.readAsStringSync()) as Map<String, dynamic>;
+      } catch (_) {
+        // Unreadable marker — clear it so it can't wedge future launches.
+        try {
+          marker.deleteSync();
+        } catch (_) {}
+        return;
+      }
+
+      final payload = <String, dynamic>{
+        'app_id': appId,
+        'kind': 'auto_rollback',
+        'reason': info['reason'] ?? 'unknown',
+        'platform': _platform,
+        if (info['patch_version'] != null)
+          'patch_version': info['patch_version'],
+        if (info['boot_count'] != null) 'boot_count': info['boot_count'],
+        if (info['rolled_back_at'] != null)
+          'rolled_back_at': info['rolled_back_at'],
+      };
+      final client = HttpClient();
+      try {
+        final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
+        final req =
+            await client.postUrl(uri).timeout(const Duration(seconds: 5));
+        req.headers.set('Content-Type', 'application/json; charset=utf-8');
+        // Encoded bytes, not a string: write() defaults to Latin-1 and
+        // throws on any non-Latin-1 character in the native-written
+        // reason, which would silently strand the marker forever.
+        req.add(utf8.encode(jsonEncode(payload)));
+        final res = await req.close().timeout(const Duration(seconds: 5));
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try {
+            marker.deleteSync();
+          } catch (_) {}
+        }
       } finally {
         client.close(force: true);
       }
@@ -583,11 +808,336 @@ abstract final class CodePush {
     }
   }
 
+  // ── Rolled-back-patch quarantine ──────────────────────────────────
+  //
+  // Breaks the "bad patch at 100% rollout crash-loops forever" failure:
+  // once a patch has been rolled back on this device, its server
+  // identity is recorded in `rolled_back_patch` and [checkAndInstall]
+  // refuses to re-download a patch that matches — offline, no server
+  // change needed. The marker holds `{patch_id, patch_hash}` and is
+  // cleared automatically once the server moves on to a different patch.
+
+  /// Whether a stored `{patch_id, patch_hash}` identity matches the
+  /// server's offer (by id OR hash). Shared by the quarantine and
+  /// already-installed checks.
+  static bool _identityMatches(
+    Map<String, dynamic> stored,
+    String? patchId,
+    String? patchHash,
+  ) {
+    final sId = stored['patch_id']?.toString();
+    final sHash = stored['patch_hash']?.toString();
+    final idMatch = sId != null && sId == patchId;
+    final hashMatch = sHash != null && patchHash != null && sHash == patchHash;
+    return idMatch || hashMatch;
+  }
+
+  /// Whether [patchId]/[patchHash] matches the locally quarantined
+  /// rolled-back patch. Clears a stale marker when the server has moved
+  /// on to a different patch, so the quarantine is never permanent.
+  static bool _isPatchQuarantined({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) {
+    final rbFile = File('$patchDir/rolled_back_patch');
+    if (!rbFile.existsSync()) return false;
+    try {
+      final rb = jsonDecode(rbFile.readAsStringSync()) as Map<String, dynamic>;
+      if (_identityMatches(rb, patchId, patchHash)) return true;
+      // Different patch — the previously-bad one is superseded; drop it.
+      rbFile.deleteSync();
+      return false;
+    } catch (_) {
+      // Corrupt marker — clear it and don't block this patch.
+      try {
+        rbFile.deleteSync();
+      } catch (_) {}
+      return false;
+    }
+  }
+
+  /// Whether the server-offered [patchId]/[patchHash] is the patch this
+  /// device already installed — read from `installed_patch_identity.json`
+  /// (written on Android install, surviving the restart). Does NOT clear
+  /// the file on mismatch: a different offer is a genuinely new patch to
+  /// install, which will overwrite the identity anyway.
+  ///
+  /// Gated on the patch bytes still being present: EVERY rollback path
+  /// (crash three-strike, the OTA kill switch, or a public `rollback()`)
+  /// removes the patch file, so a surviving-but-stale identity must not
+  /// block re-delivery of the same patch after it was reverted.
+  static bool _isPatchAlreadyInstalled({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) {
+    if (!File('$patchDir/$_patchFilename').existsSync()) return false;
+    final f = File('$patchDir/installed_patch_identity.json');
+    if (!f.existsSync()) return false;
+    try {
+      final stored = jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
+      return _identityMatches(stored, patchId, patchHash);
+    } catch (_) {
+      // Corrupt — don't block a fresh install.
+      return false;
+    }
+  }
+
+  /// A stable, numeric per-install identifier for the `device_hash`
+  /// query param. Persisted to the patch dir so it survives restarts;
+  /// numeric so the server can both key its 15-minute per-device rate
+  /// limit and bucket staged rollout (`device_hash % 100`). Best-effort:
+  /// returns null when it can't be read/created, which simply leaves the
+  /// param off — the server then skips the limiter, exactly as before.
+  static String? _cachedDeviceHash;
+
+  static Future<String?> _deviceHash() async {
+    final cached = _cachedDeviceHash;
+    if (cached != null) return cached;
+    try {
+      final patchDir = await _getPatchDir();
+      if (patchDir == null) return null;
+      final f = File('$patchDir/device_id');
+      if (f.existsSync()) {
+        final v = f.readAsStringSync().trim();
+        if (v.isNotEmpty) return _cachedDeviceHash = v;
+      }
+      final rng = Random.secure();
+      // A positive 63-bit int (two draws), as a decimal string.
+      final id = (rng.nextInt(0x80000000) << 32) | rng.nextInt(0x100000000);
+      Directory(patchDir).createSync(recursive: true);
+      f.writeAsStringSync('$id');
+      return _cachedDeviceHash = '$id';
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Records the just-installed patch's server identity in a file the
+  /// engine's rollback does not delete (Android), so a later launch can
+  /// quarantine it if the engine rolled it back. Best-effort.
+  static void _recordInstalledIdentity({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) {
+    try {
+      File('$patchDir/installed_patch_identity.json').writeAsStringSync(
+        jsonEncode(<String, Object?>{
+          'patch_id': patchId,
+          'patch_hash': patchHash,
+          'installed_at': DateTime.now().toIso8601String(),
+        }),
+      );
+    } catch (_) {
+      // Non-fatal: without it the crash-loop still bottoms out at the
+      // engine's three-strike rollback, just without the quarantine.
+    }
+  }
+
+  /// If the engine left a rollback breadcrumb (`rollback_info.json`),
+  /// quarantine the rolled-back patch — but only ONCE per breadcrumb. A
+  /// breadcrumb that lingers offline (telemetry never acked) must not
+  /// re-quarantine a good patch that was installed in the meantime, so
+  /// the breadcrumb is flagged `quarantined` after the first promotion.
+  /// Synchronous, best-effort, idempotent — safe to call more than once.
+  ///
+  /// Cross-component assumption: the native engine (`Updater::Rollback`)
+  /// **replaces** `rollback_info.json` wholesale on each rollback, so a
+  /// new bad patch always arrives as a fresh, unflagged breadcrumb. If a
+  /// future engine ever did a read-modify-write that preserved unknown
+  /// keys, a stale `quarantined` flag would make this early-return and
+  /// the new bad patch would fall back to the engine's three-strike
+  /// protection instead of being quarantined.
+  static void _quarantineFromBreadcrumb(String patchDir) {
+    try {
+      final marker = File('$patchDir/rollback_info.json');
+      if (!marker.existsSync()) return;
+      final info =
+          jsonDecode(marker.readAsStringSync()) as Map<String, dynamic>;
+      if (info['quarantined'] == true) return;
+      // Flag the breadcrumb BEFORE promoting, so this is all-or-nothing:
+      // if the flag write throws, we return WITHOUT consuming the identity
+      // (a later boot retries cleanly). The alternative order could leave
+      // the breadcrumb unflagged AND the identity consumed — and if a good
+      // patch were installed before the next boot, the still-live
+      // breadcrumb would then quarantine that good patch.
+      info['quarantined'] = true;
+      marker.writeAsStringSync(jsonEncode(info));
+      _promoteRolledBackIdentity(patchDir);
+    } catch (_) {
+      // Best-effort; the three-strike rollback still protects the device.
+    }
+  }
+
+  /// Promotes the surviving install-time identity into the
+  /// `rolled_back_patch` marker, then consumes the identity file. Called
+  /// when the engine's rollback breadcrumb is detected on Android.
+  static void _promoteRolledBackIdentity(String patchDir) {
+    try {
+      final idFile = File('$patchDir/installed_patch_identity.json');
+      if (!idFile.existsSync()) return;
+      final id = jsonDecode(idFile.readAsStringSync()) as Map<String, dynamic>;
+      File('$patchDir/rolled_back_patch').writeAsStringSync(
+        jsonEncode(<String, Object?>{
+          'patch_id': id['patch_id'],
+          'patch_hash': id['patch_hash'],
+          'rolled_back_at': DateTime.now().toIso8601String(),
+        }),
+      );
+      idFile.deleteSync();
+    } catch (_) {
+      // Best-effort quarantine; the three-strike rollback still protects
+      // the device even if this fails.
+    }
+  }
+
   /// In-memory cache of the running app's baseline hash.
   /// Computed lazily on first use and reused for the rest of the
   /// session, since the AOT snapshot can't change while the app is
   /// running.
   static String? _cachedBaselineHash;
+
+  /// When the last hash computation failed (null result), the failure is
+  /// remembered here so one check cycle doesn't pay the platform-channel
+  /// timeout twice — [checkAndInstall] computes the hash at both the query
+  /// step and the soft-gate step. Retried after [_baselineHashRetryAfter]:
+  /// a transient first-boot failure (slow storage, cold cache) must not
+  /// disable the baseline gate for the whole session.
+  static DateTime? _baselineHashFailedAt;
+
+  /// How long a failed hash computation short-circuits before retrying.
+  static const Duration _baselineHashRetryAfter = Duration(minutes: 1);
+
+  /// In-flight hash computation, shared so concurrent callers don't stack
+  /// duplicate platform-channel invocations (and duplicate native hashing
+  /// threads) while one is already running.
+  static Future<String?>? _baselineHashInFlight;
+
+  /// Test-only: forces the Android branch of the baseline-hash path in
+  /// host unit tests, where `Platform.isAndroid` is always false.
+  @visibleForTesting
+  static bool debugForceAndroidPlatform = false;
+
+  /// Baseline-hash mismatch pairs (`expected|actual`) already reported to
+  /// the server this session, so periodic checks don't repeat identical
+  /// telemetry every poll cycle.
+  static final Set<String> _reportedBaselineMismatches = <String>{};
+
+  /// Test-only: clears the baseline-hash session state between tests.
+  @visibleForTesting
+  static void debugResetBaselineHashCache() {
+    _cachedBaselineHash = null;
+    _baselineHashFailedAt = null;
+    _baselineHashInFlight = null;
+    _reportedBaselineMismatches.clear();
+    _cachedIsPlayInstall = null;
+    _cachedDeviceHash = null;
+    _cachedPatchDir = null;
+  }
+
+  /// Test-only wrappers for the rolled-back-patch quarantine helpers.
+  @visibleForTesting
+  static bool debugIsPatchQuarantined({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) =>
+      _isPatchQuarantined(
+        patchDir: patchDir,
+        patchId: patchId,
+        patchHash: patchHash,
+      );
+
+  @visibleForTesting
+  static void debugRecordInstalledIdentity({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) =>
+      _recordInstalledIdentity(
+        patchDir: patchDir,
+        patchId: patchId,
+        patchHash: patchHash,
+      );
+
+  @visibleForTesting
+  static void debugPromoteRolledBackIdentity(String patchDir) =>
+      _promoteRolledBackIdentity(patchDir);
+
+  @visibleForTesting
+  static void debugQuarantineFromBreadcrumb(String patchDir) =>
+      _quarantineFromBreadcrumb(patchDir);
+
+  @visibleForTesting
+  static bool debugIsPatchAlreadyInstalled({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) =>
+      _isPatchAlreadyInstalled(
+        patchDir: patchDir,
+        patchId: patchId,
+        patchHash: patchHash,
+      );
+
+  @visibleForTesting
+  static Future<String?> debugDeviceHash() => _deviceHash();
+
+  /// Cached distribution-proof baseline UUID (see [_readBaselineId]).
+  static String? _cachedBaselineId;
+
+  /// Cached installer-source verdict for the session.
+  static bool? _cachedIsPlayInstall;
+
+  /// Whether this build was installed by the Google Play Store.
+  ///
+  /// Backs [init]'s `disableOnPlayStoreInstalls`: developers who want
+  /// store-only updates for Play-installed builds set that flag, and
+  /// this check decides whether it applies to the running install.
+  /// Only meaningful on Android; false elsewhere and on any failure
+  /// (a build without the plugin — debug, sideload — is not a store
+  /// install, so failing open keeps OTA available where it is allowed).
+  @visibleForTesting
+  static Future<bool> isPlayStoreInstall() async {
+    final cached = _cachedIsPlayInstall;
+    if (cached != null) return cached;
+    try {
+      if (!(debugForceAndroidPlatform || Platform.isAndroid)) {
+        return _cachedIsPlayInstall = false;
+      }
+      final installer = await _pluginChannel
+          .invokeMethod<String>('getInstallerSource')
+          .timeout(const Duration(seconds: 2));
+      return _cachedIsPlayInstall = installer == 'com.android.vending';
+    } catch (_) {
+      // Transient failure (slow first boot, torn-down messenger): fail
+      // open for this call but do NOT cache it, so the next init or
+      // check re-asks instead of pinning the wrong answer all session.
+      return false;
+    }
+  }
+
+  /// Read the distribution-proof baseline UUID from Info.plist
+  /// (`FCPBaselineId` key, written by `fcp codepush release`).
+  /// Returns null when the key is absent (older CLI or non-iOS).
+  static Future<String?> _readBaselineId() async {
+    if (_cachedBaselineId != null) return _cachedBaselineId;
+    try {
+      if (!Platform.isIOS) return null;
+      final id = await _pluginChannel
+          .invokeMethod<String>('getBaselineId')
+          .timeout(const Duration(seconds: 2));
+      if (id != null && id.isNotEmpty) {
+        _cachedBaselineId = id;
+        return id;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
 
   /// Returns the SHA-256 hex of the currently-running baseline's
   /// `App.framework/App` (iOS) or `libapp.so` (Android).
@@ -603,14 +1153,47 @@ abstract final class CodePush {
   /// to load a patch whose recorded baseline hash disagrees with
   /// this value.
   ///
-  /// Cached in memory after first computation. Reading the few-MB
-  /// AOT blob and hashing it takes ~20–50 ms on a modern device —
-  /// once per session is fine. Non-iOS is a no-op for now (the
-  /// Android engine loads patches differently and the crash path
-  /// the hash guards against is iOS-specific).
-  static Future<String?> _computeBaselineHash() async {
-    if (_cachedBaselineHash != null) return _cachedBaselineHash;
+  /// Cached in memory after first computation. Hashing the few-MB
+  /// AOT blob takes ~20–50 ms on a modern device — once per session
+  /// is fine. On iOS the blob is read from the app bundle; on Android
+  /// it is read from the platform side.
+  ///
+  /// Failures are memoized briefly (see [_baselineHashFailedAt]) and
+  /// concurrent callers share one in-flight computation, so a device that
+  /// can't produce a hash pays the platform-channel timeout at most once
+  /// per retry window instead of on every call.
+  static Future<String?> _computeBaselineHash() {
+    if (_cachedBaselineHash != null) {
+      return Future.value(_cachedBaselineHash);
+    }
+    final failedAt = _baselineHashFailedAt;
+    if (failedAt != null &&
+        DateTime.now().difference(failedAt) < _baselineHashRetryAfter) {
+      return Future.value(null);
+    }
+    return _baselineHashInFlight ??=
+        _computeBaselineHashUncached().then((hash) {
+      if (hash == null) _baselineHashFailedAt = DateTime.now();
+      return hash;
+    }).whenComplete(() => _baselineHashInFlight = null);
+  }
+
+  static Future<String?> _computeBaselineHashUncached() async {
     try {
+      if (debugForceAndroidPlatform || Platform.isAndroid) {
+        // Android packages the AOT snapshot as lib/<abi>/libapp.so inside
+        // the APK; the platform side reads and hashes it. Generous timeout:
+        // a first-boot hash of a multi-MB entry on slow storage with a cold
+        // page cache can take several seconds.
+        final hash = await _pluginChannel
+            .invokeMethod<String>('getAppLibHash')
+            .timeout(const Duration(seconds: 10));
+        if (hash != null && hash.isNotEmpty) {
+          _cachedBaselineHash = hash;
+          return hash;
+        }
+        return null;
+      }
       if (!Platform.isIOS) return null;
 
       // On iOS, Platform.resolvedExecutable points at
@@ -644,10 +1227,8 @@ abstract final class CodePush {
   /// Checks the engine for available updates (delegates to Dart side HTTP).
   static Future<UpdateInfo> checkForUpdate() async {
     try {
-      final Map<String, dynamic>? result =
-          await _channel.invokeMapMethod<String, dynamic>(
-        'CodePush.checkForUpdate',
-      );
+      final Map<String, dynamic>? result = await _channel
+          .invokeMapMethod<String, dynamic>('CodePush.checkForUpdate');
       if (result == null) {
         throw CodePushException(
           'Failed to check for update: no response from engine.',
@@ -690,10 +1271,8 @@ abstract final class CodePush {
   /// Returns information about the currently installed patch, or null if
   /// no patch is active.
   static Future<PatchInfo?> get currentPatch async {
-    final Map<String, dynamic>? result =
-        await _channel.invokeMapMethod<String, dynamic>(
-      'CodePush.getCurrentPatch',
-    );
+    final Map<String, dynamic>? result = await _channel
+        .invokeMapMethod<String, dynamic>('CodePush.getCurrentPatch');
     if (result == null) return null;
     return PatchInfo(
       version: result['version'] as String,
@@ -720,8 +1299,9 @@ abstract final class CodePush {
   static Future<void> rollback() async {
     // Try engine-side rollback first (works on Android/desktop).
     try {
-      final bool? success =
-          await _channel.invokeMethod<bool>('CodePush.rollback');
+      final bool? success = await _channel.invokeMethod<bool>(
+        'CodePush.rollback',
+      );
       if (success == true) return;
     } catch (_) {}
 
@@ -730,7 +1310,7 @@ abstract final class CodePush {
     if (patchDir == null) {
       throw CodePushException('No patch directory configured.');
     }
-    final patchFile = File('$patchDir/patch.vmcode');
+    final patchFile = File('$patchDir/$_patchFilename');
     if (!patchFile.existsSync()) {
       throw CodePushException('No active patch to roll back.');
     }
@@ -739,7 +1319,6 @@ abstract final class CodePush {
     if (infoFile.existsSync()) infoFile.deleteSync();
     _iosResetBootCounter(patchDir);
     _moduleLoaded = false;
-    _lastModuleResult = null;
     moduleResult.value = null;
   }
 
@@ -753,8 +1332,9 @@ abstract final class CodePush {
   ///
   /// Throws [CodePushException] if the download or application fails.
   static Future<void> downloadAndApply() async {
-    final result =
-        await _channel.invokeMethod<bool>('CodePush.downloadAndApply');
+    final result = await _channel.invokeMethod<bool>(
+      'CodePush.downloadAndApply',
+    );
     if (result != true) {
       throw CodePushException('Failed to download and apply patch.');
     }
@@ -792,8 +1372,9 @@ abstract final class CodePush {
   /// which breaks Apple Clang LTO.
   static Future<void> _installPatchFromDart(Uint8List patchBytes) async {
     // Ask the engine for its configured patch directory path.
-    final patchDir =
-        await _channel.invokeMethod<String>('CodePush.getPatchDir');
+    final patchDir = await _channel.invokeMethod<String>(
+      'CodePush.getPatchDir',
+    );
     if (patchDir == null || patchDir.isEmpty) {
       throw CodePushException('Engine returned no patch directory.');
     }
@@ -803,7 +1384,7 @@ abstract final class CodePush {
       dir.createSync(recursive: true);
     }
 
-    final file = File('$patchDir/patch.vmcode');
+    final file = File('$patchDir/$_patchFilename');
     await file.writeAsBytes(patchBytes, flush: true);
   }
 
@@ -829,7 +1410,7 @@ abstract final class CodePush {
     try {
       final patchDir = await _getPatchDir();
       if (patchDir == null) return;
-      final patchFile = File('$patchDir/patch.vmcode');
+      final patchFile = File('$patchDir/$_patchFilename');
       if (!patchFile.existsSync()) return; // No patch, nothing to protect.
 
       if (_iosCheckAndAutoRollback(patchDir)) {
@@ -877,12 +1458,34 @@ abstract final class CodePush {
     required String? patchId,
     required String errorMessage,
   }) async {
-    // 1. Delete the patch files from disk.
+    // 1. Record which patch was rolled back, then delete files.
     try {
       final patchDir = await _getPatchDir();
       if (patchDir != null) {
-        final patchFile = File('$patchDir/patch.vmcode');
-        if (await patchFile.exists()) await patchFile.delete();
+        // Read patch metadata before deleting so we can record the
+        // rolled-back ID + hash.  This marker persists across cold
+        // starts to prevent re-downloading the same bad patch.
+        try {
+          final infoFile = File('$patchDir/patch_info.json');
+          if (infoFile.existsSync()) {
+            final info =
+                jsonDecode(infoFile.readAsStringSync()) as Map<String, dynamic>;
+            File('$patchDir/rolled_back_patch').writeAsStringSync(
+              jsonEncode(<String, Object?>{
+                'patch_id': info['patch_id'],
+                'patch_hash': info['patch_hash'],
+                'rolled_back_at': DateTime.now().toIso8601String(),
+              }),
+            );
+          }
+        } catch (_) {}
+
+        // Delete both the new (patch.bytecode) and legacy (patch.vmcode)
+        // filenames to be safe across SDK upgrades.
+        for (final name in const ['patch.bytecode', 'patch.vmcode']) {
+          final f = File('$patchDir/$name');
+          if (await f.exists()) await f.delete();
+        }
         final infoFile = File('$patchDir/patch_info.json');
         if (await infoFile.exists()) await infoFile.delete();
         _iosResetBootCounter(patchDir);
@@ -898,7 +1501,6 @@ abstract final class CodePush {
 
     // 3. Reset in-memory module state so the app runs on baseline.
     _moduleLoaded = false;
-    _lastModuleResult = null;
     moduleResult.value = null;
 
     // 4. Report the failure to the server (fire-and-forget).
@@ -975,16 +1577,49 @@ abstract final class CodePush {
     _iosWriteBootCounter(patchDir, 0);
   }
 
+  static void _iosAppendDebugLog(String patchDir, String line) {
+    try {
+      final dir = Directory(patchDir);
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      final stamp = DateTime.now().toIso8601String();
+      File('$patchDir/cp_debug.log').writeAsStringSync(
+        '[$stamp] $line\n',
+        mode: FileMode.append,
+        flush: true,
+      );
+    } catch (_) {}
+  }
+
   /// Returns true if a rollback was performed.
   static bool _iosCheckAndAutoRollback(String patchDir) {
     final count = _iosReadBootCounter(patchDir);
     if (count < _maxBootAttempts) return false;
 
-    // Auto-rollback: remove the patch and reset the counter.
+    // Auto-rollback: record which patch was bad, then remove files.
     try {
-      final patchFile = File('$patchDir/patch.vmcode');
-      if (patchFile.existsSync()) patchFile.deleteSync();
+      // Record the rolled-back patch ID + hash before deleting.
       final infoFile = File('$patchDir/patch_info.json');
+      if (infoFile.existsSync()) {
+        try {
+          final info =
+              jsonDecode(infoFile.readAsStringSync()) as Map<String, dynamic>;
+          File('$patchDir/rolled_back_patch').writeAsStringSync(
+            jsonEncode(<String, Object?>{
+              'patch_id': info['patch_id'],
+              'patch_hash': info['patch_hash'],
+              'rolled_back_at': DateTime.now().toIso8601String(),
+            }),
+          );
+        } catch (_) {}
+      }
+
+      // Delete both the new (patch.bytecode) and legacy (patch.vmcode)
+      // filenames defensively — a device upgrading from 0.1.10 might
+      // still have the legacy file on disk.
+      for (final name in const ['patch.bytecode', 'patch.vmcode']) {
+        final f = File('$patchDir/$name');
+        if (f.existsSync()) f.deleteSync();
+      }
       if (infoFile.existsSync()) infoFile.deleteSync();
       _iosResetBootCounter(patchDir);
     } catch (_) {}
@@ -1005,6 +1640,7 @@ class CodePushConfig {
     required this.releaseVersion,
     this.checkInterval = const Duration(hours: 4),
     this.channel = 'production',
+    this.disableOnPlayStoreInstalls = false,
   });
 
   final String serverUrl;
@@ -1012,6 +1648,12 @@ class CodePushConfig {
   final String releaseVersion;
   final Duration checkInterval;
   final String channel;
+
+  /// Keep OTA updates off for builds installed from the Play Store, so
+  /// those installs only ever change through store updates. Off-store
+  /// installs (sideload, other stores, MDM) are unaffected. Off by
+  /// default.
+  final bool disableOnPlayStoreInstalls;
 }
 
 /// A widget that wraps your app and shows an update-ready banner
@@ -1057,8 +1699,10 @@ class CodePushOverlay extends StatefulWidget {
   /// Optional custom banner builder. If null, uses the default banner.
   /// Return `null` to hide the banner.
   final Widget Function(
-          BuildContext context, VoidCallback onRestart, VoidCallback onDismiss)?
-      bannerBuilder;
+    BuildContext context,
+    VoidCallback onRestart,
+    VoidCallback onDismiss,
+  )? bannerBuilder;
 
   /// Whether to show the debug status bar at the top. Defaults to false.
   final bool showDebugBar;
@@ -1092,6 +1736,7 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    CodePush.status.addListener(_onModuleLoaded);
     CodePush.moduleResult.addListener(_onModuleLoaded);
     final cfg = _config;
     CodePush.init(
@@ -1100,6 +1745,7 @@ class _CodePushOverlayState extends State<CodePushOverlay>
       releaseVersion: cfg.releaseVersion,
       interval: cfg.checkInterval,
       channel: cfg.channel,
+      disableOnPlayStoreInstalls: cfg.disableOnPlayStoreInstalls,
       onUpdateReady: () {
         if (mounted) setState(() => _updateReady = true);
       },
@@ -1107,13 +1753,14 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   }
 
   void _onModuleLoaded() {
-    if (CodePush.moduleResult.value != null && mounted) {
+    if (mounted && !_patchActive && CodePush.status.value == 'Patch active') {
       setState(() => _patchActive = true);
     }
   }
 
   @override
   void dispose() {
+    CodePush.status.removeListener(_onModuleLoaded);
     CodePush.moduleResult.removeListener(_onModuleLoaded);
     CodePush.dispose();
     WidgetsBinding.instance.removeObserver(this);
@@ -1142,7 +1789,7 @@ class _CodePushOverlayState extends State<CodePushOverlay>
       textDirection: TextDirection.ltr,
       child: Stack(
         children: [
-          widget.child,
+          KeyedSubtree(key: ValueKey<bool>(_patchActive), child: widget.child),
           if (widget.showDebugBar && !_patchActive)
             Positioned(
               top: 0,
@@ -1157,11 +1804,14 @@ class _CodePushOverlayState extends State<CodePushOverlay>
                   child: Container(
                     color: const Color(0xFF1A237E),
                     padding: const EdgeInsets.fromLTRB(12, 50, 12, 6),
-                    child: Text('CP: $status',
-                        style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 11,
-                            decoration: TextDecoration.none)),
+                    child: Text(
+                      'CP: $status',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        decoration: TextDecoration.none,
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -1176,7 +1826,7 @@ class _CodePushOverlayState extends State<CodePushOverlay>
                       context,
                       CodePush.restart,
                       () => setState(() => _updateReady = false),
-                    )!
+                    )
                   : _DefaultUpdateBanner(
                       onRestart: CodePush.restart,
                       onDismiss: () => setState(() => _updateReady = false),
@@ -1210,18 +1860,10 @@ class _DefaultUpdateBanner extends StatelessWidget {
           children: [
             const Icon(Icons.system_update, size: 20),
             const SizedBox(width: 12),
-            const Expanded(
-              child: Text('Update ready. Restart to apply.'),
-            ),
-            TextButton(
-              onPressed: onDismiss,
-              child: const Text('LATER'),
-            ),
+            const Expanded(child: Text('Update ready. Restart to apply.')),
+            TextButton(onPressed: onDismiss, child: const Text('LATER')),
             const SizedBox(width: 4),
-            FilledButton(
-              onPressed: onRestart,
-              child: const Text('RESTART'),
-            ),
+            FilledButton(onPressed: onRestart, child: const Text('RESTART')),
           ],
         ),
       ),
@@ -1274,7 +1916,10 @@ class CodePushPatchBuilder extends StatelessWidget {
           if (patchKey != null) {
             if (result.startsWith('$patchKey:')) {
               return builder(
-                  context, result.substring(patchKey!.length + 1), child);
+                context,
+                result.substring(patchKey!.length + 1),
+                child,
+              );
             }
             return builder(context, null, child);
           }
@@ -1300,8 +1945,10 @@ Future<_HttpResult> _httpGet(String url) async {
   try {
     final request = await client.getUrl(Uri.parse(url));
     final response = await request.close();
-    final bytes = await response
-        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
+    final bytes = await response.fold<List<int>>(
+      <int>[],
+      (prev, chunk) => prev..addAll(chunk),
+    );
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
     client.close();
@@ -1313,8 +1960,10 @@ Future<_HttpResult> _httpGetBytes(String url) async {
   try {
     final request = await client.getUrl(Uri.parse(url));
     final response = await request.close();
-    final bytes = await response
-        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
+    final bytes = await response.fold<List<int>>(
+      <int>[],
+      (prev, chunk) => prev..addAll(chunk),
+    );
     return _HttpResult(response.statusCode, '', bytes);
   } finally {
     client.close();
@@ -1330,8 +1979,10 @@ Future<_HttpResult> _httpPostJson(String url, Map<String, dynamic> body) async {
     request.contentLength = encoded.length;
     request.add(encoded);
     final response = await request.close();
-    final bytes = await response
-        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
+    final bytes = await response.fold<List<int>>(
+      <int>[],
+      (prev, chunk) => prev..addAll(chunk),
+    );
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
     client.close();

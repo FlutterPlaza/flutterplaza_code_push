@@ -2,3 +2,11 @@ build/
 .dart_tool/
 .flutter-plugins
 .flutter-plugins-dependencies
+pubspec.lock
+example/pubspec.lock
+# Local-only test artifacts
+.bundle-rt/
+hello.dart
+hello.bytecode
+hello_*.bytecode
+example/.flutter-plugins-dependencies
