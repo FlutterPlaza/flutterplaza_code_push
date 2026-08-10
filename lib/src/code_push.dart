@@ -283,8 +283,7 @@ abstract final class CodePush {
       final deviceBaselineHash = await _computeBaselineHash();
       final deviceBaselineId = await _readBaselineId();
       final deviceHash = await _deviceHash();
-      final url =
-          '$serverUrl/api/v1/updates'
+      final url = '$serverUrl/api/v1/updates'
           '?app_id=$appId'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
@@ -390,8 +389,7 @@ abstract final class CodePush {
           serverUrl: serverUrl,
           appId: appId,
           patchId: patchId,
-          reason:
-              'Engine has no code push support (stock Flutter engine '
+          reason: 'Engine has no code push support (stock Flutter engine '
               'or missing flutter/codepush method channel).',
           expectedFingerprint: expectedEngineFingerprint,
           actualFingerprint: null,
@@ -406,8 +404,7 @@ abstract final class CodePush {
       if (expectedEngineFingerprint != null &&
           actualEngineFingerprint != 'unknown' &&
           expectedEngineFingerprint != actualEngineFingerprint) {
-        status.value =
-            'Incompatible baseline: engine ABI mismatch '
+        status.value = 'Incompatible baseline: engine ABI mismatch '
             '($actualEngineFingerprint vs $expectedEngineFingerprint)';
         await _reportIncompatibleBaseline(
           serverUrl: serverUrl,
@@ -448,8 +445,7 @@ abstract final class CodePush {
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            reason:
-                'Baseline hash mismatch (soft gate — proceeding '
+            reason: 'Baseline hash mismatch (soft gate — proceeding '
                 'with download; engine ABI check is the hard gate)',
             expectedFingerprint: expectedBaselineHash,
             actualFingerprint: actualBaselineHash,
@@ -530,8 +526,7 @@ abstract final class CodePush {
                 'HEADER_MISMATCH patchId=$patchId payload=${payload.length}',
               );
             }
-            status.value =
-                'Patch format is unexpected — rolling back. '
+            status.value = 'Patch format is unexpected — rolling back. '
                 'Upgrade flutter_compile to the latest version and '
                 'rebuild the patch.';
             await _iosImmediateRollback(
@@ -721,9 +716,8 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req = await client
-            .postUrl(uri)
-            .timeout(const Duration(seconds: 5));
+        final req =
+            await client.postUrl(uri).timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json; charset=utf-8');
         // Send encoded bytes, not a string: HttpClientRequest.write()
         // defaults to Latin-1, which throws on any non-Latin-1 character
@@ -787,9 +781,8 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req = await client
-            .postUrl(uri)
-            .timeout(const Duration(seconds: 5));
+        final req =
+            await client.postUrl(uri).timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json; charset=utf-8');
         // Encoded bytes, not a string: write() defaults to Latin-1 and
         // throws on any non-Latin-1 character in the native-written
@@ -863,11 +856,17 @@ abstract final class CodePush {
   /// (written on Android install, surviving the restart). Does NOT clear
   /// the file on mismatch: a different offer is a genuinely new patch to
   /// install, which will overwrite the identity anyway.
+  ///
+  /// Gated on the patch bytes still being present: EVERY rollback path
+  /// (crash three-strike, the OTA kill switch, or a public `rollback()`)
+  /// removes the patch file, so a surviving-but-stale identity must not
+  /// block re-delivery of the same patch after it was reverted.
   static bool _isPatchAlreadyInstalled({
     required String patchDir,
     required String? patchId,
     required String? patchHash,
   }) {
+    if (!File('$patchDir/$_patchFilename').existsSync()) return false;
     final f = File('$patchDir/installed_patch_identity.json');
     if (!f.existsSync()) return false;
     try {
@@ -885,21 +884,25 @@ abstract final class CodePush {
   /// limit and bucket staged rollout (`device_hash % 100`). Best-effort:
   /// returns null when it can't be read/created, which simply leaves the
   /// param off — the server then skips the limiter, exactly as before.
+  static String? _cachedDeviceHash;
+
   static Future<String?> _deviceHash() async {
+    final cached = _cachedDeviceHash;
+    if (cached != null) return cached;
     try {
       final patchDir = await _getPatchDir();
       if (patchDir == null) return null;
       final f = File('$patchDir/device_id');
       if (f.existsSync()) {
         final v = f.readAsStringSync().trim();
-        if (v.isNotEmpty) return v;
+        if (v.isNotEmpty) return _cachedDeviceHash = v;
       }
       final rng = Random.secure();
       // A positive 63-bit int (two draws), as a decimal string.
       final id = (rng.nextInt(0x80000000) << 32) | rng.nextInt(0x100000000);
       Directory(patchDir).createSync(recursive: true);
       f.writeAsStringSync('$id');
-      return '$id';
+      return _cachedDeviceHash = '$id';
     } catch (_) {
       return null;
     }
@@ -1024,6 +1027,8 @@ abstract final class CodePush {
     _baselineHashInFlight = null;
     _reportedBaselineMismatches.clear();
     _cachedIsPlayInstall = null;
+    _cachedDeviceHash = null;
+    _cachedPatchDir = null;
   }
 
   /// Test-only wrappers for the rolled-back-patch quarantine helpers.
@@ -1032,22 +1037,24 @@ abstract final class CodePush {
     required String patchDir,
     required String? patchId,
     required String? patchHash,
-  }) => _isPatchQuarantined(
-    patchDir: patchDir,
-    patchId: patchId,
-    patchHash: patchHash,
-  );
+  }) =>
+      _isPatchQuarantined(
+        patchDir: patchDir,
+        patchId: patchId,
+        patchHash: patchHash,
+      );
 
   @visibleForTesting
   static void debugRecordInstalledIdentity({
     required String patchDir,
     required String? patchId,
     required String? patchHash,
-  }) => _recordInstalledIdentity(
-    patchDir: patchDir,
-    patchId: patchId,
-    patchHash: patchHash,
-  );
+  }) =>
+      _recordInstalledIdentity(
+        patchDir: patchDir,
+        patchId: patchId,
+        patchHash: patchHash,
+      );
 
   @visibleForTesting
   static void debugPromoteRolledBackIdentity(String patchDir) =>
@@ -1062,11 +1069,12 @@ abstract final class CodePush {
     required String patchDir,
     required String? patchId,
     required String? patchHash,
-  }) => _isPatchAlreadyInstalled(
-    patchDir: patchDir,
-    patchId: patchId,
-    patchHash: patchHash,
-  );
+  }) =>
+      _isPatchAlreadyInstalled(
+        patchDir: patchDir,
+        patchId: patchId,
+        patchHash: patchHash,
+      );
 
   @visibleForTesting
   static Future<String?> debugDeviceHash() => _deviceHash();
@@ -1157,12 +1165,11 @@ abstract final class CodePush {
         DateTime.now().difference(failedAt) < _baselineHashRetryAfter) {
       return Future.value(null);
     }
-    return _baselineHashInFlight ??= _computeBaselineHashUncached()
-        .then((hash) {
-          if (hash == null) _baselineHashFailedAt = DateTime.now();
-          return hash;
-        })
-        .whenComplete(() => _baselineHashInFlight = null);
+    return _baselineHashInFlight ??=
+        _computeBaselineHashUncached().then((hash) {
+      if (hash == null) _baselineHashFailedAt = DateTime.now();
+      return hash;
+    }).whenComplete(() => _baselineHashInFlight = null);
   }
 
   static Future<String?> _computeBaselineHashUncached() async {
@@ -1689,8 +1696,7 @@ class CodePushOverlay extends StatefulWidget {
     BuildContext context,
     VoidCallback onRestart,
     VoidCallback onDismiss,
-  )?
-  bannerBuilder;
+  )? bannerBuilder;
 
   /// Whether to show the debug status bar at the top. Defaults to false.
   final bool showDebugBar;
@@ -1890,7 +1896,7 @@ class CodePushPatchBuilder extends StatelessWidget {
 
   /// Builder called with the patch data string (or null if no patch).
   final Widget Function(BuildContext context, String? patchData, Widget? child)
-  builder;
+      builder;
 
   /// Optional child widget passed to the builder (typically the default/baseline UI).
   final Widget? child;
