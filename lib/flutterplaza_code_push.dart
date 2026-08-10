@@ -1,8 +1,7 @@
 /// Over-the-air code push updates for Flutter apps.
 ///
-/// This package provides the runtime API for FlutterPlaza Code Push.
-/// It communicates with the custom code-push engine via platform channels
-/// to check for updates, download and apply patches, and roll back.
+/// This package provides the runtime API for FlutterPlaza Code Push:
+/// check for updates, download and apply patches, and roll back.
 ///
 /// ## Quick start
 ///

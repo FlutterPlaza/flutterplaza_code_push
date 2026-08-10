@@ -14,3 +14,7 @@ pubspec.lock
 
 # Environment
 .env
+
+# Local artifacts
+**/.flutter-plugins-dependencies
+hello_*.bytecode
