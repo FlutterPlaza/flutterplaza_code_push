@@ -121,6 +121,75 @@ void main() {
       CodePush.debugPromoteRolledBackIdentity(patchDir.path);
       expect(marker().existsSync(), isFalse);
     });
+  });
+
+  group('_quarantineFromBreadcrumb (once-per-breadcrumb guard)', () {
+    File breadcrumb() => File('${patchDir.path}/rollback_info.json');
+
+    void writeBreadcrumb({bool quarantined = false}) {
+      breadcrumb().writeAsStringSync(jsonEncode({
+        'reason': 'boot_loop',
+        'patch_version': '1.0.0+2',
+        if (quarantined) 'quarantined': true,
+      }));
+    }
+
+    test('a fresh breadcrumb promotes the identity and flags itself', () {
+      CodePush.debugRecordInstalledIdentity(
+        patchDir: patchDir.path,
+        patchId: 'bad',
+        patchHash: 'h',
+      );
+      writeBreadcrumb();
+
+      CodePush.debugQuarantineFromBreadcrumb(patchDir.path);
+
+      expect(
+        CodePush.debugIsPatchQuarantined(
+          patchDir: patchDir.path,
+          patchId: 'bad',
+          patchHash: null,
+        ),
+        isTrue,
+      );
+      final bc =
+          jsonDecode(breadcrumb().readAsStringSync()) as Map<String, dynamic>;
+      expect(bc['quarantined'], isTrue);
+      expect(identity().existsSync(), isFalse); // consumed
+    });
+
+    test(
+        'a breadcrumb already flagged does NOT re-quarantine a good patch '
+        'installed in the meantime', () {
+      // The bad patch was already quarantined; its breadcrumb lingers
+      // (telemetry never acked, device offline).
+      writeBreadcrumb(quarantined: true);
+      // Meanwhile a genuinely good patch got installed.
+      CodePush.debugRecordInstalledIdentity(
+        patchDir: patchDir.path,
+        patchId: 'good',
+        patchHash: 'goodhash',
+      );
+
+      CodePush.debugQuarantineFromBreadcrumb(patchDir.path);
+
+      // The good patch must NOT be quarantined by the stale breadcrumb.
+      expect(
+        CodePush.debugIsPatchQuarantined(
+          patchDir: patchDir.path,
+          patchId: 'good',
+          patchHash: 'goodhash',
+        ),
+        isFalse,
+      );
+      // The good identity is untouched (not consumed).
+      expect(identity().existsSync(), isTrue);
+    });
+
+    test('no breadcrumb → safe no-op', () {
+      CodePush.debugQuarantineFromBreadcrumb(patchDir.path);
+      expect(marker().existsSync(), isFalse);
+    });
 
     test('end-to-end: install bad → rollback → the bad patch is quarantined',
         () {

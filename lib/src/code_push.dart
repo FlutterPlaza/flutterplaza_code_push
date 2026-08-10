@@ -208,10 +208,19 @@ abstract final class CodePush {
     // (possibly equally bad) patch. Prior versions fired checkAndInstall
     // unconditionally on init which left no room for the boot counter
     // to trip — see CHANGELOG 0.1.7 for the race condition this fixes.
-    _runCrashProtection().then((_) {
+    _runCrashProtection().then((_) async {
       // Start launch success timer only after crash protection completes,
       // so a rollback doesn't get immediately overwritten by a success report.
       _startLaunchTimer();
+
+      // Quarantine any just-rolled-back patch synchronously BEFORE the
+      // first check, so a bad patch isn't re-downloaded even once on this
+      // boot (the fast, no-network half of the rollback handling). The
+      // telemetry POST below is the slow, best-effort half.
+      final quarantineDir = await _getPatchDir();
+      if (quarantineDir != null) {
+        _quarantineFromBreadcrumb(quarantineDir);
+      }
 
       // Report any rollback that was recorded natively before Dart started
       // (crash-loop protection runs before main(), so without this the
@@ -272,8 +281,7 @@ abstract final class CodePush {
       // (further down) still protects us.
       final deviceBaselineHash = await _computeBaselineHash();
       final deviceBaselineId = await _readBaselineId();
-      final url =
-          '$serverUrl/api/v1/updates'
+      final url = '$serverUrl/api/v1/updates'
           '?app_id=$appId'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
@@ -360,8 +368,7 @@ abstract final class CodePush {
           serverUrl: serverUrl,
           appId: appId,
           patchId: patchId,
-          reason:
-              'Engine has no code push support (stock Flutter engine '
+          reason: 'Engine has no code push support (stock Flutter engine '
               'or missing flutter/codepush method channel).',
           expectedFingerprint: expectedEngineFingerprint,
           actualFingerprint: null,
@@ -376,8 +383,7 @@ abstract final class CodePush {
       if (expectedEngineFingerprint != null &&
           actualEngineFingerprint != 'unknown' &&
           expectedEngineFingerprint != actualEngineFingerprint) {
-        status.value =
-            'Incompatible baseline: engine ABI mismatch '
+        status.value = 'Incompatible baseline: engine ABI mismatch '
             '($actualEngineFingerprint vs $expectedEngineFingerprint)';
         await _reportIncompatibleBaseline(
           serverUrl: serverUrl,
@@ -418,8 +424,7 @@ abstract final class CodePush {
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            reason:
-                'Baseline hash mismatch (soft gate — proceeding '
+            reason: 'Baseline hash mismatch (soft gate — proceeding '
                 'with download; engine ABI check is the hard gate)',
             expectedFingerprint: expectedBaselineHash,
             actualFingerprint: actualBaselineHash,
@@ -500,8 +505,7 @@ abstract final class CodePush {
                 'HEADER_MISMATCH patchId=$patchId payload=${payload.length}',
               );
             }
-            status.value =
-                'Patch format is unexpected — rolling back. '
+            status.value = 'Patch format is unexpected — rolling back. '
                 'Upgrade flutter_compile to the latest version and '
                 'rebuild the patch.';
             await _iosImmediateRollback(
@@ -691,9 +695,8 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req = await client
-            .postUrl(uri)
-            .timeout(const Duration(seconds: 5));
+        final req =
+            await client.postUrl(uri).timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json; charset=utf-8');
         // Send encoded bytes, not a string: HttpClientRequest.write()
         // defaults to Latin-1, which throws on any non-Latin-1 character
@@ -727,6 +730,11 @@ abstract final class CodePush {
       final marker = File('$patchDir/rollback_info.json');
       if (!marker.existsSync()) return;
 
+      // Quarantine the rolled-back patch BEFORE the (best-effort, maybe
+      // offline) telemetry POST, so the crash-loop breaks even with no
+      // network.
+      _quarantineFromBreadcrumb(patchDir);
+
       Map<String, dynamic> info;
       try {
         info = jsonDecode(marker.readAsStringSync()) as Map<String, dynamic>;
@@ -736,22 +744,6 @@ abstract final class CodePush {
           marker.deleteSync();
         } catch (_) {}
         return;
-      }
-
-      // Quarantine the rolled-back patch BEFORE the (best-effort, maybe
-      // offline) telemetry POST, so the crash-loop breaks even with no
-      // network. Do it once per breadcrumb: a rollback_info.json that
-      // lingers offline must not later re-quarantine a good patch that
-      // was installed in the meantime.
-      if (info['quarantined'] != true) {
-        _promoteRolledBackIdentity(patchDir);
-        try {
-          info['quarantined'] = true;
-          marker.writeAsStringSync(jsonEncode(info));
-        } catch (_) {
-          // If we can't flag it, the identity file was already consumed
-          // by the promotion above, so a re-run finds nothing to promote.
-        }
       }
 
       final payload = <String, dynamic>{
@@ -768,9 +760,8 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req = await client
-            .postUrl(uri)
-            .timeout(const Duration(seconds: 5));
+        final req =
+            await client.postUrl(uri).timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json; charset=utf-8');
         // Encoded bytes, not a string: write() defaults to Latin-1 and
         // throws on any non-Latin-1 character in the native-written
@@ -848,6 +839,32 @@ abstract final class CodePush {
     } catch (_) {
       // Non-fatal: without it the crash-loop still bottoms out at the
       // engine's three-strike rollback, just without the quarantine.
+    }
+  }
+
+  /// If the engine left a rollback breadcrumb (`rollback_info.json`),
+  /// quarantine the rolled-back patch — but only ONCE per breadcrumb. A
+  /// breadcrumb that lingers offline (telemetry never acked) must not
+  /// re-quarantine a good patch that was installed in the meantime, so
+  /// the breadcrumb is flagged `quarantined` after the first promotion.
+  /// Synchronous, best-effort, idempotent — safe to call more than once.
+  static void _quarantineFromBreadcrumb(String patchDir) {
+    try {
+      final marker = File('$patchDir/rollback_info.json');
+      if (!marker.existsSync()) return;
+      final info =
+          jsonDecode(marker.readAsStringSync()) as Map<String, dynamic>;
+      if (info['quarantined'] == true) return;
+      _promoteRolledBackIdentity(patchDir);
+      try {
+        info['quarantined'] = true;
+        marker.writeAsStringSync(jsonEncode(info));
+      } catch (_) {
+        // If we can't flag it, the identity file was already consumed by
+        // the promotion above, so a re-run finds nothing to re-promote.
+      }
+    } catch (_) {
+      // Best-effort; the three-strike rollback still protects the device.
     }
   }
 
@@ -944,6 +961,10 @@ abstract final class CodePush {
   static void debugPromoteRolledBackIdentity(String patchDir) =>
       _promoteRolledBackIdentity(patchDir);
 
+  @visibleForTesting
+  static void debugQuarantineFromBreadcrumb(String patchDir) =>
+      _quarantineFromBreadcrumb(patchDir);
+
   /// Cached distribution-proof baseline UUID (see [_readBaselineId]).
   static String? _cachedBaselineId;
 
@@ -1030,12 +1051,11 @@ abstract final class CodePush {
         DateTime.now().difference(failedAt) < _baselineHashRetryAfter) {
       return Future.value(null);
     }
-    return _baselineHashInFlight ??= _computeBaselineHashUncached()
-        .then((hash) {
-          if (hash == null) _baselineHashFailedAt = DateTime.now();
-          return hash;
-        })
-        .whenComplete(() => _baselineHashInFlight = null);
+    return _baselineHashInFlight ??=
+        _computeBaselineHashUncached().then((hash) {
+      if (hash == null) _baselineHashFailedAt = DateTime.now();
+      return hash;
+    }).whenComplete(() => _baselineHashInFlight = null);
   }
 
   static Future<String?> _computeBaselineHashUncached() async {
@@ -1562,8 +1582,7 @@ class CodePushOverlay extends StatefulWidget {
     BuildContext context,
     VoidCallback onRestart,
     VoidCallback onDismiss,
-  )?
-  bannerBuilder;
+  )? bannerBuilder;
 
   /// Whether to show the debug status bar at the top. Defaults to false.
   final bool showDebugBar;
@@ -1763,7 +1782,7 @@ class CodePushPatchBuilder extends StatelessWidget {
 
   /// Builder called with the patch data string (or null if no patch).
   final Widget Function(BuildContext context, String? patchData, Widget? child)
-  builder;
+      builder;
 
   /// Optional child widget passed to the builder (typically the default/baseline UI).
   final Widget? child;
