@@ -1,6 +1,7 @@
 import 'dart:async' show Timer, unawaited;
 import 'dart:convert' show base64Encode, jsonDecode, jsonEncode, utf8;
 import 'dart:io' show Directory, File, FileMode, HttpClient, Platform, exit;
+import 'dart:math' show Random;
 
 import 'dart:ui' as ui;
 
@@ -281,13 +282,16 @@ abstract final class CodePush {
       // (further down) still protects us.
       final deviceBaselineHash = await _computeBaselineHash();
       final deviceBaselineId = await _readBaselineId();
-      final url = '$serverUrl/api/v1/updates'
+      final deviceHash = await _deviceHash();
+      final url =
+          '$serverUrl/api/v1/updates'
           '?app_id=$appId'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
           '&channel=$channel'
           '${deviceBaselineHash != null ? '&baseline_hash=$deviceBaselineHash' : ''}'
-          '${deviceBaselineId != null ? '&baseline_id=$deviceBaselineId' : ''}';
+          '${deviceBaselineId != null ? '&baseline_id=$deviceBaselineId' : ''}'
+          '${deviceHash != null ? '&device_hash=$deviceHash' : ''}';
 
       final r = await _httpGet(url);
       if (r.statusCode == 204 || r.statusCode != 200) {
@@ -349,6 +353,24 @@ abstract final class CodePush {
         return false;
       }
 
+      // Don't re-offer a patch this device already installed. On Android
+      // a patch applies on the next cold boot, so without this the server
+      // keeps offering the same patch every launch and the SDK
+      // re-downloads it and re-fires "restart to apply" forever. The
+      // install-time identity (finding #7's `installed_patch_identity.json`)
+      // survives the restart, so a matching offer means "already applied".
+      // (iOS latches `_moduleLoaded` and never writes this file, so this
+      // is effectively the Android equivalent of that latch.)
+      if (quarantineDir != null &&
+          _isPatchAlreadyInstalled(
+            patchDir: quarantineDir,
+            patchId: patchId,
+            patchHash: serverPatchHash,
+          )) {
+        status.value = 'Patch already installed';
+        return false;
+      }
+
       // ── Baseline compatibility guard ────────────────────────────
       //
       // Before touching any bytes, verify that the running Flutter
@@ -368,7 +390,8 @@ abstract final class CodePush {
           serverUrl: serverUrl,
           appId: appId,
           patchId: patchId,
-          reason: 'Engine has no code push support (stock Flutter engine '
+          reason:
+              'Engine has no code push support (stock Flutter engine '
               'or missing flutter/codepush method channel).',
           expectedFingerprint: expectedEngineFingerprint,
           actualFingerprint: null,
@@ -383,7 +406,8 @@ abstract final class CodePush {
       if (expectedEngineFingerprint != null &&
           actualEngineFingerprint != 'unknown' &&
           expectedEngineFingerprint != actualEngineFingerprint) {
-        status.value = 'Incompatible baseline: engine ABI mismatch '
+        status.value =
+            'Incompatible baseline: engine ABI mismatch '
             '($actualEngineFingerprint vs $expectedEngineFingerprint)';
         await _reportIncompatibleBaseline(
           serverUrl: serverUrl,
@@ -424,7 +448,8 @@ abstract final class CodePush {
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            reason: 'Baseline hash mismatch (soft gate — proceeding '
+            reason:
+                'Baseline hash mismatch (soft gate — proceeding '
                 'with download; engine ABI check is the hard gate)',
             expectedFingerprint: expectedBaselineHash,
             actualFingerprint: actualBaselineHash,
@@ -505,7 +530,8 @@ abstract final class CodePush {
                 'HEADER_MISMATCH patchId=$patchId payload=${payload.length}',
               );
             }
-            status.value = 'Patch format is unexpected — rolling back. '
+            status.value =
+                'Patch format is unexpected — rolling back. '
                 'Upgrade flutter_compile to the latest version and '
                 'rebuild the patch.';
             await _iosImmediateRollback(
@@ -695,8 +721,9 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req =
-            await client.postUrl(uri).timeout(const Duration(seconds: 5));
+        final req = await client
+            .postUrl(uri)
+            .timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json; charset=utf-8');
         // Send encoded bytes, not a string: HttpClientRequest.write()
         // defaults to Latin-1, which throws on any non-Latin-1 character
@@ -760,8 +787,9 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req =
-            await client.postUrl(uri).timeout(const Duration(seconds: 5));
+        final req = await client
+            .postUrl(uri)
+            .timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json; charset=utf-8');
         // Encoded bytes, not a string: write() defaults to Latin-1 and
         // throws on any non-Latin-1 character in the native-written
@@ -790,6 +818,21 @@ abstract final class CodePush {
   // change needed. The marker holds `{patch_id, patch_hash}` and is
   // cleared automatically once the server moves on to a different patch.
 
+  /// Whether a stored `{patch_id, patch_hash}` identity matches the
+  /// server's offer (by id OR hash). Shared by the quarantine and
+  /// already-installed checks.
+  static bool _identityMatches(
+    Map<String, dynamic> stored,
+    String? patchId,
+    String? patchHash,
+  ) {
+    final sId = stored['patch_id']?.toString();
+    final sHash = stored['patch_hash']?.toString();
+    final idMatch = sId != null && sId == patchId;
+    final hashMatch = sHash != null && patchHash != null && sHash == patchHash;
+    return idMatch || hashMatch;
+  }
+
   /// Whether [patchId]/[patchHash] matches the locally quarantined
   /// rolled-back patch. Clears a stale marker when the server has moved
   /// on to a different patch, so the quarantine is never permanent.
@@ -802,12 +845,7 @@ abstract final class CodePush {
     if (!rbFile.existsSync()) return false;
     try {
       final rb = jsonDecode(rbFile.readAsStringSync()) as Map<String, dynamic>;
-      final rbId = rb['patch_id']?.toString();
-      final rbHash = rb['patch_hash']?.toString();
-      final idMatch = rbId != null && rbId == patchId;
-      final hashMatch =
-          rbHash != null && patchHash != null && rbHash == patchHash;
-      if (idMatch || hashMatch) return true;
+      if (_identityMatches(rb, patchId, patchHash)) return true;
       // Different patch — the previously-bad one is superseded; drop it.
       rbFile.deleteSync();
       return false;
@@ -817,6 +855,53 @@ abstract final class CodePush {
         rbFile.deleteSync();
       } catch (_) {}
       return false;
+    }
+  }
+
+  /// Whether the server-offered [patchId]/[patchHash] is the patch this
+  /// device already installed — read from `installed_patch_identity.json`
+  /// (written on Android install, surviving the restart). Does NOT clear
+  /// the file on mismatch: a different offer is a genuinely new patch to
+  /// install, which will overwrite the identity anyway.
+  static bool _isPatchAlreadyInstalled({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) {
+    final f = File('$patchDir/installed_patch_identity.json');
+    if (!f.existsSync()) return false;
+    try {
+      final stored = jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
+      return _identityMatches(stored, patchId, patchHash);
+    } catch (_) {
+      // Corrupt — don't block a fresh install.
+      return false;
+    }
+  }
+
+  /// A stable, numeric per-install identifier for the `device_hash`
+  /// query param. Persisted to the patch dir so it survives restarts;
+  /// numeric so the server can both key its 15-minute per-device rate
+  /// limit and bucket staged rollout (`device_hash % 100`). Best-effort:
+  /// returns null when it can't be read/created, which simply leaves the
+  /// param off — the server then skips the limiter, exactly as before.
+  static Future<String?> _deviceHash() async {
+    try {
+      final patchDir = await _getPatchDir();
+      if (patchDir == null) return null;
+      final f = File('$patchDir/device_id');
+      if (f.existsSync()) {
+        final v = f.readAsStringSync().trim();
+        if (v.isNotEmpty) return v;
+      }
+      final rng = Random.secure();
+      // A positive 63-bit int (two draws), as a decimal string.
+      final id = (rng.nextInt(0x80000000) << 32) | rng.nextInt(0x100000000);
+      Directory(patchDir).createSync(recursive: true);
+      f.writeAsStringSync('$id');
+      return '$id';
+    } catch (_) {
+      return null;
     }
   }
 
@@ -947,24 +1032,22 @@ abstract final class CodePush {
     required String patchDir,
     required String? patchId,
     required String? patchHash,
-  }) =>
-      _isPatchQuarantined(
-        patchDir: patchDir,
-        patchId: patchId,
-        patchHash: patchHash,
-      );
+  }) => _isPatchQuarantined(
+    patchDir: patchDir,
+    patchId: patchId,
+    patchHash: patchHash,
+  );
 
   @visibleForTesting
   static void debugRecordInstalledIdentity({
     required String patchDir,
     required String? patchId,
     required String? patchHash,
-  }) =>
-      _recordInstalledIdentity(
-        patchDir: patchDir,
-        patchId: patchId,
-        patchHash: patchHash,
-      );
+  }) => _recordInstalledIdentity(
+    patchDir: patchDir,
+    patchId: patchId,
+    patchHash: patchHash,
+  );
 
   @visibleForTesting
   static void debugPromoteRolledBackIdentity(String patchDir) =>
@@ -973,6 +1056,20 @@ abstract final class CodePush {
   @visibleForTesting
   static void debugQuarantineFromBreadcrumb(String patchDir) =>
       _quarantineFromBreadcrumb(patchDir);
+
+  @visibleForTesting
+  static bool debugIsPatchAlreadyInstalled({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) => _isPatchAlreadyInstalled(
+    patchDir: patchDir,
+    patchId: patchId,
+    patchHash: patchHash,
+  );
+
+  @visibleForTesting
+  static Future<String?> debugDeviceHash() => _deviceHash();
 
   /// Cached distribution-proof baseline UUID (see [_readBaselineId]).
   static String? _cachedBaselineId;
@@ -1060,11 +1157,12 @@ abstract final class CodePush {
         DateTime.now().difference(failedAt) < _baselineHashRetryAfter) {
       return Future.value(null);
     }
-    return _baselineHashInFlight ??=
-        _computeBaselineHashUncached().then((hash) {
-      if (hash == null) _baselineHashFailedAt = DateTime.now();
-      return hash;
-    }).whenComplete(() => _baselineHashInFlight = null);
+    return _baselineHashInFlight ??= _computeBaselineHashUncached()
+        .then((hash) {
+          if (hash == null) _baselineHashFailedAt = DateTime.now();
+          return hash;
+        })
+        .whenComplete(() => _baselineHashInFlight = null);
   }
 
   static Future<String?> _computeBaselineHashUncached() async {
@@ -1591,7 +1689,8 @@ class CodePushOverlay extends StatefulWidget {
     BuildContext context,
     VoidCallback onRestart,
     VoidCallback onDismiss,
-  )? bannerBuilder;
+  )?
+  bannerBuilder;
 
   /// Whether to show the debug status bar at the top. Defaults to false.
   final bool showDebugBar;
@@ -1791,7 +1890,7 @@ class CodePushPatchBuilder extends StatelessWidget {
 
   /// Builder called with the patch data string (or null if no patch).
   final Widget Function(BuildContext context, String? patchData, Widget? child)
-      builder;
+  builder;
 
   /// Optional child widget passed to the builder (typically the default/baseline UI).
   final Widget? child;
