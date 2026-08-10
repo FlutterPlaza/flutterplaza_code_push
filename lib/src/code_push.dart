@@ -348,7 +348,13 @@ abstract final class CodePush {
             patchId: patchId,
             patchHash: serverPatchHash,
           )) {
-        status.value = 'Skipping rolled-back patch $patchId';
+        // Older servers omit patch_id from the offer, so the match may
+        // have come from the hash — never render a null id.
+        final skippedLabel = patchId ??
+            ((serverPatchHash?.length ?? 0) >= 8
+                ? serverPatchHash!.substring(0, 8)
+                : 'unknown');
+        status.value = 'Skipping rolled-back patch $skippedLabel';
         return false;
       }
 
