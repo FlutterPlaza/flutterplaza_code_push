@@ -161,10 +161,7 @@ abstract final class CodePush {
         // A native crash-loop rollback recorded before Dart started is
         // still history worth reporting (and its marker worth
         // clearing), even though OTA is off from here on.
-        await _reportPendingNativeRollback(
-          serverUrl: serverUrl,
-          appId: appId,
-        );
+        await _reportPendingNativeRollback(serverUrl: serverUrl, appId: appId);
         if (epoch != _initEpoch) return;
         try {
           // rollback() removes the patch wherever the platform keeps it
@@ -275,7 +272,8 @@ abstract final class CodePush {
       // (further down) still protects us.
       final deviceBaselineHash = await _computeBaselineHash();
       final deviceBaselineId = await _readBaselineId();
-      final url = '$serverUrl/api/v1/updates'
+      final url =
+          '$serverUrl/api/v1/updates'
           '?app_id=$appId'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
@@ -318,53 +316,29 @@ abstract final class CodePush {
       }
 
       final patchId = data['patch_id']?.toString();
+      final serverPatchHash = data['patch_hash']?.toString();
       final patchUrl = data['patch_url'] as String?;
       if (patchUrl == null || patchUrl.isEmpty) {
         status.value = 'No patch URL';
         return false;
       }
 
-      // Check if this patch was previously rolled back.  The rollback
-      // marker persists across cold starts so the same bad patch isn't
-      // re-downloaded in a crash loop.
-      if (Platform.isIOS) {
-        final patchDir = await _getPatchDir();
-        if (patchDir != null) {
-          final rbFile = File('$patchDir/rolled_back_patch');
-          if (rbFile.existsSync()) {
-            try {
-              final rb =
-                  jsonDecode(rbFile.readAsStringSync()) as Map<String, dynamic>;
-              final rbId = rb['patch_id']?.toString();
-              final rbHash = rb['patch_hash']?.toString();
-              final serverPatchId = patchId;
-              final serverPatchHash = data['patch_hash']?.toString();
-              final idMatch = rbId != null && rbId == serverPatchId;
-              final hashMatch = rbHash != null &&
-                  serverPatchHash != null &&
-                  rbHash == serverPatchHash;
-              print(
-                '[CP] rollback check: rbId=$rbId serverId=$serverPatchId '
-                'idMatch=$idMatch rbHash=${rbHash?.substring(0, 8)}... '
-                'serverHash=${serverPatchHash?.substring(0, 8)}... '
-                'hashMatch=$hashMatch',
-              );
-              if (idMatch || hashMatch) {
-                status.value = 'Skipping rolled-back patch $patchId';
-                print('[CP] SKIPPING rolled-back patch');
-                return false;
-              }
-              // Different patch — clear the old rollback marker.
-              rbFile.deleteSync();
-            } catch (e) {
-              // Corrupt marker — delete and continue.
-              print('[CP] rollback marker read error: $e');
-              try {
-                rbFile.deleteSync();
-              } catch (_) {}
-            }
-          }
-        }
+      // Skip a patch this device already rolled back, so a bad patch at
+      // 100% rollout can't crash-loop the device forever (rollback →
+      // refetch → re-crash). The marker persists across cold starts and
+      // works offline — no server round-trip needed. Cross-platform: on
+      // iOS the marker is written by the immediate/three-strike rollback;
+      // on Android it's promoted from the engine's rollback breadcrumb
+      // (see _reportPendingNativeRollback).
+      final quarantineDir = await _getPatchDir();
+      if (quarantineDir != null &&
+          _isPatchQuarantined(
+            patchDir: quarantineDir,
+            patchId: patchId,
+            patchHash: serverPatchHash,
+          )) {
+        status.value = 'Skipping rolled-back patch $patchId';
+        return false;
       }
 
       // ── Baseline compatibility guard ────────────────────────────
@@ -386,7 +360,8 @@ abstract final class CodePush {
           serverUrl: serverUrl,
           appId: appId,
           patchId: patchId,
-          reason: 'Engine has no code push support (stock Flutter engine '
+          reason:
+              'Engine has no code push support (stock Flutter engine '
               'or missing flutter/codepush method channel).',
           expectedFingerprint: expectedEngineFingerprint,
           actualFingerprint: null,
@@ -401,7 +376,8 @@ abstract final class CodePush {
       if (expectedEngineFingerprint != null &&
           actualEngineFingerprint != 'unknown' &&
           expectedEngineFingerprint != actualEngineFingerprint) {
-        status.value = 'Incompatible baseline: engine ABI mismatch '
+        status.value =
+            'Incompatible baseline: engine ABI mismatch '
             '($actualEngineFingerprint vs $expectedEngineFingerprint)';
         await _reportIncompatibleBaseline(
           serverUrl: serverUrl,
@@ -442,7 +418,8 @@ abstract final class CodePush {
             serverUrl: serverUrl,
             appId: appId,
             patchId: patchId,
-            reason: 'Baseline hash mismatch (soft gate — proceeding '
+            reason:
+                'Baseline hash mismatch (soft gate — proceeding '
                 'with download; engine ABI check is the hard gate)',
             expectedFingerprint: expectedBaselineHash,
             actualFingerprint: actualBaselineHash,
@@ -523,7 +500,8 @@ abstract final class CodePush {
                 'HEADER_MISMATCH patchId=$patchId payload=${payload.length}',
               );
             }
-            status.value = 'Patch format is unexpected — rolling back. '
+            status.value =
+                'Patch format is unexpected — rolling back. '
                 'Upgrade flutter_compile to the latest version and '
                 'rebuild the patch.';
             await _iosImmediateRollback(
@@ -615,6 +593,20 @@ abstract final class CodePush {
       } else {
         // Android/desktop: install via engine, restart required.
         await installPatch(patchBytes);
+        // Record this patch's server identity in a file the engine's
+        // rollback does NOT delete. If the patch crash-loops, the engine
+        // rolls it back pre-main and deletes patch_info.json before any
+        // Dart runs — so without this, the next launch couldn't learn
+        // which patch to quarantine. Promoted to the rollback marker by
+        // _reportPendingNativeRollback when the breadcrumb appears.
+        final patchDir = await _getPatchDir();
+        if (patchDir != null) {
+          _recordInstalledIdentity(
+            patchDir: patchDir,
+            patchId: patchId,
+            patchHash: serverPatchHash,
+          );
+        }
         status.value = 'Restart to apply';
         onUpdateReady?.call();
         return true;
@@ -699,8 +691,9 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req =
-            await client.postUrl(uri).timeout(const Duration(seconds: 5));
+        final req = await client
+            .postUrl(uri)
+            .timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json; charset=utf-8');
         // Send encoded bytes, not a string: HttpClientRequest.write()
         // defaults to Latin-1, which throws on any non-Latin-1 character
@@ -745,6 +738,22 @@ abstract final class CodePush {
         return;
       }
 
+      // Quarantine the rolled-back patch BEFORE the (best-effort, maybe
+      // offline) telemetry POST, so the crash-loop breaks even with no
+      // network. Do it once per breadcrumb: a rollback_info.json that
+      // lingers offline must not later re-quarantine a good patch that
+      // was installed in the meantime.
+      if (info['quarantined'] != true) {
+        _promoteRolledBackIdentity(patchDir);
+        try {
+          info['quarantined'] = true;
+          marker.writeAsStringSync(jsonEncode(info));
+        } catch (_) {
+          // If we can't flag it, the identity file was already consumed
+          // by the promotion above, so a re-run finds nothing to promote.
+        }
+      }
+
       final payload = <String, dynamic>{
         'app_id': appId,
         'kind': 'auto_rollback',
@@ -759,8 +768,9 @@ abstract final class CodePush {
       final client = HttpClient();
       try {
         final uri = Uri.parse('$serverUrl/api/v1/telemetry/client-error');
-        final req =
-            await client.postUrl(uri).timeout(const Duration(seconds: 5));
+        final req = await client
+            .postUrl(uri)
+            .timeout(const Duration(seconds: 5));
         req.headers.set('Content-Type', 'application/json; charset=utf-8');
         // Encoded bytes, not a string: write() defaults to Latin-1 and
         // throws on any non-Latin-1 character in the native-written
@@ -777,6 +787,89 @@ abstract final class CodePush {
       }
     } catch (_) {
       // Telemetry is best-effort. Never crash over it.
+    }
+  }
+
+  // ── Rolled-back-patch quarantine ──────────────────────────────────
+  //
+  // Breaks the "bad patch at 100% rollout crash-loops forever" failure:
+  // once a patch has been rolled back on this device, its server
+  // identity is recorded in `rolled_back_patch` and [checkAndInstall]
+  // refuses to re-download a patch that matches — offline, no server
+  // change needed. The marker holds `{patch_id, patch_hash}` and is
+  // cleared automatically once the server moves on to a different patch.
+
+  /// Whether [patchId]/[patchHash] matches the locally quarantined
+  /// rolled-back patch. Clears a stale marker when the server has moved
+  /// on to a different patch, so the quarantine is never permanent.
+  static bool _isPatchQuarantined({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) {
+    final rbFile = File('$patchDir/rolled_back_patch');
+    if (!rbFile.existsSync()) return false;
+    try {
+      final rb = jsonDecode(rbFile.readAsStringSync()) as Map<String, dynamic>;
+      final rbId = rb['patch_id']?.toString();
+      final rbHash = rb['patch_hash']?.toString();
+      final idMatch = rbId != null && rbId == patchId;
+      final hashMatch =
+          rbHash != null && patchHash != null && rbHash == patchHash;
+      if (idMatch || hashMatch) return true;
+      // Different patch — the previously-bad one is superseded; drop it.
+      rbFile.deleteSync();
+      return false;
+    } catch (_) {
+      // Corrupt marker — clear it and don't block this patch.
+      try {
+        rbFile.deleteSync();
+      } catch (_) {}
+      return false;
+    }
+  }
+
+  /// Records the just-installed patch's server identity in a file the
+  /// engine's rollback does not delete (Android), so a later launch can
+  /// quarantine it if the engine rolled it back. Best-effort.
+  static void _recordInstalledIdentity({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) {
+    try {
+      File('$patchDir/installed_patch_identity.json').writeAsStringSync(
+        jsonEncode(<String, Object?>{
+          'patch_id': patchId,
+          'patch_hash': patchHash,
+          'installed_at': DateTime.now().toIso8601String(),
+        }),
+      );
+    } catch (_) {
+      // Non-fatal: without it the crash-loop still bottoms out at the
+      // engine's three-strike rollback, just without the quarantine.
+    }
+  }
+
+  /// Promotes the surviving install-time identity into the
+  /// `rolled_back_patch` marker, then consumes the identity file. Called
+  /// when the engine's rollback breadcrumb is detected on Android.
+  static void _promoteRolledBackIdentity(String patchDir) {
+    try {
+      final idFile = File('$patchDir/installed_patch_identity.json');
+      if (!idFile.existsSync()) return;
+      final id = jsonDecode(idFile.readAsStringSync()) as Map<String, dynamic>;
+      File('$patchDir/rolled_back_patch').writeAsStringSync(
+        jsonEncode(<String, Object?>{
+          'patch_id': id['patch_id'],
+          'patch_hash': id['patch_hash'],
+          'rolled_back_at': DateTime.now().toIso8601String(),
+        }),
+      );
+      idFile.deleteSync();
+    } catch (_) {
+      // Best-effort quarantine; the three-strike rollback still protects
+      // the device even if this fails.
     }
   }
 
@@ -821,6 +914,35 @@ abstract final class CodePush {
     _reportedBaselineMismatches.clear();
     _cachedIsPlayInstall = null;
   }
+
+  /// Test-only wrappers for the rolled-back-patch quarantine helpers.
+  @visibleForTesting
+  static bool debugIsPatchQuarantined({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) =>
+      _isPatchQuarantined(
+        patchDir: patchDir,
+        patchId: patchId,
+        patchHash: patchHash,
+      );
+
+  @visibleForTesting
+  static void debugRecordInstalledIdentity({
+    required String patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) =>
+      _recordInstalledIdentity(
+        patchDir: patchDir,
+        patchId: patchId,
+        patchHash: patchHash,
+      );
+
+  @visibleForTesting
+  static void debugPromoteRolledBackIdentity(String patchDir) =>
+      _promoteRolledBackIdentity(patchDir);
 
   /// Cached distribution-proof baseline UUID (see [_readBaselineId]).
   static String? _cachedBaselineId;
@@ -908,11 +1030,12 @@ abstract final class CodePush {
         DateTime.now().difference(failedAt) < _baselineHashRetryAfter) {
       return Future.value(null);
     }
-    return _baselineHashInFlight ??=
-        _computeBaselineHashUncached().then((hash) {
-      if (hash == null) _baselineHashFailedAt = DateTime.now();
-      return hash;
-    }).whenComplete(() => _baselineHashInFlight = null);
+    return _baselineHashInFlight ??= _computeBaselineHashUncached()
+        .then((hash) {
+          if (hash == null) _baselineHashFailedAt = DateTime.now();
+          return hash;
+        })
+        .whenComplete(() => _baselineHashInFlight = null);
   }
 
   static Future<String?> _computeBaselineHashUncached() async {
@@ -1439,7 +1562,8 @@ class CodePushOverlay extends StatefulWidget {
     BuildContext context,
     VoidCallback onRestart,
     VoidCallback onDismiss,
-  )? bannerBuilder;
+  )?
+  bannerBuilder;
 
   /// Whether to show the debug status bar at the top. Defaults to false.
   final bool showDebugBar;
@@ -1639,7 +1763,7 @@ class CodePushPatchBuilder extends StatelessWidget {
 
   /// Builder called with the patch data string (or null if no patch).
   final Widget Function(BuildContext context, String? patchData, Widget? child)
-      builder;
+  builder;
 
   /// Optional child widget passed to the builder (typically the default/baseline UI).
   final Widget? child;
