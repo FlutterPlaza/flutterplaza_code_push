@@ -848,6 +848,14 @@ abstract final class CodePush {
   /// re-quarantine a good patch that was installed in the meantime, so
   /// the breadcrumb is flagged `quarantined` after the first promotion.
   /// Synchronous, best-effort, idempotent — safe to call more than once.
+  ///
+  /// Cross-component assumption: the native engine (`Updater::Rollback`)
+  /// **replaces** `rollback_info.json` wholesale on each rollback, so a
+  /// new bad patch always arrives as a fresh, unflagged breadcrumb. If a
+  /// future engine ever did a read-modify-write that preserved unknown
+  /// keys, a stale `quarantined` flag would make this early-return and
+  /// the new bad patch would fall back to the engine's three-strike
+  /// protection instead of being quarantined.
   static void _quarantineFromBreadcrumb(String patchDir) {
     try {
       final marker = File('$patchDir/rollback_info.json');

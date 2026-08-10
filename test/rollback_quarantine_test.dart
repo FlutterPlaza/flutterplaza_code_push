@@ -191,6 +191,21 @@ void main() {
       expect(marker().existsSync(), isFalse);
     });
 
+    test('a corrupt breadcrumb neither promotes nor consumes the identity', () {
+      breadcrumb().writeAsStringSync('{ not valid json');
+      CodePush.debugRecordInstalledIdentity(
+        patchDir: patchDir.path,
+        patchId: 'good',
+        patchHash: 'h',
+      );
+
+      CodePush.debugQuarantineFromBreadcrumb(patchDir.path);
+
+      // No quarantine written, and the identity is left intact.
+      expect(marker().existsSync(), isFalse);
+      expect(identity().existsSync(), isTrue);
+    });
+
     test('end-to-end: install bad → rollback → the bad patch is quarantined',
         () {
       // Install records identity.
