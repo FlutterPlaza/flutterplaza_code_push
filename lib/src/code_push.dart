@@ -855,14 +855,15 @@ abstract final class CodePush {
       final info =
           jsonDecode(marker.readAsStringSync()) as Map<String, dynamic>;
       if (info['quarantined'] == true) return;
+      // Flag the breadcrumb BEFORE promoting, so this is all-or-nothing:
+      // if the flag write throws, we return WITHOUT consuming the identity
+      // (a later boot retries cleanly). The alternative order could leave
+      // the breadcrumb unflagged AND the identity consumed — and if a good
+      // patch were installed before the next boot, the still-live
+      // breadcrumb would then quarantine that good patch.
+      info['quarantined'] = true;
+      marker.writeAsStringSync(jsonEncode(info));
       _promoteRolledBackIdentity(patchDir);
-      try {
-        info['quarantined'] = true;
-        marker.writeAsStringSync(jsonEncode(info));
-      } catch (_) {
-        // If we can't flag it, the identity file was already consumed by
-        // the promotion above, so a re-run finds nothing to re-promote.
-      }
     } catch (_) {
       // Best-effort; the three-strike rollback still protects the device.
     }
