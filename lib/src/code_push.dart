@@ -177,8 +177,45 @@ abstract final class CodePush {
   static String? _loadedPatchHash;
 
   /// Once-per-process latch for the incompatible-reload telemetry —
-  /// repeated init() calls re-enter the reload and must not re-POST.
+  /// repeated init() calls re-enter the reload and must not re-POST a
+  /// DELIVERED report. Cleared again on transport failure so devices
+  /// that boot offline retry on a later re-init.
   static bool _reportedIncompatibleReload = false;
+
+  /// Fires the incompatible-reload stranding report. Latched per
+  /// process on DELIVERY: set optimistically (no duplicate in-flight
+  /// posts), cleared again if the POST never completed an HTTP round
+  /// trip (device offline at boot) so a later re-init retries. One
+  /// delivered report per process is exactly sufficient — an engine
+  /// ABI cannot change within a running process.
+  @visibleForTesting
+  static Future<void> debugReportIncompatibleReload({
+    required String serverUrl,
+    required String appId,
+    required String? patchId,
+    required String? storedAbi,
+    required String? liveAbi,
+  }) async {
+    if (_reportedIncompatibleReload) return;
+    _reportedIncompatibleReload = true;
+    final delivered = await _reportIncompatibleBaseline(
+      serverUrl: serverUrl,
+      appId: appId,
+      patchId: patchId,
+      kind: 'incompatible_reload',
+      reason: 'Installed patch was built for a different engine '
+          'ABI; reload skipped, baseline running',
+      expectedFingerprint: storedAbi,
+      actualFingerprint: liveAbi,
+    );
+    if (!delivered) _reportedIncompatibleReload = false;
+  }
+
+  /// Test-only: clears the incompatible-reload latch.
+  @visibleForTesting
+  static void debugResetIncompatibleReloadLatch() {
+    _reportedIncompatibleReload = false;
+  }
 
   /// Initializes automatic code push update checking with crash protection.
   ///
@@ -1873,22 +1910,15 @@ abstract final class CodePush {
               'engine — waiting for a compatible update';
           // Fleet observability: without this, engine-changed devices
           // sit on baseline invisibly. Fire-and-forget so the boot path
-          // never waits on telemetry. Deduped per process: init() can
-          // legally run more than once (e.g. re-init on resume), and
-          // each run re-enters this reload — without the latch every
-          // re-init would re-POST the same stranding event.
-          if (_reportedIncompatibleReload) return;
-          _reportedIncompatibleReload = true;
+          // never waits on telemetry; delivery/latch semantics live in
+          // the helper.
           unawaited(
-            _reportIncompatibleBaseline(
+            debugReportIncompatibleReload(
               serverUrl: serverUrl,
               appId: appId,
               patchId: patchId,
-              kind: 'incompatible_reload',
-              reason: 'Installed patch was built for a different engine '
-                  'ABI; reload skipped, baseline running',
-              expectedFingerprint: info?['engine_abi']?.toString(),
-              actualFingerprint: liveAbi,
+              storedAbi: info?['engine_abi']?.toString(),
+              liveAbi: liveAbi,
             ),
           );
           return;
