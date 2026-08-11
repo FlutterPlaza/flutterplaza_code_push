@@ -71,6 +71,7 @@ void main() {
         .setMockMethodCallHandler(engineChannel, null);
     CodePush.debugResetBaselineHashCache();
     CodePush.debugMaxPatchDownloadBytes = 256 * 1024 * 1024;
+    CodePush.debugHttpRequestTimeout = const Duration(seconds: 30);
     await server.close(force: true);
     patchDir.deleteSync(recursive: true);
   });
@@ -128,6 +129,35 @@ void main() {
   });
 
   group('single-flight', () {
+    test('a stalled server times out and RELEASES the guard', () async {
+      // Regression guard for the wedge: connectionTimeout doesn't bound
+      // the response, so a server that accepts and never answers used
+      // to hang the check forever — latching _checkInFlight and
+      // silently disabling all future update checks.
+      CodePush.debugHttpRequestTimeout = const Duration(milliseconds: 300);
+      server.listen((HttpRequest req) {
+        updateChecks++;
+        // Accept and stall: no response is ever written.
+      });
+
+      final first = await CodePush.checkAndInstall(
+        serverUrl: 'http://127.0.0.1:${server.port}',
+        appId: 'app',
+        releaseVersion: '1.0.0+1',
+      ).timeout(const Duration(seconds: 5));
+      expect(first, isFalse);
+
+      final second = await CodePush.checkAndInstall(
+        serverUrl: 'http://127.0.0.1:${server.port}',
+        appId: 'app',
+        releaseVersion: '1.0.0+1',
+      ).timeout(const Duration(seconds: 5));
+      expect(second, isFalse);
+      expect(updateChecks, 2,
+          reason: 'the guard must release after a timeout — a second '
+              'check reaches the server instead of returning early');
+    });
+
     test('overlapping checks collapse to one server round-trip', () async {
       offeredHash = patchHash;
       offerDelay = const Duration(milliseconds: 300);

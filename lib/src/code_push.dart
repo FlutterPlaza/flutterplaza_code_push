@@ -1,4 +1,4 @@
-import 'dart:async' show Timer, unawaited;
+import 'dart:async' show Timer, TimeoutException, unawaited;
 import 'dart:convert' show base64Encode, jsonDecode, jsonEncode, utf8;
 import 'dart:io' show Directory, File, FileMode, HttpClient, Platform, exit;
 import 'dart:math' show Random;
@@ -714,6 +714,14 @@ abstract final class CodePush {
   /// patches are tens of megabytes, so the default is generous.
   @visibleForTesting
   static int debugMaxPatchDownloadBytes = 256 * 1024 * 1024;
+
+  /// Per-await bound on update-check and download HTTP operations
+  /// (connect, response start, body read / inter-chunk gap). Visible
+  /// for tests. Prevents a stalled server from wedging the
+  /// single-flight guard — one hang must never latch updates off for
+  /// the process lifetime.
+  @visibleForTesting
+  static Duration debugHttpRequestTimeout = const Duration(seconds: 30);
 
   /// Kills the app process for a cold restart.
   ///
@@ -2008,22 +2016,28 @@ class _HttpResult {
 }
 
 Future<_HttpResult> _httpGet(String url) async {
+  // connectionTimeout only bounds establishing the connection; a server
+  // that accepts and then stalls would otherwise hang this await forever
+  // — and with the single-flight guard in checkAndInstall, one such
+  // hang would silently disable all future update checks for the
+  // process lifetime. Every await is bounded.
+  final timeout = CodePush.debugHttpRequestTimeout;
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
   try {
-    final request = await client.getUrl(Uri.parse(url));
-    final response = await request.close();
-    final bytes = await response.fold<List<int>>(
-      <int>[],
-      (prev, chunk) => prev..addAll(chunk),
-    );
+    final request = await client.getUrl(Uri.parse(url)).timeout(timeout);
+    final response = await request.close().timeout(timeout);
+    final bytes = await response
+        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk))
+        .timeout(timeout);
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
-    client.close();
+    client.close(force: true);
   }
 }
 
 Future<_HttpResult> _httpGetBytes(String url) async {
   final maxBytes = CodePush.debugMaxPatchDownloadBytes;
+  final timeout = CodePush.debugHttpRequestTimeout;
   final client = HttpClient()
     ..connectionTimeout = const Duration(seconds: 30)
     // The bytes we hash must be exactly the bytes on the wire — don't
@@ -2031,17 +2045,25 @@ Future<_HttpResult> _httpGetBytes(String url) async {
     // toggled Content-Encoding.
     ..autoUncompress = false;
   try {
-    final request = await client.getUrl(Uri.parse(url));
-    final response = await request.close();
+    final request = await client.getUrl(Uri.parse(url)).timeout(timeout);
+    final response = await request.close().timeout(timeout);
     // Cap the download so a misbehaving server can't drive the app out
     // of memory. Real patches are tens of megabytes.
     if (response.contentLength > maxBytes) {
       return const _HttpResult(-1, '', <int>[]);
     }
+    // Stalls are bounded two ways: the stream timeout fires on any
+    // inter-chunk gap, and the deadline bounds a trickling server that
+    // sends a byte just often enough to reset the gap timer.
+    final deadline = DateTime.now().add(const Duration(minutes: 15));
     final bytes = <int>[];
-    await for (final chunk in response) {
+    await for (final chunk in response.timeout(
+      timeout,
+      onTimeout: (sink) =>
+          sink.addError(TimeoutException('patch download stalled', timeout)),
+    )) {
       bytes.addAll(chunk);
-      if (bytes.length > maxBytes) {
+      if (bytes.length > maxBytes || DateTime.now().isAfter(deadline)) {
         return const _HttpResult(-1, '', <int>[]);
       }
     }
@@ -2052,20 +2074,20 @@ Future<_HttpResult> _httpGetBytes(String url) async {
 }
 
 Future<_HttpResult> _httpPostJson(String url, Map<String, dynamic> body) async {
+  final timeout = CodePush.debugHttpRequestTimeout;
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
   try {
-    final request = await client.postUrl(Uri.parse(url));
+    final request = await client.postUrl(Uri.parse(url)).timeout(timeout);
     request.headers.set('Content-Type', 'application/json');
     final encoded = utf8.encode(jsonEncode(body));
     request.contentLength = encoded.length;
     request.add(encoded);
-    final response = await request.close();
-    final bytes = await response.fold<List<int>>(
-      <int>[],
-      (prev, chunk) => prev..addAll(chunk),
-    );
+    final response = await request.close().timeout(timeout);
+    final bytes = await response
+        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk))
+        .timeout(timeout);
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
-    client.close();
+    client.close(force: true);
   }
 }
