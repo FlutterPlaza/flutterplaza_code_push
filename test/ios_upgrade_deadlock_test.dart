@@ -169,4 +169,60 @@ void main() {
       isFalse,
     );
   });
+
+  group('debugDecideLoadedSessionOffer (the four-way branch)', () {
+    test('a disk match is skipped without looking at the bytes', () {
+      expect(
+        CodePush.debugDecideLoadedSessionOffer(
+          offerMatchesDisk: true,
+          formatValid: false,
+          offerMatchesRunningModule: true,
+        ),
+        IosLoadedSessionDecision.skipAlreadyInstalled,
+      );
+    });
+
+    test('malformed containers are rejected before any write', () {
+      expect(
+        CodePush.debugDecideLoadedSessionOffer(
+          offerMatchesDisk: false,
+          formatValid: false,
+          offerMatchesRunningModule: false,
+        ),
+        IosLoadedSessionDecision.rejectMalformed,
+      );
+      // Even when the offer claims to be the running module — bytes
+      // that fail the format check must never reach disk.
+      expect(
+        CodePush.debugDecideLoadedSessionOffer(
+          offerMatchesDisk: false,
+          formatValid: false,
+          offerMatchesRunningModule: true,
+        ),
+        IosLoadedSessionDecision.rejectMalformed,
+      );
+    });
+
+    test('server revert to the running module persists silently', () {
+      expect(
+        CodePush.debugDecideLoadedSessionOffer(
+          offerMatchesDisk: false,
+          formatValid: true,
+          offerMatchesRunningModule: true,
+        ),
+        IosLoadedSessionDecision.persistSilently,
+      );
+    });
+
+    test('a genuinely new patch persists with restart-to-apply', () {
+      expect(
+        CodePush.debugDecideLoadedSessionOffer(
+          offerMatchesDisk: false,
+          formatValid: true,
+          offerMatchesRunningModule: false,
+        ),
+        IosLoadedSessionDecision.persistAndRestart,
+      );
+    });
+  });
 }
