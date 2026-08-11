@@ -91,6 +91,33 @@ abstract final class CodePush {
   /// unwrapping the on-disk header. Opaque format marker.
   static const List<int> _iosPayloadHeader = <int>[0x33, 0x43, 0x42, 0x44];
 
+  /// Unwraps an on-disk iOS patch container and returns its payload, or
+  /// `null` when the container is malformed or the payload's format
+  /// marker doesn't match.
+  ///
+  /// Fully bounds-checked and never throws: since the reload path runs
+  /// this on every launch against whatever is on disk, a truncated or
+  /// garbage file must produce a clean rejection rather than an
+  /// exception at startup.
+  @visibleForTesting
+  static Uint8List? debugExtractIosPayload(Uint8List container) {
+    // The payload offset lives in a fixed-width header field; a file
+    // too small to contain that field cannot be a patch.
+    const offsetField = 12;
+    if (container.length < offsetField + 4) return null;
+    final payloadOffset =
+        container.buffer.asByteData().getUint32(offsetField, Endian.little);
+    if (payloadOffset < offsetField + 4 || payloadOffset >= container.length) {
+      return null;
+    }
+    final payload = container.sublist(payloadOffset);
+    if (payload.length < _iosPayloadHeader.length) return null;
+    for (var i = 0; i < _iosPayloadHeader.length; i++) {
+      if (payload[i] != _iosPayloadHeader[i]) return null;
+    }
+    return payload;
+  }
+
   /// Debug status notifier — shows what code push is doing.
   static final ValueNotifier<String> status = ValueNotifier('init');
 
@@ -210,6 +237,20 @@ abstract final class CodePush {
     // unconditionally on init which left no room for the boot counter
     // to trip — see CHANGELOG 0.1.7 for the race condition this fixes.
     _runCrashProtection().then((_) async {
+      // Re-apply a patch that was installed on a previous launch. On
+      // iOS the patch is loaded into the running VM rather than mapped
+      // at boot by the engine, so without this the patch would only be
+      // active in the session it was downloaded and every later launch
+      // would silently run the baseline — including offline launches,
+      // where no check can re-download it.
+      //
+      // Ordering is load-bearing: this runs AFTER _runCrashProtection
+      // (so a crash-looping patch is rolled back before we load it
+      // again) and BEFORE _startLaunchTimer (so a load that crashes or
+      // hangs cannot be reported as a successful launch, leaving the
+      // boot counter incremented for the next attempt).
+      await _iosReloadInstalledPatch(serverUrl: serverUrl, appId: appId);
+
       // Start launch success timer only after crash protection completes,
       // so a rollback doesn't get immediately overwritten by a success report.
       _startLaunchTimer();
@@ -548,136 +589,14 @@ abstract final class CodePush {
           } catch (_) {}
         }
 
-        try {
-          // Extract the payload from the patch wrapper.
-          final offsetBytes = patchBytes.buffer.asByteData();
-          final payloadOffset = offsetBytes.getUint32(12, Endian.little);
-          final payload = patchBytes.sublist(payloadOffset);
-          if (patchDir != null) {
-            _iosAppendDebugLog(
-              patchDir,
-              'BEFORE_LOAD patchId=$patchId bytes=${patchBytes.length} '
-              'payload=${payload.length}',
-            );
-          }
-
-          // Format guard: reject a patch payload that doesn't match
-          // the expected iOS header before handing it to the runtime.
-          // A mismatched payload cannot load cleanly, so we delete it
-          // and surface an upgrade hint instead.
-          bool headerMatches() {
-            if (payload.length < _iosPayloadHeader.length) return false;
-            for (var i = 0; i < _iosPayloadHeader.length; i++) {
-              if (payload[i] != _iosPayloadHeader[i]) return false;
-            }
-            return true;
-          }
-
-          if (!headerMatches()) {
-            if (patchDir != null) {
-              _iosAppendDebugLog(
-                patchDir,
-                'HEADER_MISMATCH patchId=$patchId payload=${payload.length}',
-              );
-            }
-            status.value = 'Patch format is unexpected — rolling back. '
-                'Upgrade flutter_compile to the latest version and '
-                'rebuild the patch.';
-            await _iosImmediateRollback(
-              serverUrl: serverUrl,
-              appId: appId,
-              patchId: patchId,
-              errorMessage: 'Patch format mismatch — rejected before load',
-            );
-            return false;
-          }
-
-          status.value = 'Loading module...';
-          if (patchDir != null) {
-            _iosAppendDebugLog(
-              patchDir,
-              'CALL_LOAD patchId=$patchId payload=${payload.length}',
-            );
-          }
-          // Invoke the runtime hook exposed by the code-push-capable
-          // engine. The presence check above
-          // (`_probeEngineFingerprint`) guarantees we only reach this
-          // point on an engine that actually exposes the hook.
-          //
-          // Return-value semantics: the hook throws on real load
-          // failures (bad format, verification failure, etc.). Any
-          // non-throw return — including `null` — is a successful
-          // load. `null` in particular comes back when the payload
-          // loaded cleanly but had no entry-point function to invoke
-          // (for example, a delta whose contents are all already
-          // present in the baseline). That is a valid no-op, not a
-          // failure, and must NOT trigger rollback — rolling back
-          // would cause the next check to re-download, re-load, and
-          // loop tightly.
-          final rawResult = await ui
-              // ignore: undefined_function
-              .codePushLoadModule(Uint8List.fromList(payload));
-
-          // A `false` return is the one non-throw value we refuse: no
-          // engine build uses it to mean success, so if one ever signals
-          // failure this way, latching success here would mark a bad
-          // patch active AND clear its quarantine marker below. Throwing
-          // routes it through the normal rollback path.
-          if (rawResult == false) {
-            throw StateError('module load reported failure');
-          }
-
-          // Module loaded live — no restart needed on iOS.
-          // Auto-parse JSON strings into Map/List for structured data.
-          Object? result = rawResult;
-          if (rawResult is String) {
-            try {
-              final parsed = jsonDecode(rawResult);
-              if (parsed is Map || parsed is List) result = parsed;
-            } catch (_) {
-              // Not JSON — keep as raw string.
-            }
-          }
-          _moduleLoaded = true;
-          moduleResult.value = result;
-          status.value = 'Patch active';
-          // Clear any previous rollback marker — this patch works.
-          if (patchDir != null) {
-            try {
-              final rbFile = File('$patchDir/rolled_back_patch');
-              if (rbFile.existsSync()) rbFile.deleteSync();
-            } catch (_) {}
-          }
-          if (patchDir != null) {
-            _iosAppendDebugLog(
-              patchDir,
-              'AFTER_LOAD patchId=$patchId result=$result '
-              'moduleLoaded=$_moduleLoaded',
-            );
-          }
-          print(
-            '[CP] MODULE LOADED OK — result=$result moduleLoaded=$_moduleLoaded',
-          );
-          return true;
-        } catch (e) {
-          if (patchDir != null) {
-            _iosAppendDebugLog(
-              patchDir,
-              'LOAD_THROW patchId=$patchId error=$e',
-            );
-          }
-          print('[CP] MODULE LOAD THREW — $e');
-          status.value = 'Module error: $e — rolling back patch';
-          // Real load failure. Delete immediately instead of waiting
-          // for the three-strike auto-rollback.
-          await _iosImmediateRollback(
-            serverUrl: serverUrl,
-            appId: appId,
-            patchId: patchId,
-            errorMessage: 'Patch load threw $e — deleted immediately',
-          );
-          return false;
-        }
+        return _iosLoadPayload(
+          container: patchBytes,
+          patchDir: patchDir,
+          patchId: patchId,
+          serverUrl: serverUrl,
+          appId: appId,
+          origin: 'install',
+        );
       } else {
         // Android/desktop: install via engine, restart required.
         await installPatch(patchBytes);
@@ -1480,6 +1399,201 @@ abstract final class CodePush {
   /// so we handle the boot counter entirely in Dart. On other platforms,
   /// the engine handles it natively — we just start the launch timer so
   /// Dart can signal success back via the platform channel.
+  /// iOS-only: unwraps a patch container and hands its payload to the
+  /// runtime, latching success or rolling back on failure.
+  ///
+  /// Shared by both routes that can load a patch — the post-download
+  /// install and the startup reload — so the two can never drift. This
+  /// is the most failure-sensitive code in the SDK: one copy only.
+  ///
+  /// [origin] is recorded in the on-device debug log so a failure can
+  /// be attributed to the install or the reload route.
+  static Future<bool> _iosLoadPayload({
+    required Uint8List container,
+    required String? patchDir,
+    required String? patchId,
+    required String serverUrl,
+    required String appId,
+    required String origin,
+  }) async {
+    try {
+      final payload = debugExtractIosPayload(container);
+      if (patchDir != null) {
+        _iosAppendDebugLog(
+          patchDir,
+          'BEFORE_LOAD origin=$origin patchId=$patchId '
+          'bytes=${container.length} payload=${payload?.length}',
+        );
+      }
+
+      // Format guard: reject a payload that doesn't match the expected
+      // iOS marker before handing it to the runtime. A mismatched or
+      // truncated payload cannot load cleanly, so delete it and surface
+      // an upgrade hint instead.
+      if (payload == null) {
+        if (patchDir != null) {
+          _iosAppendDebugLog(
+            patchDir,
+            'HEADER_MISMATCH origin=$origin patchId=$patchId '
+            'bytes=${container.length}',
+          );
+        }
+        status.value = 'Patch format is unexpected — rolling back. '
+            'Upgrade flutter_compile to the latest version and '
+            'rebuild the patch.';
+        await _iosImmediateRollback(
+          serverUrl: serverUrl,
+          appId: appId,
+          patchId: patchId,
+          errorMessage: 'Patch format mismatch — rejected before load',
+        );
+        return false;
+      }
+
+      status.value = 'Loading module...';
+      if (patchDir != null) {
+        _iosAppendDebugLog(
+          patchDir,
+          'CALL_LOAD origin=$origin patchId=$patchId '
+          'payload=${payload.length}',
+        );
+      }
+      // Invoke the runtime hook exposed by the code-push-capable
+      // engine. Callers guarantee the hook exists (install probes the
+      // fingerprint before downloading; reload probes before reading).
+      //
+      // Return-value semantics: the hook throws on real load failures
+      // (bad format, verification failure, etc.). Any non-throw return
+      // — including `null` — is a successful load. `null` in particular
+      // comes back when the payload loaded cleanly but had no entry
+      // point to invoke (for example, a delta whose contents are all
+      // already present in the baseline). That is a valid no-op, not a
+      // failure, and must NOT trigger rollback — rolling back would
+      // cause the next check to re-download, re-load, and loop tightly.
+      final rawResult = await ui
+          // ignore: undefined_function
+          .codePushLoadModule(Uint8List.fromList(payload));
+
+      // A `false` return is the one non-throw value we refuse: no
+      // engine build uses it to mean success, so if one ever signals
+      // failure this way, latching success here would mark a bad patch
+      // active AND clear its quarantine marker below. Throwing routes
+      // it through the normal rollback path.
+      if (rawResult == false) {
+        throw StateError('module load reported failure');
+      }
+
+      // Auto-parse JSON strings into Map/List for structured data.
+      Object? result = rawResult;
+      if (rawResult is String) {
+        try {
+          final parsed = jsonDecode(rawResult);
+          if (parsed is Map || parsed is List) result = parsed;
+        } catch (_) {
+          // Not JSON — keep as raw string.
+        }
+      }
+      _moduleLoaded = true;
+      moduleResult.value = result;
+      status.value = 'Patch active';
+      // Clear any previous rollback marker — this patch works.
+      if (patchDir != null) {
+        try {
+          final rbFile = File('$patchDir/rolled_back_patch');
+          if (rbFile.existsSync()) rbFile.deleteSync();
+        } catch (_) {}
+        _iosAppendDebugLog(
+          patchDir,
+          'AFTER_LOAD origin=$origin patchId=$patchId result=$result '
+          'moduleLoaded=$_moduleLoaded',
+        );
+      }
+      print(
+        '[CP] MODULE LOADED OK ($origin) — result=$result '
+        'moduleLoaded=$_moduleLoaded',
+      );
+      return true;
+    } catch (e) {
+      if (patchDir != null) {
+        _iosAppendDebugLog(
+          patchDir,
+          'LOAD_THROW origin=$origin patchId=$patchId error=$e',
+        );
+      }
+      print('[CP] MODULE LOAD THREW ($origin) — $e');
+      status.value = 'Module error: $e — rolling back patch';
+      // Real load failure. Delete immediately instead of waiting for
+      // the three-strike auto-rollback.
+      await _iosImmediateRollback(
+        serverUrl: serverUrl,
+        appId: appId,
+        patchId: patchId,
+        errorMessage: 'Patch load threw $e — deleted immediately',
+      );
+      return false;
+    }
+  }
+
+  /// iOS-only: loads the already-installed patch from disk at startup.
+  ///
+  /// The engine maps patches at boot on Android/desktop; on iOS the
+  /// patch is handed to the runtime from Dart, so it must be re-loaded
+  /// on every launch. No network is involved — this is what makes an
+  /// installed patch survive a restart and work offline.
+  ///
+  /// Never throws: any failure either rolls the patch back (a real load
+  /// failure) or leaves the baseline running.
+  static Future<void> _iosReloadInstalledPatch({
+    required String serverUrl,
+    required String appId,
+  }) async {
+    if (!Platform.isIOS || _moduleLoaded) return;
+    try {
+      final patchDir = await _getPatchDir();
+      if (patchDir == null) return;
+      final patchFile = File('$patchDir/$_patchFilename');
+      if (!patchFile.existsSync()) return;
+
+      // The runtime hook only exists on a code-push-capable engine.
+      // Without it no load is possible, so release the strike that
+      // _runCrashProtection just recorded — three launches on a stock
+      // engine must not quarantine a patch that was never attempted.
+      if (await _probeEngineFingerprint() == null) {
+        _iosResetBootCounter(patchDir);
+        return;
+      }
+
+      final container = await patchFile.readAsBytes();
+      final patchId = _readInstalledPatchId(patchDir);
+
+      await _iosLoadPayload(
+        container: container,
+        patchDir: patchDir,
+        patchId: patchId,
+        serverUrl: serverUrl,
+        appId: appId,
+        origin: 'reload',
+      );
+    } catch (e) {
+      // Reload must never take the app down; the baseline is running.
+      status.value = 'Patch reload error: $e';
+    }
+  }
+
+  /// Reads the installed patch's server id from `patch_info.json`, or
+  /// null when absent/unreadable.
+  static String? _readInstalledPatchId(String patchDir) {
+    try {
+      final f = File('$patchDir/patch_info.json');
+      if (!f.existsSync()) return null;
+      final decoded = jsonDecode(f.readAsStringSync());
+      if (decoded is Map<String, dynamic>) {
+        return decoded['patch_id']?.toString();
+      }
+    } catch (_) {}
+    return null;
+  }
+
   static Future<void> _runCrashProtection() async {
     if (!Platform.isIOS) return; // Engine handles non-iOS.
     try {
