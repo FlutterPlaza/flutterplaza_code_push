@@ -176,6 +176,10 @@ abstract final class CodePush {
   static String? _loadedPatchId;
   static String? _loadedPatchHash;
 
+  /// Once-per-process latch for the incompatible-reload telemetry —
+  /// repeated init() calls re-enter the reload and must not re-POST.
+  static bool _reportedIncompatibleReload = false;
+
   /// Initializes automatic code push update checking with crash protection.
   ///
   /// Call this once in your app's startup. It will:
@@ -849,11 +853,12 @@ abstract final class CodePush {
     required String reason,
     required String? expectedFingerprint,
     required String? actualFingerprint,
+    String kind = 'incompatible_baseline',
   }) async {
     try {
       final payload = <String, dynamic>{
         'app_id': appId,
-        'kind': 'incompatible_baseline',
+        'kind': kind,
         'reason': reason,
         'platform': _platform,
         if (patchId != null) 'patch_id': patchId,
@@ -1866,6 +1871,26 @@ abstract final class CodePush {
           _iosResetBootCounter(patchDir);
           status.value = 'Installed patch was built for a different '
               'engine — waiting for a compatible update';
+          // Fleet observability: without this, engine-changed devices
+          // sit on baseline invisibly. Fire-and-forget so the boot path
+          // never waits on telemetry. Deduped per process: init() can
+          // legally run more than once (e.g. re-init on resume), and
+          // each run re-enters this reload — without the latch every
+          // re-init would re-POST the same stranding event.
+          if (_reportedIncompatibleReload) return;
+          _reportedIncompatibleReload = true;
+          unawaited(
+            _reportIncompatibleBaseline(
+              serverUrl: serverUrl,
+              appId: appId,
+              patchId: patchId,
+              kind: 'incompatible_reload',
+              reason: 'Installed patch was built for a different engine '
+                  'ABI; reload skipped, baseline running',
+              expectedFingerprint: info?['engine_abi']?.toString(),
+              actualFingerprint: liveAbi,
+            ),
+          );
           return;
         case IosReloadGateDecision.dropCorrupt:
           // Corruption, NOT a bad patch — delete without quarantining
