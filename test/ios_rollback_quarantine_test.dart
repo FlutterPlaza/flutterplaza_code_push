@@ -88,4 +88,56 @@ void main() {
     await expectLater(CodePush.rollback(), throwsA(isA<Exception>()));
     expect(File('${tmp.path}/rolled_back_patch').existsSync(), isFalse);
   });
+
+  test('rollback() keeps the resident-module flag true to the VM', () async {
+    // A loaded module cannot be unloaded: a disk rollback must NOT
+    // claim the VM is back on baseline, or a same-session install
+    // would double-load and quarantine the wrong patch.
+    File('${tmp.path}/patch.vmcode').writeAsBytesSync([1, 2, 3, 4]);
+    File('${tmp.path}/patch_info.json').writeAsStringSync(
+      jsonEncode({'patch_id': 'p1', 'patch_hash': 'h1'}),
+    );
+    CodePush.debugModuleLoadedForTesting = true;
+    addTearDown(() => CodePush.debugModuleLoadedForTesting = false);
+
+    await CodePush.rollback();
+
+    expect(CodePush.debugModuleLoadedForTesting, isTrue,
+        reason: 'the module stays resident until the next cold start');
+    expect(CodePush.status.value, 'Patch removed — active until restart');
+    expect(CodePush.moduleResult.value, isNull,
+        reason: 'the app-facing content signal reverts immediately');
+  });
+
+  group('debugPersistOutcomeShowsRestart', () {
+    test('silent convergence only when nothing was reverted', () {
+      expect(
+        CodePush.debugPersistOutcomeShowsRestart(
+          decision: IosLoadedSessionDecision.persistSilently,
+          contentRevertedThisSession: false,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a kill-switch bounce forces the restart banner', () {
+      expect(
+        CodePush.debugPersistOutcomeShowsRestart(
+          decision: IosLoadedSessionDecision.persistSilently,
+          contentRevertedThisSession: true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('a genuinely new patch always shows the banner', () {
+      expect(
+        CodePush.debugPersistOutcomeShowsRestart(
+          decision: IosLoadedSessionDecision.persistAndRestart,
+          contentRevertedThisSession: false,
+        ),
+        isTrue,
+      );
+    });
+  });
 }

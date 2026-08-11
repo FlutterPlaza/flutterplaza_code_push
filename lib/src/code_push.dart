@@ -713,8 +713,10 @@ abstract final class CodePush {
                 // before it ever runs once.
                 _iosResetBootCounter(patchDir);
               }
-              if (decision == IosLoadedSessionDecision.persistSilently &&
-                  !_contentRevertedThisSession) {
+              if (!debugPersistOutcomeShowsRestart(
+                decision: decision,
+                contentRevertedThisSession: _contentRevertedThisSession,
+              )) {
                 // The server withdrew a pending update and reverted to
                 // the module that is running right now: disk converged,
                 // a restart would change nothing — no banner, no
@@ -1133,6 +1135,37 @@ abstract final class CodePush {
   /// its bytes (nothing would be written anyway), then malformed
   /// containers are rejected before they can overwrite the working
   /// patch, and only then is persist-silent vs persist-restart chosen.
+  /// Whether a persist outcome must surface the restart banner (and
+  /// fire `onUpdateReady`) rather than converge silently. Silent
+  /// convergence is only honest when the offer IS the running module
+  /// AND its app-facing content signal was not reverted this session
+  /// (a kill-switch bounce clears [moduleResult] while the module stays
+  /// resident — there a restart genuinely restores content).
+  @visibleForTesting
+  static bool debugPersistOutcomeShowsRestart({
+    required IosLoadedSessionDecision decision,
+    required bool contentRevertedThisSession,
+  }) {
+    return decision == IosLoadedSessionDecision.persistAndRestart ||
+        contentRevertedThisSession;
+  }
+
+  /// Test-only window onto the resident-module state, so the
+  /// "rollback keeps in-memory state true to the VM" behavior is
+  /// assertable off-device.
+  @visibleForTesting
+  static bool get debugModuleLoadedForTesting => _moduleLoaded;
+
+  @visibleForTesting
+  static set debugModuleLoadedForTesting(bool value) {
+    _moduleLoaded = value;
+    if (!value) {
+      _loadedPatchId = null;
+      _loadedPatchHash = null;
+      _contentRevertedThisSession = false;
+    }
+  }
+
   @visibleForTesting
   static IosLoadedSessionDecision debugDecideLoadedSessionOffer({
     required bool offerMatchesDisk,
@@ -1563,11 +1596,13 @@ abstract final class CodePush {
   /// Takes effect on next cold restart. On iOS (where the engine updater
   /// is disabled), removes the patch file directly from Dart.
   ///
-  /// A deliberate rollback also QUARANTINES the removed patch: without
-  /// that, the very next update check would silently re-deliver the
-  /// same patch while the server still offers it, undoing this call
-  /// minutes later. The quarantine clears automatically once the server
-  /// offers a different patch.
+  /// A deliberate rollback also QUARANTINES the removed patch (on the
+  /// iOS Dart-side path; Android's engine-side rollback does its own
+  /// bookkeeping via the rollback breadcrumb): without that, the very
+  /// next update check would silently re-deliver the same patch while
+  /// the server still offers it, undoing this call minutes later. The
+  /// quarantine clears automatically once the server offers a
+  /// different patch.
   static Future<void> rollback() => _rollbackInternal(quarantine: true);
 
   /// [quarantine] is false for the OTA kill switch: there the server
@@ -2078,6 +2113,9 @@ abstract final class CodePush {
     _moduleLoaded = false;
     _loadedPatchId = null;
     _loadedPatchHash = null;
+    // Keep the invariant "latch implies resident revert" local: once the
+    // flags say nothing is resident, the latch must not linger either.
+    _contentRevertedThisSession = false;
     moduleResult.value = null;
 
     // 4. Report the failure to the server (fire-and-forget).
