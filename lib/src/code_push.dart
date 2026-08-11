@@ -270,6 +270,12 @@ abstract final class CodePush {
     String channel = 'production',
     VoidCallback? onUpdateReady,
   }) async {
+    // Single-flight: the init chain, the periodic timer, and app-resume
+    // can overlap. Concurrent checks would double-download, and on iOS a
+    // second load of the same payload throws — whose rollback would then
+    // revert the copy the first call just loaded successfully.
+    if (_checkInFlight) return false;
+    _checkInFlight = true;
     try {
       print('[CP] checkAndInstall start');
       status.value = 'Checking server...';
@@ -284,10 +290,10 @@ abstract final class CodePush {
       final deviceBaselineId = await _readBaselineId();
       final deviceHash = await _deviceHash();
       final url = '$serverUrl/api/v1/updates'
-          '?app_id=$appId'
+          '?app_id=${Uri.encodeComponent(appId)}'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
-          '&channel=$channel'
+          '&channel=${Uri.encodeComponent(channel)}'
           '${deviceBaselineHash != null ? '&baseline_hash=$deviceBaselineHash' : ''}'
           '${deviceBaselineId != null ? '&baseline_id=$deviceBaselineId' : ''}'
           '${deviceHash != null ? '&device_hash=$deviceHash' : ''}';
@@ -331,6 +337,18 @@ abstract final class CodePush {
       final patchUrl = data['patch_url'] as String?;
       if (patchUrl == null || patchUrl.isEmpty) {
         status.value = 'No patch URL';
+        return false;
+      }
+      // Executable code must never travel over cleartext. Loopback is
+      // exempt for local development and tests.
+      final patchUri = Uri.tryParse(patchUrl);
+      final isLoopbackPatchHost = patchUri != null &&
+          (patchUri.host == '127.0.0.1' ||
+              patchUri.host == 'localhost' ||
+              patchUri.host == '::1');
+      if (patchUri == null ||
+          (patchUri.scheme != 'https' && !isLoopbackPatchHost)) {
+        status.value = 'Insecure patch URL refused';
         return false;
       }
 
@@ -475,6 +493,19 @@ abstract final class CodePush {
         return false;
       }
 
+      // Verify the download against the offer before anything touches
+      // it: the server's patch_hash covers the exact stored bytes, so a
+      // mismatch means transport corruption or tampering. Legacy servers
+      // that omit the hash skip this check (on Android the engine still
+      // verifies integrity and signature at load time).
+      if (serverPatchHash != null && serverPatchHash.isNotEmpty) {
+        final downloadedHash = sha256.convert(patchBytes).toString();
+        if (downloadedHash != serverPatchHash) {
+          status.value = 'Patch failed verification';
+          return false;
+        }
+      }
+
       status.value = 'Installing (${patchBytes.length}B)...';
       if (Platform.isIOS) {
         if (_moduleLoaded) {
@@ -570,6 +601,15 @@ abstract final class CodePush {
               // ignore: undefined_function
               .codePushLoadModule(Uint8List.fromList(payload));
 
+          // A `false` return is the one non-throw value we refuse: no
+          // engine build uses it to mean success, so if one ever signals
+          // failure this way, latching success here would mark a bad
+          // patch active AND clear its quarantine marker below. Throwing
+          // routes it through the normal rollback path.
+          if (rawResult == false) {
+            throw StateError('module load reported failure');
+          }
+
           // Module loaded live — no restart needed on iOS.
           // Auto-parse JSON strings into Map/List for structured data.
           Object? result = rawResult;
@@ -645,8 +685,18 @@ abstract final class CodePush {
     } catch (e) {
       status.value = 'Error: $e';
       return false;
+    } finally {
+      _checkInFlight = false;
     }
   }
+
+  /// Guards [checkAndInstall] against overlapping invocations.
+  static bool _checkInFlight = false;
+
+  /// Maximum accepted patch download size. Visible for tests; real
+  /// patches are tens of megabytes, so the default is generous.
+  @visibleForTesting
+  static int debugMaxPatchDownloadBytes = 256 * 1024 * 1024;
 
   /// Kills the app process for a cold restart.
   ///
@@ -1937,7 +1987,7 @@ class _HttpResult {
   final int statusCode;
   final String body;
   final List<int> bytes;
-  _HttpResult(this.statusCode, this.body, this.bytes);
+  const _HttpResult(this.statusCode, this.body, this.bytes);
 }
 
 Future<_HttpResult> _httpGet(String url) async {
@@ -1956,17 +2006,26 @@ Future<_HttpResult> _httpGet(String url) async {
 }
 
 Future<_HttpResult> _httpGetBytes(String url) async {
+  final maxBytes = CodePush.debugMaxPatchDownloadBytes;
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
   try {
     final request = await client.getUrl(Uri.parse(url));
     final response = await request.close();
-    final bytes = await response.fold<List<int>>(
-      <int>[],
-      (prev, chunk) => prev..addAll(chunk),
-    );
+    // Cap the download so a misbehaving server can't drive the app out
+    // of memory. Real patches are tens of megabytes.
+    if (response.contentLength > maxBytes) {
+      return const _HttpResult(-1, '', <int>[]);
+    }
+    final bytes = <int>[];
+    await for (final chunk in response) {
+      bytes.addAll(chunk);
+      if (bytes.length > maxBytes) {
+        return const _HttpResult(-1, '', <int>[]);
+      }
+    }
     return _HttpResult(response.statusCode, '', bytes);
   } finally {
-    client.close();
+    client.close(force: true);
   }
 }
 
