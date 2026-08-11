@@ -3,6 +3,12 @@
 - Documentation-only release: rewrites the changelog with concise, user-facing notes. No code changes from 0.1.10.
 - If you are on the 0.1.x stable line, prefer the 0.1.11 release candidates (see below).
 
+## 0.1.11-rc.7
+
+- Patch downloads are now verified against the update metadata before use.
+- Update checks and patch downloads now require HTTPS. If you point the SDK at a plain-HTTP server or patch host (other than localhost during development), updates will be refused after this upgrade — switch those URLs to HTTPS.
+- Fixes an issue where overlapping update checks could interfere with an applied patch.
+
 ## 0.1.11-rc.6
 
 - Fix: apps now rebuild correctly after a successful patch load even when the patch returns no data.

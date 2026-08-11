@@ -1,4 +1,4 @@
-import 'dart:async' show Timer, unawaited;
+import 'dart:async' show Timer, TimeoutException, unawaited;
 import 'dart:convert' show base64Encode, jsonDecode, jsonEncode, utf8;
 import 'dart:io' show Directory, File, FileMode, HttpClient, Platform, exit;
 import 'dart:math' show Random;
@@ -270,9 +270,32 @@ abstract final class CodePush {
     String channel = 'production',
     VoidCallback? onUpdateReady,
   }) async {
+    // Single-flight: the init chain, the periodic timer, and app-resume
+    // can overlap. Concurrent checks would double-download, and on iOS a
+    // second load of the same payload throws — whose rollback would then
+    // revert the copy the first call just loaded successfully. The guard
+    // is deliberately global (not per appId/channel): apps use a single
+    // config, and a losing caller's `false` means "another check is
+    // already running", not "no update".
+    if (_checkInFlight) return false;
+    _checkInFlight = true;
     try {
       print('[CP] checkAndInstall start');
       status.value = 'Checking server...';
+      // The offer is the trust root — it vends both the patch URL and
+      // the hash the download is verified against — so the metadata
+      // channel itself must be secure too. Loopback is exempt for
+      // development and tests.
+      final serverUri = Uri.tryParse(serverUrl);
+      final isLoopbackServer = serverUri != null &&
+          (serverUri.host == '127.0.0.1' ||
+              serverUri.host == 'localhost' ||
+              serverUri.host == '::1');
+      if (serverUri == null ||
+          (serverUri.scheme != 'https' && !isLoopbackServer)) {
+        status.value = 'Insecure server URL refused';
+        return false;
+      }
       // Compute the baseline hash once, up front, so it can be
       // included in the /updates query. The server uses it as a
       // belt-and-suspenders gate: if the patch on file has a
@@ -284,10 +307,10 @@ abstract final class CodePush {
       final deviceBaselineId = await _readBaselineId();
       final deviceHash = await _deviceHash();
       final url = '$serverUrl/api/v1/updates'
-          '?app_id=$appId'
+          '?app_id=${Uri.encodeComponent(appId)}'
           '&version=${Uri.encodeComponent(releaseVersion)}'
           '&platform=$_platform'
-          '&channel=$channel'
+          '&channel=${Uri.encodeComponent(channel)}'
           '${deviceBaselineHash != null ? '&baseline_hash=$deviceBaselineHash' : ''}'
           '${deviceBaselineId != null ? '&baseline_id=$deviceBaselineId' : ''}'
           '${deviceHash != null ? '&device_hash=$deviceHash' : ''}';
@@ -331,6 +354,18 @@ abstract final class CodePush {
       final patchUrl = data['patch_url'] as String?;
       if (patchUrl == null || patchUrl.isEmpty) {
         status.value = 'No patch URL';
+        return false;
+      }
+      // Executable code must never travel over cleartext. Loopback is
+      // exempt for local development and tests.
+      final patchUri = Uri.tryParse(patchUrl);
+      final isLoopbackPatchHost = patchUri != null &&
+          (patchUri.host == '127.0.0.1' ||
+              patchUri.host == 'localhost' ||
+              patchUri.host == '::1');
+      if (patchUri == null ||
+          (patchUri.scheme != 'https' && !isLoopbackPatchHost)) {
+        status.value = 'Insecure patch URL refused';
         return false;
       }
 
@@ -475,6 +510,19 @@ abstract final class CodePush {
         return false;
       }
 
+      // Verify the download against the offer before anything touches
+      // it: the server's patch_hash covers the exact stored bytes, so a
+      // mismatch means transport corruption or tampering. Legacy servers
+      // that omit the hash skip this check (on Android the engine still
+      // verifies integrity and signature at load time).
+      if (serverPatchHash != null && serverPatchHash.isNotEmpty) {
+        final downloadedHash = sha256.convert(patchBytes).toString();
+        if (downloadedHash != serverPatchHash) {
+          status.value = 'Patch failed verification';
+          return false;
+        }
+      }
+
       status.value = 'Installing (${patchBytes.length}B)...';
       if (Platform.isIOS) {
         if (_moduleLoaded) {
@@ -570,6 +618,15 @@ abstract final class CodePush {
               // ignore: undefined_function
               .codePushLoadModule(Uint8List.fromList(payload));
 
+          // A `false` return is the one non-throw value we refuse: no
+          // engine build uses it to mean success, so if one ever signals
+          // failure this way, latching success here would mark a bad
+          // patch active AND clear its quarantine marker below. Throwing
+          // routes it through the normal rollback path.
+          if (rawResult == false) {
+            throw StateError('module load reported failure');
+          }
+
           // Module loaded live — no restart needed on iOS.
           // Auto-parse JSON strings into Map/List for structured data.
           Object? result = rawResult;
@@ -645,8 +702,26 @@ abstract final class CodePush {
     } catch (e) {
       status.value = 'Error: $e';
       return false;
+    } finally {
+      _checkInFlight = false;
     }
   }
+
+  /// Guards [checkAndInstall] against overlapping invocations.
+  static bool _checkInFlight = false;
+
+  /// Maximum accepted patch download size. Visible for tests; real
+  /// patches are tens of megabytes, so the default is generous.
+  @visibleForTesting
+  static int debugMaxPatchDownloadBytes = 256 * 1024 * 1024;
+
+  /// Per-await bound on update-check and download HTTP operations
+  /// (connect, response start, body read / inter-chunk gap). Visible
+  /// for tests. Prevents a stalled server from wedging the
+  /// single-flight guard — one hang must never latch updates off for
+  /// the process lifetime.
+  @visibleForTesting
+  static Duration debugHttpRequestTimeout = const Duration(seconds: 30);
 
   /// Kills the app process for a cold restart.
   ///
@@ -1937,54 +2012,97 @@ class _HttpResult {
   final int statusCode;
   final String body;
   final List<int> bytes;
-  _HttpResult(this.statusCode, this.body, this.bytes);
+  const _HttpResult(this.statusCode, this.body, this.bytes);
 }
 
 Future<_HttpResult> _httpGet(String url) async {
+  // connectionTimeout only bounds establishing the connection; a server
+  // that accepts and then stalls would otherwise hang this await forever
+  // — and with the single-flight guard in checkAndInstall, one such
+  // hang would silently disable all future update checks for the
+  // process lifetime. Every await is bounded.
+  final timeout = CodePush.debugHttpRequestTimeout;
+  // Offers and errors are kilobytes of JSON; cap generously so a
+  // hostile server can't OOM the app through the metadata channel
+  // either (the patch download has its own, larger cap).
+  const maxBytes = 1024 * 1024;
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
   try {
-    final request = await client.getUrl(Uri.parse(url));
-    final response = await request.close();
-    final bytes = await response.fold<List<int>>(
-      <int>[],
-      (prev, chunk) => prev..addAll(chunk),
-    );
+    final request = await client.getUrl(Uri.parse(url)).timeout(timeout);
+    final response = await request.close().timeout(timeout);
+    if (response.contentLength > maxBytes) {
+      return const _HttpResult(-1, '', <int>[]);
+    }
+    final bytes = <int>[];
+    await for (final chunk in response.timeout(
+      timeout,
+      onTimeout: (sink) =>
+          sink.addError(TimeoutException('response stalled', timeout)),
+    )) {
+      bytes.addAll(chunk);
+      if (bytes.length > maxBytes) {
+        return const _HttpResult(-1, '', <int>[]);
+      }
+    }
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
-    client.close();
+    client.close(force: true);
   }
 }
 
 Future<_HttpResult> _httpGetBytes(String url) async {
-  final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
+  final maxBytes = CodePush.debugMaxPatchDownloadBytes;
+  final timeout = CodePush.debugHttpRequestTimeout;
+  final client = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 30)
+    // The bytes we hash must be exactly the bytes on the wire — don't
+    // let transparent gunzip make integrity depend on whether a CDN
+    // toggled Content-Encoding.
+    ..autoUncompress = false;
   try {
-    final request = await client.getUrl(Uri.parse(url));
-    final response = await request.close();
-    final bytes = await response.fold<List<int>>(
-      <int>[],
-      (prev, chunk) => prev..addAll(chunk),
-    );
+    final request = await client.getUrl(Uri.parse(url)).timeout(timeout);
+    final response = await request.close().timeout(timeout);
+    // Cap the download so a misbehaving server can't drive the app out
+    // of memory. Real patches are tens of megabytes.
+    if (response.contentLength > maxBytes) {
+      return const _HttpResult(-1, '', <int>[]);
+    }
+    // Stalls are bounded two ways: the stream timeout fires on any
+    // inter-chunk gap, and the deadline bounds a trickling server that
+    // sends a byte just often enough to reset the gap timer.
+    final deadline = DateTime.now().add(const Duration(minutes: 15));
+    final bytes = <int>[];
+    await for (final chunk in response.timeout(
+      timeout,
+      onTimeout: (sink) =>
+          sink.addError(TimeoutException('patch download stalled', timeout)),
+    )) {
+      bytes.addAll(chunk);
+      if (bytes.length > maxBytes || DateTime.now().isAfter(deadline)) {
+        return const _HttpResult(-1, '', <int>[]);
+      }
+    }
     return _HttpResult(response.statusCode, '', bytes);
   } finally {
-    client.close();
+    client.close(force: true);
   }
 }
 
 Future<_HttpResult> _httpPostJson(String url, Map<String, dynamic> body) async {
+  final timeout = CodePush.debugHttpRequestTimeout;
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
   try {
-    final request = await client.postUrl(Uri.parse(url));
+    final request = await client.postUrl(Uri.parse(url)).timeout(timeout);
     request.headers.set('Content-Type', 'application/json');
     final encoded = utf8.encode(jsonEncode(body));
     request.contentLength = encoded.length;
     request.add(encoded);
-    final response = await request.close();
-    final bytes = await response.fold<List<int>>(
-      <int>[],
-      (prev, chunk) => prev..addAll(chunk),
-    );
+    final response = await request.close().timeout(timeout);
+    final bytes = await response
+        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk))
+        .timeout(timeout);
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
-    client.close();
+    client.close(force: true);
   }
 }
