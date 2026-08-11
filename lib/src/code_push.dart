@@ -273,12 +273,29 @@ abstract final class CodePush {
     // Single-flight: the init chain, the periodic timer, and app-resume
     // can overlap. Concurrent checks would double-download, and on iOS a
     // second load of the same payload throws — whose rollback would then
-    // revert the copy the first call just loaded successfully.
+    // revert the copy the first call just loaded successfully. The guard
+    // is deliberately global (not per appId/channel): apps use a single
+    // config, and a losing caller's `false` means "another check is
+    // already running", not "no update".
     if (_checkInFlight) return false;
     _checkInFlight = true;
     try {
       print('[CP] checkAndInstall start');
       status.value = 'Checking server...';
+      // The offer is the trust root — it vends both the patch URL and
+      // the hash the download is verified against — so the metadata
+      // channel itself must be secure too. Loopback is exempt for
+      // development and tests.
+      final serverUri = Uri.tryParse(serverUrl);
+      final isLoopbackServer = serverUri != null &&
+          (serverUri.host == '127.0.0.1' ||
+              serverUri.host == 'localhost' ||
+              serverUri.host == '::1');
+      if (serverUri == null ||
+          (serverUri.scheme != 'https' && !isLoopbackServer)) {
+        status.value = 'Insecure server URL refused';
+        return false;
+      }
       // Compute the baseline hash once, up front, so it can be
       // included in the /updates query. The server uses it as a
       // belt-and-suspenders gate: if the patch on file has a
@@ -2007,7 +2024,12 @@ Future<_HttpResult> _httpGet(String url) async {
 
 Future<_HttpResult> _httpGetBytes(String url) async {
   final maxBytes = CodePush.debugMaxPatchDownloadBytes;
-  final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
+  final client = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 30)
+    // The bytes we hash must be exactly the bytes on the wire — don't
+    // let transparent gunzip make integrity depend on whether a CDN
+    // toggled Content-Encoding.
+    ..autoUncompress = false;
   try {
     final request = await client.getUrl(Uri.parse(url));
     final response = await request.close();

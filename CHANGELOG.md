@@ -5,7 +5,8 @@
 
 ## 0.1.11-rc.7
 
-- Patch downloads are now verified against the update metadata before use, and update URLs must be secure.
+- Patch downloads are now verified against the update metadata before use.
+- Update checks and patch downloads now require HTTPS. If you point the SDK at a plain-HTTP server or patch host (other than localhost during development), updates will be refused after this upgrade — switch those URLs to HTTPS.
 - Fixes an issue where overlapping update checks could interfere with an applied patch.
 
 ## 0.1.11-rc.6

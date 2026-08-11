@@ -151,5 +151,43 @@ void main() {
       expect(await check(), isFalse);
       expect(CodePush.status.value, contains('Download failed'));
     });
+
+    test('a chunked response with no declared length is capped while '
+        'streaming', () async {
+      // A hostile server omits Content-Length, so the pre-check cannot
+      // fire — only the streaming guard can. Chunked transfer encoding
+      // exercises exactly that branch.
+      offeredHash = patchHash;
+      CodePush.debugMaxPatchDownloadBytes = 1024;
+      server.listen((HttpRequest req) async {
+        if (req.uri.path.endsWith('/updates')) {
+          req.response
+            ..statusCode = HttpStatus.ok
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({
+              'patch_available': true,
+              'patch_id': 'p1',
+              'patch_hash': patchHash,
+              'patch_url': 'http://127.0.0.1:${server.port}/patch',
+            }));
+        } else {
+          // The client aborts mid-stream once the cap trips; writes to
+          // a dead connection throw and must not fail the test zone.
+          try {
+            req.response.headers.chunkedTransferEncoding = true;
+            for (var i = 0; i < 64; i++) {
+              req.response.add(List<int>.filled(64, i)); // 4 KB total
+              await req.response.flush();
+            }
+          } catch (_) {}
+        }
+        try {
+          await req.response.close();
+        } catch (_) {}
+      });
+
+      expect(await check(), isFalse);
+      expect(CodePush.status.value, contains('Download failed'));
+    });
   });
 }
