@@ -5,6 +5,9 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutterplaza_code_push/flutterplaza_code_push.dart';
 
+// The kill-switch test drives checkAndInstall against a loopback
+// server; the test binding's stubbed HttpClient must not intercept it.
+
 /// A deliberate [CodePush.rollback] must STICK: it quarantines the
 /// removed patch so the next update check cannot silently re-deliver it
 /// while the server still offers it. (The OTA kill switch goes through
@@ -12,6 +15,7 @@ import 'package:flutterplaza_code_push/flutterplaza_code_push.dart';
 /// stopped offering, and a re-enable must resume with the same patch.)
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  HttpOverrides.global = null;
 
   const engineChannel = MethodChannel('flutter/codepush', JSONMethodCodec());
   final messenger =
@@ -87,6 +91,44 @@ void main() {
   test('rollback() on a clean device throws and writes nothing', () async {
     await expectLater(CodePush.rollback(), throwsA(isA<Exception>()));
     expect(File('${tmp.path}/rolled_back_patch').existsSync(), isFalse);
+  });
+
+  test('kill-switch rollback does NOT quarantine — re-enable can resume',
+      () async {
+    // The opposite contract of the public rollback(): when the SERVER
+    // disables OTA, the patch is removed but no rolled_back_patch
+    // marker may be written — a later re-enable must be able to resume
+    // service with the SAME patch.
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((HttpRequest req) {
+      req.response
+        ..statusCode = HttpStatus.ok
+        ..headers.contentType = ContentType.json
+        ..write(
+          jsonEncode(<String, dynamic>{
+            'patch_available': false,
+            'ota_disabled': true,
+          }),
+        );
+      req.response.close();
+    });
+
+    File('${tmp.path}/patch.vmcode').writeAsBytesSync([1, 2, 3, 4]);
+    File('${tmp.path}/patch_info.json').writeAsStringSync(
+      jsonEncode({'patch_id': 'p1', 'patch_hash': 'h1'}),
+    );
+
+    await CodePush.checkAndInstall(
+      serverUrl: 'http://127.0.0.1:${server.port}',
+      appId: 'test-app',
+      releaseVersion: '1.0.0+1',
+    );
+
+    expect(File('${tmp.path}/patch.vmcode').existsSync(), isFalse,
+        reason: 'the kill switch must remove the patch');
+    expect(File('${tmp.path}/rolled_back_patch').existsSync(), isFalse,
+        reason: 'the kill-switch rollback must NOT quarantine');
   });
 
   test('rollback() keeps the resident-module flag true to the VM', () async {
