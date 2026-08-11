@@ -36,7 +36,7 @@ packages:
       path: ".."
       relative: true
     source: path
-    version: "0.1.11-rc.7"
+    version: "0.1.11"
   material_color_utilities:
     dependency: transitive
     description:
