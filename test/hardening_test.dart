@@ -36,8 +36,8 @@ void main() {
             'patch_available': true,
             'patch_id': 'p1',
             if (offeredHash != null) 'patch_hash': offeredHash,
-            'patch_url': offeredUrlOverride ??
-                'http://127.0.0.1:${server.port}/patch',
+            'patch_url':
+                offeredUrlOverride ?? 'http://127.0.0.1:${server.port}/patch',
           }));
       } else {
         downloads++;
@@ -109,8 +109,7 @@ void main() {
   });
 
   group('cleartext refusal', () {
-    test('non-loopback http patch_url is refused without download',
-        () async {
+    test('non-loopback http patch_url is refused without download', () async {
       offeredHash = patchHash;
       offeredUrlOverride = 'http://updates.example.com/patch';
       serve();
@@ -182,7 +181,8 @@ void main() {
       expect(CodePush.status.value, contains('Download failed'));
     });
 
-    test('a chunked response with no declared length is capped while '
+    test(
+        'a chunked response with no declared length is capped while '
         'streaming', () async {
       // A hostile server omits Content-Length, so the pre-check cannot
       // fire — only the streaming guard can. Chunked transfer encoding

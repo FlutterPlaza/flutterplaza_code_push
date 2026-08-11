@@ -22,7 +22,9 @@ const MethodChannel _channel = MethodChannel(
 const MethodChannel _pluginChannel = MethodChannel('flutterplaza_code_push');
 
 /// Outcome of the iOS loaded-session offer decision — see
-/// [CodePush.debugDecideLoadedSessionOffer].
+/// [CodePush.debugDecideLoadedSessionOffer]. Only produced by
+/// test-visible methods; not part of the supported runtime API.
+@visibleForTesting
 enum IosLoadedSessionDecision {
   /// The offer is already persisted on disk: nothing to write.
   skipAlreadyInstalled,
@@ -40,7 +42,9 @@ enum IosLoadedSessionDecision {
 }
 
 /// Outcome of the iOS cold-start reload gate — see
-/// [CodePush.debugDecideReloadGate].
+/// [CodePush.debugDecideReloadGate]. Only produced by
+/// test-visible methods; not part of the supported runtime API.
+@visibleForTesting
 enum IosReloadGateDecision {
   /// The on-disk patch may be fed to the runtime.
   load,
@@ -1082,13 +1086,6 @@ abstract final class CodePush {
     } catch (_) {}
   }
 
-  /// Pure decision for an offer that arrives while a module is already
-  /// loaded (iOS). Extracted so the four-way branch the upgrade-deadlock
-  /// fix hinges on is testable off-device. Priority order matters:
-  /// an offer already persisted on disk is skipped without looking at
-  /// its bytes (nothing would be written anyway), then malformed
-  /// containers are rejected before they can overwrite the working
-  /// patch, and only then is persist-silent vs persist-restart chosen.
   /// Pure decision for whether the on-disk patch may be fed to the
   /// runtime at cold-start reload. Priority: engine-ABI compatibility
   /// first (an incompatible patch must not be loaded regardless of its
@@ -1117,6 +1114,13 @@ abstract final class CodePush {
     return IosReloadGateDecision.load;
   }
 
+  /// Pure decision for an offer that arrives while a module is already
+  /// loaded (iOS). Extracted so the four-way branch the upgrade-deadlock
+  /// fix hinges on is testable off-device. Priority order matters:
+  /// an offer already persisted on disk is skipped without looking at
+  /// its bytes (nothing would be written anyway), then malformed
+  /// containers are rejected before they can overwrite the working
+  /// patch, and only then is persist-silent vs persist-restart chosen.
   @visibleForTesting
   static IosLoadedSessionDecision debugDecideLoadedSessionOffer({
     required bool offerMatchesDisk,
@@ -1836,6 +1840,16 @@ abstract final class CodePush {
       final patchId = info?['patch_id']?.toString();
 
       final container = await patchFile.readAsBytes();
+
+      // Re-check BEFORE acting on the gate: a resume-triggered
+      // checkAndInstall can install and load a patch while the probe /
+      // file read were in flight. Without this, the stale `info` read
+      // above could be compared against the freshly-installed container
+      // — a false dropCorrupt verdict that would DELETE the good patch
+      // (and a second load on the load path would throw and quarantine
+      // the wrong patch).
+      if (_moduleLoaded) return;
+
       final gate = debugDecideReloadGate(
         storedAbi: info?['engine_abi']?.toString(),
         liveAbi: liveAbi,
@@ -1875,12 +1889,6 @@ abstract final class CodePush {
           break;
       }
 
-      // Re-check after the awaits above: a resume-triggered
-      // checkAndInstall can install and load a patch while the probe /
-      // file read were in flight; a second load would throw and
-      // quarantine the wrong patch.
-      if (_moduleLoaded) return;
-
       await _iosLoadPayload(
         container: container,
         patchDir: patchDir,
@@ -1895,8 +1903,9 @@ abstract final class CodePush {
     }
   }
 
-  /// Reads the installed patch's server id from `patch_info.json`, or
-  /// null when absent/unreadable.
+  /// Reads the installed patch's metadata map from `patch_info.json`
+  /// (`patch_id`, `patch_hash`, `engine_abi`, `installed_at`), or null
+  /// when absent/unreadable.
   static Map<String, dynamic>? _readInstalledPatchInfo(String patchDir) {
     try {
       final f = File('$patchDir/patch_info.json');
