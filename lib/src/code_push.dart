@@ -1704,9 +1704,21 @@ abstract final class CodePush {
         }
       } catch (_) {}
     }
-    patchFile.deleteSync();
+    // Delete both the current (patch.bytecode) and legacy (patch.vmcode)
+    // filenames — mirroring the auto-rollback paths — so a device
+    // upgraded from an old SDK can't keep a stale artifact through a
+    // deliberate rollback.
+    for (final name in const ['patch.bytecode', 'patch.vmcode']) {
+      final f = File('$patchDir/$name');
+      if (f.existsSync()) f.deleteSync();
+    }
     final infoFile = File('$patchDir/patch_info.json');
     if (infoFile.existsSync()) infoFile.deleteSync();
+    // installed_patch_identity.json deliberately SURVIVES this delete:
+    // the already-installed skip is gated on the patch FILE existing,
+    // so a surviving identity cannot block re-delivery — and on
+    // Android it is the quarantine-promotion source. If that
+    // file-exists gate ever moves, revisit this reliance.
     _iosResetBootCounter(patchDir);
     // In-memory state: a loaded module CANNOT be unloaded from the
     // running VM — the disk is clean, but the module stays resident
