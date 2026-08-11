@@ -105,8 +105,11 @@ abstract final class CodePush {
     // too small to contain that field cannot be a patch.
     const offsetField = 12;
     if (container.length < offsetField + 4) return null;
+    // sublistView, not buffer.asByteData(): the latter indexes the
+    // UNDERLYING buffer from byte 0, so a caller passing a sub-view
+    // (non-zero offsetInBytes) would silently read the wrong field.
     final payloadOffset =
-        container.buffer.asByteData().getUint32(offsetField, Endian.little);
+        ByteData.sublistView(container).getUint32(offsetField, Endian.little);
     if (payloadOffset < offsetField + 4 || payloadOffset >= container.length) {
       return null;
     }
@@ -2212,9 +2215,8 @@ Future<_HttpResult> _httpPostJson(String url, Map<String, dynamic> body) async {
     request.contentLength = encoded.length;
     request.add(encoded);
     final response = await request.close().timeout(timeout);
-    final bytes = await response
-        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk))
-        .timeout(timeout);
+    final bytes = await response.fold<List<int>>(
+        <int>[], (prev, chunk) => prev..addAll(chunk)).timeout(timeout);
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
     client.close(force: true);
