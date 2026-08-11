@@ -181,6 +181,65 @@ abstract final class CodePush {
   /// loaded, so a disk re-persist of that patch is NOT restart-neutral.
   static bool _contentRevertedThisSession = false;
 
+  /// Once-per-process latch for the incompatible-reload telemetry —
+  /// repeated init() calls re-enter the reload and must not re-POST a
+  /// DELIVERED report. Cleared again on transport failure so devices
+  /// that boot offline retry on a later re-init.
+  static bool _reportedIncompatibleReload = false;
+
+  /// Fires the incompatible-reload stranding report. Latched per
+  /// process on DELIVERY: set optimistically (no duplicate in-flight
+  /// posts), cleared again if the POST never completed an HTTP round
+  /// trip (device offline at boot) so a later re-init retries. One
+  /// delivered report per process is exactly sufficient — an engine
+  /// ABI cannot change within a running process.
+  static Future<void> _reportIncompatibleReload({
+    required String serverUrl,
+    required String appId,
+    required String? patchId,
+    required String? storedAbi,
+    required String? liveAbi,
+  }) async {
+    if (_reportedIncompatibleReload) return;
+    _reportedIncompatibleReload = true;
+    final delivered = await _reportIncompatibleBaseline(
+      serverUrl: serverUrl,
+      appId: appId,
+      patchId: patchId,
+      kind: 'incompatible_reload',
+      reason: 'Installed patch was built for a different engine '
+          'ABI; reload skipped, baseline running',
+      expectedFingerprint: storedAbi,
+      actualFingerprint: liveAbi,
+    );
+    if (!delivered) _reportedIncompatibleReload = false;
+  }
+
+  /// Test-only wrapper over [_reportIncompatibleReload] — the
+  /// production trigger is the private method (reload path); this seam
+  /// exists so the payload and latch semantics are assertable on host.
+  @visibleForTesting
+  static Future<void> debugReportIncompatibleReload({
+    required String serverUrl,
+    required String appId,
+    required String? patchId,
+    required String? storedAbi,
+    required String? liveAbi,
+  }) =>
+      _reportIncompatibleReload(
+        serverUrl: serverUrl,
+        appId: appId,
+        patchId: patchId,
+        storedAbi: storedAbi,
+        liveAbi: liveAbi,
+      );
+
+  /// Test-only: clears the incompatible-reload latch.
+  @visibleForTesting
+  static void debugResetIncompatibleReloadLatch() {
+    _reportedIncompatibleReload = false;
+  }
+
   /// Initializes automatic code push update checking with crash protection.
   ///
   /// Call this once in your app's startup. It will:
@@ -863,11 +922,12 @@ abstract final class CodePush {
     required String reason,
     required String? expectedFingerprint,
     required String? actualFingerprint,
+    String kind = 'incompatible_baseline',
   }) async {
     try {
       final payload = <String, dynamic>{
         'app_id': appId,
-        'kind': 'incompatible_baseline',
+        'kind': kind,
         'reason': reason,
         'platform': _platform,
         if (patchId != null) 'patch_id': patchId,
@@ -1965,6 +2025,19 @@ abstract final class CodePush {
           _iosResetBootCounter(patchDir);
           status.value = 'Installed patch was built for a different '
               'engine — waiting for a compatible update';
+          // Fleet observability: without this, engine-changed devices
+          // sit on baseline invisibly. Fire-and-forget so the boot path
+          // never waits on telemetry; delivery/latch semantics live in
+          // the helper.
+          unawaited(
+            _reportIncompatibleReload(
+              serverUrl: serverUrl,
+              appId: appId,
+              patchId: patchId,
+              storedAbi: info?['engine_abi']?.toString(),
+              liveAbi: liveAbi,
+            ),
+          );
           return;
         case IosReloadGateDecision.dropCorrupt:
           // Corruption, NOT a bad patch — delete without quarantining
