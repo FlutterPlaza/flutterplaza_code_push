@@ -169,4 +169,161 @@ void main() {
       isFalse,
     );
   });
+
+  group('debugDecideLoadedSessionOffer (the four-way branch)', () {
+    // Note: this is the HELPER's priority order — a disk match wins
+    // regardless of the other inputs. The call site still evaluates
+    // all three predicates eagerly (they are pure and cannot throw).
+    test('a disk match wins regardless of the other inputs', () {
+      expect(
+        CodePush.debugDecideLoadedSessionOffer(
+          offerMatchesDisk: true,
+          formatValid: false,
+          offerMatchesRunningModule: true,
+        ),
+        IosLoadedSessionDecision.skipAlreadyInstalled,
+      );
+    });
+
+    test('malformed containers are rejected before any write', () {
+      expect(
+        CodePush.debugDecideLoadedSessionOffer(
+          offerMatchesDisk: false,
+          formatValid: false,
+          offerMatchesRunningModule: false,
+        ),
+        IosLoadedSessionDecision.rejectMalformed,
+      );
+      // Even when the offer claims to be the running module — bytes
+      // that fail the format check must never reach disk.
+      expect(
+        CodePush.debugDecideLoadedSessionOffer(
+          offerMatchesDisk: false,
+          formatValid: false,
+          offerMatchesRunningModule: true,
+        ),
+        IosLoadedSessionDecision.rejectMalformed,
+      );
+    });
+
+    test('server revert to the running module persists silently', () {
+      expect(
+        CodePush.debugDecideLoadedSessionOffer(
+          offerMatchesDisk: false,
+          formatValid: true,
+          offerMatchesRunningModule: true,
+        ),
+        IosLoadedSessionDecision.persistSilently,
+      );
+    });
+
+    test('a genuinely new patch persists with restart-to-apply', () {
+      expect(
+        CodePush.debugDecideLoadedSessionOffer(
+          offerMatchesDisk: false,
+          formatValid: true,
+          offerMatchesRunningModule: false,
+        ),
+        IosLoadedSessionDecision.persistAndRestart,
+      );
+    });
+  });
+
+  group('debugDecideReloadGate (ABI + integrity)', () {
+    test('legacy install with no metadata loads as before', () {
+      expect(
+        CodePush.debugDecideReloadGate(
+          storedAbi: null,
+          liveAbi: 'flutter-3.41.2',
+          storedHash: null,
+          actualHash: 'h',
+        ),
+        IosReloadGateDecision.load,
+      );
+    });
+
+    test('matching ABI and hash loads', () {
+      expect(
+        CodePush.debugDecideReloadGate(
+          storedAbi: 'flutter-3.41.2',
+          liveAbi: 'flutter-3.41.2',
+          storedHash: 'h1',
+          actualHash: 'h1',
+        ),
+        IosReloadGateDecision.load,
+      );
+    });
+
+    test('ABI mismatch skips the load', () {
+      expect(
+        CodePush.debugDecideReloadGate(
+          storedAbi: 'flutter-3.41.2',
+          liveAbi: 'flutter-3.41.6',
+          storedHash: 'h1',
+          actualHash: 'h1',
+        ),
+        IosReloadGateDecision.skipIncompatibleAbi,
+      );
+    });
+
+    test('unknown on either side skips the ABI comparison', () {
+      expect(
+        CodePush.debugDecideReloadGate(
+          storedAbi: 'unknown',
+          liveAbi: 'flutter-3.41.6',
+          storedHash: 'h1',
+          actualHash: 'h1',
+        ),
+        IosReloadGateDecision.load,
+      );
+      expect(
+        CodePush.debugDecideReloadGate(
+          storedAbi: 'flutter-3.41.2',
+          liveAbi: 'unknown',
+          storedHash: 'h1',
+          actualHash: 'h1',
+        ),
+        IosReloadGateDecision.load,
+      );
+    });
+
+    test('empty-string metadata is treated as absent', () {
+      expect(
+        CodePush.debugDecideReloadGate(
+          storedAbi: '',
+          liveAbi: 'flutter-3.41.6',
+          storedHash: '',
+          actualHash: 'h1',
+        ),
+        IosReloadGateDecision.load,
+      );
+    });
+
+    test('hash mismatch drops the corrupt container', () {
+      expect(
+        CodePush.debugDecideReloadGate(
+          storedAbi: 'flutter-3.41.2',
+          liveAbi: 'flutter-3.41.2',
+          storedHash: 'h1',
+          actualHash: 'h2',
+        ),
+        IosReloadGateDecision.dropCorrupt,
+      );
+    });
+
+    test('ABI incompatibility wins over integrity', () {
+      // An incompatible patch must not be loaded regardless of its
+      // bytes; it also must NOT be dropped as corrupt (it may be a
+      // perfectly good patch for the engine it was built against).
+      expect(
+        CodePush.debugDecideReloadGate(
+          storedAbi: 'flutter-3.41.2',
+          liveAbi: 'flutter-3.41.6',
+          storedHash: 'h1',
+          actualHash: 'h2',
+        ),
+        IosReloadGateDecision.skipIncompatibleAbi,
+      );
+    });
+  });
 }
