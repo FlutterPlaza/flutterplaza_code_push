@@ -176,6 +176,11 @@ abstract final class CodePush {
   static String? _loadedPatchId;
   static String? _loadedPatchHash;
 
+  /// True after a rollback nulled [moduleResult] while the module stayed
+  /// resident: the app shows baseline content although patched code is
+  /// loaded, so a disk re-persist of that patch is NOT restart-neutral.
+  static bool _contentRevertedThisSession = false;
+
   /// Once-per-process latch for the incompatible-reload telemetry —
   /// repeated init() calls re-enter the reload and must not re-POST a
   /// DELIVERED report. Cleared again on transport failure so devices
@@ -487,12 +492,14 @@ abstract final class CodePush {
       if (data['ota_disabled'] == true) {
         status.value = 'OTA disabled by server';
         try {
-          // Unconditional: rollback() knows where each platform keeps
+          // Unconditional: the rollback knows where each platform keeps
           // the patch (engine on Android/desktop, file removal on iOS
           // where the engine channel is disabled and isPatched would
           // always answer false) and throws harmlessly when the device
-          // is already clean.
-          await rollback();
+          // is already clean. quarantine: false — the server stopped
+          // offering, and a later re-enable must be able to resume
+          // service with the SAME patch.
+          await _rollbackInternal(quarantine: false);
           status.value =
               'OTA disabled by server — patch removed (restart to apply)';
         } catch (_) {
@@ -765,7 +772,10 @@ abstract final class CodePush {
                 // before it ever runs once.
                 _iosResetBootCounter(patchDir);
               }
-              if (decision == IosLoadedSessionDecision.persistSilently) {
+              if (!debugPersistOutcomeShowsRestart(
+                decision: decision,
+                contentRevertedThisSession: _contentRevertedThisSession,
+              )) {
                 // The server withdrew a pending update and reverted to
                 // the module that is running right now: disk converged,
                 // a restart would change nothing — no banner, no
@@ -773,6 +783,10 @@ abstract final class CodePush {
                 status.value = 'Patch active';
                 return false;
               }
+              // persistAndRestart — or persistSilently after a rollback
+              // reverted the app-facing content this session: the
+              // module is resident but moduleResult was cleared, so a
+              // restart DOES change what the user sees. Surface it.
               status.value = 'Restart to apply';
               onUpdateReady?.call();
               return true;
@@ -1181,6 +1195,37 @@ abstract final class CodePush {
   /// its bytes (nothing would be written anyway), then malformed
   /// containers are rejected before they can overwrite the working
   /// patch, and only then is persist-silent vs persist-restart chosen.
+  /// Whether a persist outcome must surface the restart banner (and
+  /// fire `onUpdateReady`) rather than converge silently. Silent
+  /// convergence is only honest when the offer IS the running module
+  /// AND its app-facing content signal was not reverted this session
+  /// (a kill-switch bounce clears [moduleResult] while the module stays
+  /// resident — there a restart genuinely restores content).
+  @visibleForTesting
+  static bool debugPersistOutcomeShowsRestart({
+    required IosLoadedSessionDecision decision,
+    required bool contentRevertedThisSession,
+  }) {
+    return decision == IosLoadedSessionDecision.persistAndRestart ||
+        contentRevertedThisSession;
+  }
+
+  /// Test-only window onto the resident-module state, so the
+  /// "rollback keeps in-memory state true to the VM" behavior is
+  /// assertable off-device.
+  @visibleForTesting
+  static bool get debugModuleLoadedForTesting => _moduleLoaded;
+
+  @visibleForTesting
+  static set debugModuleLoadedForTesting(bool value) {
+    _moduleLoaded = value;
+    if (!value) {
+      _loadedPatchId = null;
+      _loadedPatchHash = null;
+      _contentRevertedThisSession = false;
+    }
+  }
+
   @visibleForTesting
   static IosLoadedSessionDecision debugDecideLoadedSessionOffer({
     required bool offerMatchesDisk,
@@ -1610,7 +1655,21 @@ abstract final class CodePush {
   /// Rolls back to the previous version by removing the active patch.
   /// Takes effect on next cold restart. On iOS (where the engine updater
   /// is disabled), removes the patch file directly from Dart.
-  static Future<void> rollback() async {
+  ///
+  /// A deliberate rollback also QUARANTINES the removed patch (on the
+  /// iOS Dart-side path; Android's engine-side rollback does its own
+  /// bookkeeping via the rollback breadcrumb): without that, the very
+  /// next update check would silently re-deliver the same patch while
+  /// the server still offers it, undoing this call minutes later. The
+  /// quarantine clears automatically once the server offers a
+  /// different patch.
+  static Future<void> rollback() => _rollbackInternal(quarantine: true);
+
+  /// [quarantine] is false for the OTA kill switch: there the server
+  /// has stopped offering, and a later re-enable must be able to resume
+  /// service with the SAME patch — a marker would block that until an
+  /// unrelated patch shipped.
+  static Future<void> _rollbackInternal({required bool quarantine}) async {
     // Try engine-side rollback first (works on Android/desktop).
     try {
       final bool? success = await _channel.invokeMethod<bool>(
@@ -1628,13 +1687,64 @@ abstract final class CodePush {
     if (!patchFile.existsSync()) {
       throw CodePushException('No active patch to roll back.');
     }
-    patchFile.deleteSync();
+    if (quarantine) {
+      // Record the identity BEFORE deleting patch_info below — the
+      // loaded-session running-module match would otherwise re-persist
+      // a patch the caller explicitly removed (see [rollback]).
+      try {
+        final info = _readInstalledPatchInfo(patchDir);
+        if (info != null) {
+          File('$patchDir/rolled_back_patch').writeAsStringSync(
+            jsonEncode(<String, Object?>{
+              'patch_id': info['patch_id'],
+              'patch_hash': info['patch_hash'],
+              'rolled_back_at': DateTime.now().toIso8601String(),
+            }),
+          );
+        }
+      } catch (_) {}
+    }
+    // Delete both the current (patch.bytecode) and legacy (patch.vmcode)
+    // filenames — mirroring the auto-rollback paths — so a device
+    // upgraded from an old SDK can't keep a stale artifact through a
+    // deliberate rollback.
+    for (final name in const ['patch.bytecode', 'patch.vmcode']) {
+      final f = File('$patchDir/$name');
+      if (f.existsSync()) f.deleteSync();
+    }
     final infoFile = File('$patchDir/patch_info.json');
     if (infoFile.existsSync()) infoFile.deleteSync();
+    // installed_patch_identity.json deliberately SURVIVES this delete:
+    // the already-installed skip is gated on the patch FILE existing,
+    // so a surviving identity cannot block re-delivery — and on
+    // Android it is the quarantine-promotion source. If that
+    // file-exists gate ever moves, revisit this reliance.
     _iosResetBootCounter(patchDir);
-    _moduleLoaded = false;
-    _loadedPatchId = null;
-    _loadedPatchHash = null;
+    // In-memory state: a loaded module CANNOT be unloaded from the
+    // running VM — the disk is clean, but the module stays resident
+    // until the next cold start (which is exactly what this method's
+    // doc has always promised). _moduleLoaded and the loaded identity
+    // must keep telling that truth: clearing them here would let a
+    // same-session install take the fresh-load path, and a second
+    // loadModule into this VM throws — the failure handler would then
+    // quarantine the NEW patch, losing a healthy update until the
+    // server ships a different one. With the flag intact, a later
+    // offer goes through the persist-don't-load branch (and a
+    // re-offer of the still-resident patch converges silently via the
+    // running-module identity).
+    //
+    // moduleResult IS cleared: it is the app-facing content signal,
+    // and apps keying UI off it should revert immediately — the
+    // kill-switch UX — even though the code stays resident.
+    if (_moduleLoaded) {
+      status.value = 'Patch removed — active until restart';
+      // Remember that the app-facing content was reverted while the
+      // module stays resident: a later "persist silently" convergence
+      // (kill-switch bounce re-offering the resident patch) is NOT
+      // restart-neutral in that state — a restart restores the content
+      // — so the restart banner must fire. Cleared on successful load.
+      _contentRevertedThisSession = true;
+    }
     moduleResult.value = null;
   }
 
@@ -1826,6 +1936,7 @@ abstract final class CodePush {
       _moduleLoaded = true;
       _loadedPatchId = patchId;
       _loadedPatchHash = sha256.convert(container).toString();
+      _contentRevertedThisSession = false;
       moduleResult.value = result;
       status.value = 'Patch active';
       // Clear any previous rollback marker — this patch works.
@@ -2087,6 +2198,9 @@ abstract final class CodePush {
     _moduleLoaded = false;
     _loadedPatchId = null;
     _loadedPatchHash = null;
+    // Keep the invariant "latch implies resident revert" local: once the
+    // flags say nothing is resident, the latch must not linger either.
+    _contentRevertedThisSession = false;
     moduleResult.value = null;
 
     // 4. Report the failure to the server (fire-and-forget).

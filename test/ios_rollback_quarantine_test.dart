@@ -1,0 +1,185 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:flutterplaza_code_push/flutterplaza_code_push.dart';
+
+// The kill-switch test drives checkAndInstall against a loopback
+// server; the test binding's stubbed HttpClient must not intercept it.
+
+/// A deliberate [CodePush.rollback] must STICK: it quarantines the
+/// removed patch so the next update check cannot silently re-deliver it
+/// while the server still offers it. (The OTA kill switch goes through
+/// the non-quarantining internal path instead — there the server has
+/// stopped offering, and a re-enable must resume with the same patch.)
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  HttpOverrides.global = null;
+
+  const engineChannel = MethodChannel('flutter/codepush', JSONMethodCodec());
+  final messenger =
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+
+  // ONE directory for the whole file: CodePush memoizes the patch dir
+  // (_cachedPatchDir), so per-test directories would go stale after the
+  // first lookup. Contents are wiped between tests instead.
+  late Directory tmp;
+
+  setUpAll(() {
+    tmp = Directory.systemTemp.createTempSync('cp_rollback_test');
+  });
+
+  tearDownAll(() {
+    try {
+      tmp.deleteSync(recursive: true);
+    } catch (_) {}
+  });
+
+  setUp(() {
+    for (final e in tmp.listSync()) {
+      try {
+        e.deleteSync(recursive: true);
+      } catch (_) {}
+    }
+    messenger.setMockMethodCallHandler(engineChannel, (MethodCall call) async {
+      switch (call.method) {
+        case 'CodePush.rollback':
+          return false; // Engine updater absent → Dart-side branch runs.
+        case 'CodePush.getPatchDir':
+          return tmp.path;
+      }
+      return null;
+    });
+  });
+
+  tearDown(() {
+    messenger.setMockMethodCallHandler(engineChannel, null);
+  });
+
+  test('public rollback() quarantines the removed patch', () async {
+    File('${tmp.path}/patch.vmcode').writeAsBytesSync([1, 2, 3, 4]);
+    File('${tmp.path}/patch_info.json').writeAsStringSync(
+      jsonEncode({'patch_id': 'p1', 'patch_hash': 'h1'}),
+    );
+
+    await CodePush.rollback();
+
+    expect(File('${tmp.path}/patch.vmcode').existsSync(), isFalse,
+        reason: 'patch file must be deleted');
+    expect(File('${tmp.path}/patch_info.json').existsSync(), isFalse,
+        reason: 'patch metadata must be deleted');
+
+    final marker = File('${tmp.path}/rolled_back_patch');
+    expect(marker.existsSync(), isTrue,
+        reason: 'a deliberate rollback must quarantine the patch');
+    final rb = jsonDecode(marker.readAsStringSync()) as Map<String, dynamic>;
+    expect(rb['patch_id'], 'p1');
+    expect(rb['patch_hash'], 'h1');
+  });
+
+  test('rollback() without patch metadata still deletes, no marker', () async {
+    File('${tmp.path}/patch.vmcode').writeAsBytesSync([1, 2, 3, 4]);
+
+    await CodePush.rollback();
+
+    expect(File('${tmp.path}/patch.vmcode').existsSync(), isFalse);
+    expect(File('${tmp.path}/rolled_back_patch').existsSync(), isFalse,
+        reason: 'no identity to quarantine — marker must not be written');
+  });
+
+  test('rollback() on a clean device throws and writes nothing', () async {
+    await expectLater(CodePush.rollback(), throwsA(isA<Exception>()));
+    expect(File('${tmp.path}/rolled_back_patch').existsSync(), isFalse);
+  });
+
+  test('kill-switch rollback does NOT quarantine — re-enable can resume',
+      () async {
+    // The opposite contract of the public rollback(): when the SERVER
+    // disables OTA, the patch is removed but no rolled_back_patch
+    // marker may be written — a later re-enable must be able to resume
+    // service with the SAME patch.
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((HttpRequest req) {
+      req.response
+        ..statusCode = HttpStatus.ok
+        ..headers.contentType = ContentType.json
+        ..write(
+          jsonEncode(<String, dynamic>{
+            'patch_available': false,
+            'ota_disabled': true,
+          }),
+        );
+      req.response.close();
+    });
+
+    File('${tmp.path}/patch.vmcode').writeAsBytesSync([1, 2, 3, 4]);
+    File('${tmp.path}/patch_info.json').writeAsStringSync(
+      jsonEncode({'patch_id': 'p1', 'patch_hash': 'h1'}),
+    );
+
+    await CodePush.checkAndInstall(
+      serverUrl: 'http://127.0.0.1:${server.port}',
+      appId: 'test-app',
+      releaseVersion: '1.0.0+1',
+    );
+
+    expect(File('${tmp.path}/patch.vmcode').existsSync(), isFalse,
+        reason: 'the kill switch must remove the patch');
+    expect(File('${tmp.path}/rolled_back_patch').existsSync(), isFalse,
+        reason: 'the kill-switch rollback must NOT quarantine');
+  });
+
+  test('rollback() keeps the resident-module flag true to the VM', () async {
+    // A loaded module cannot be unloaded: a disk rollback must NOT
+    // claim the VM is back on baseline, or a same-session install
+    // would double-load and quarantine the wrong patch.
+    File('${tmp.path}/patch.vmcode').writeAsBytesSync([1, 2, 3, 4]);
+    File('${tmp.path}/patch_info.json').writeAsStringSync(
+      jsonEncode({'patch_id': 'p1', 'patch_hash': 'h1'}),
+    );
+    CodePush.debugModuleLoadedForTesting = true;
+    addTearDown(() => CodePush.debugModuleLoadedForTesting = false);
+
+    await CodePush.rollback();
+
+    expect(CodePush.debugModuleLoadedForTesting, isTrue,
+        reason: 'the module stays resident until the next cold start');
+    expect(CodePush.status.value, 'Patch removed — active until restart');
+    expect(CodePush.moduleResult.value, isNull,
+        reason: 'the app-facing content signal reverts immediately');
+  });
+
+  group('debugPersistOutcomeShowsRestart', () {
+    test('silent convergence only when nothing was reverted', () {
+      expect(
+        CodePush.debugPersistOutcomeShowsRestart(
+          decision: IosLoadedSessionDecision.persistSilently,
+          contentRevertedThisSession: false,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a kill-switch bounce forces the restart banner', () {
+      expect(
+        CodePush.debugPersistOutcomeShowsRestart(
+          decision: IosLoadedSessionDecision.persistSilently,
+          contentRevertedThisSession: true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('a genuinely new patch always shows the banner', () {
+      expect(
+        CodePush.debugPersistOutcomeShowsRestart(
+          decision: IosLoadedSessionDecision.persistAndRestart,
+          contentRevertedThisSession: false,
+        ),
+        isTrue,
+      );
+    });
+  });
+}
