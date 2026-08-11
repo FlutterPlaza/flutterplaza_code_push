@@ -1,3 +1,10 @@
+## 0.1.11
+
+- Adds Android support: patches download, verify, and apply on the next app restart.
+- Patch downloads are verified before use, and update URLs must use HTTPS (plain-HTTP hosts other than localhost are refused).
+- Adds `disableOnPlayStoreInstalls` for keeping over-the-air updates off on Play Store installs.
+- Devices no longer re-download an already-installed or rolled-back patch.
+
 ## 0.1.10+1
 
 - Documentation-only release: rewrites the changelog with concise, user-facing notes. No code changes from 0.1.10.
