@@ -129,6 +129,13 @@ abstract final class CodePush {
   static final ValueNotifier<Object?> moduleResult = ValueNotifier(null);
   static bool _moduleLoaded = false;
 
+  /// Identity of the module that is loaded in THIS VM right now (iOS).
+  /// Distinct from `patch_info.json`, which describes the patch
+  /// persisted on disk — after a pending update is persisted, the two
+  /// deliberately differ until the next cold start.
+  static String? _loadedPatchId;
+  static String? _loadedPatchHash;
+
   /// Initializes automatic code push update checking with crash protection.
   ///
   /// Call this once in your app's startup. It will:
@@ -259,15 +266,25 @@ abstract final class CodePush {
       // first check, so a bad patch isn't re-downloaded even once on this
       // boot (the fast, no-network half of the rollback handling). The
       // telemetry POST below is the slow, best-effort half.
-      final quarantineDir = await _getPatchDir();
-      if (quarantineDir != null) {
-        _quarantineFromBreadcrumb(quarantineDir);
-      }
+      //
+      // NOT on iOS: the breadcrumb (`rollback_info.json`) is written only
+      // by the engine's updater, which is disabled on iOS — and iOS now
+      // writes `installed_patch_identity.json` with "currently
+      // active/pending" semantics, so promoting it into the quarantine
+      // marker here would quarantine the RUNNING GOOD patch if a
+      // breadcrumb ever appeared (restored backup, future engine change).
+      if (!Platform.isIOS) {
+        final quarantineDir = await _getPatchDir();
+        if (quarantineDir != null) {
+          _quarantineFromBreadcrumb(quarantineDir);
+        }
 
-      // Report any rollback that was recorded natively before Dart started
-      // (crash-loop protection runs before main(), so without this the
-      // server never hears about it). Best-effort, fire-and-forget.
-      _reportPendingNativeRollback(serverUrl: serverUrl, appId: appId);
+        // Report any rollback that was recorded natively before Dart
+        // started (crash-loop protection runs before main(), so without
+        // this the server never hears about it). Best-effort,
+        // fire-and-forget.
+        _reportPendingNativeRollback(serverUrl: serverUrl, appId: appId);
+      }
 
       // Immediate check is now *after* crash protection so a bad patch
       // on disk gets a chance to increment the boot counter before we
@@ -440,8 +457,9 @@ abstract final class CodePush {
       // re-downloads it and re-fires "restart to apply" forever. The
       // install-time identity (finding #7's `installed_patch_identity.json`)
       // survives the restart, so a matching offer means "already applied".
-      // (iOS latches `_moduleLoaded` and never writes this file, so this
-      // is effectively the Android equivalent of that latch.)
+      // Written at install on BOTH platforms: on iOS it stops the SDK
+      // re-downloading the patch that is already running (or persisted
+      // and pending restart) on every check cycle.
       if (quarantineDir != null &&
           _isPatchAlreadyInstalled(
             patchDir: quarantineDir,
@@ -556,37 +574,109 @@ abstract final class CodePush {
       // mismatch means transport corruption or tampering. Legacy servers
       // that omit the hash skip this check (on Android the engine still
       // verifies integrity and signature at load time).
+      final downloadedHash = sha256.convert(patchBytes).toString();
       if (serverPatchHash != null && serverPatchHash.isNotEmpty) {
-        final downloadedHash = sha256.convert(patchBytes).toString();
         if (downloadedHash != serverPatchHash) {
           status.value = 'Patch failed verification';
           return false;
         }
       }
+      // The hash used for identity records and comparisons. An
+      // empty-string server hash must fall back exactly like a missing
+      // one: storing '' would let a later ''-hash offer of a DIFFERENT
+      // patch "match" by hash and deadlock upgrades.
+      final offerHash = (serverPatchHash != null && serverPatchHash.isNotEmpty)
+          ? serverPatchHash
+          : downloadedHash;
 
       status.value = 'Installing (${patchBytes.length}B)...';
       if (Platform.isIOS) {
+        final patchDir = await _getPatchDir();
         if (_moduleLoaded) {
-          status.value = 'Patch active';
-          return false; // Already loaded this session.
+          // A module is already active in this VM. If the offer is the
+          // patch already persisted on disk, there is nothing to do. If
+          // it is a DIFFERENT patch, it cannot be loaded into a VM that
+          // already holds the old module — but it must not be discarded
+          // either: a device that reloads v1 at every cold start would
+          // then never take v2 (permanent upgrade deadlock). Persist it
+          // and ask for a restart, mirroring the Android path.
+          if (debugInstalledIdentityMatches(
+            patchDir: patchDir,
+            patchId: patchId,
+            patchHash: offerHash,
+          )) {
+            // Heal the pre-download skip for installs made by older
+            // SDK versions that never wrote the identity file on iOS.
+            if (patchDir != null) {
+              _recordInstalledIdentity(
+                patchDir: patchDir,
+                patchId: patchId,
+                patchHash: offerHash,
+              );
+            }
+            status.value = 'Patch active';
+            return false;
+          }
+          // Validate BEFORE overwriting: this branch never goes through
+          // _iosLoadPayload's format guard, and it is about to replace
+          // the WORKING patch's bytes on disk. Persisting a malformed
+          // container here would destroy a good patch and strand the
+          // device on baseline at the next cold start.
+          if (debugExtractIosPayload(patchBytes) == null) {
+            status.value =
+                'Patch format is unexpected — keeping the current patch. '
+                'Upgrade flutter_compile to the latest version and '
+                'rebuild the patch.';
+            return false;
+          }
+          // Decided BEFORE the disk writes below overwrite the records:
+          // is the offer the module that is running right now? (The
+          // server may have withdrawn a pending update and reverted to
+          // the running patch — disk must converge, but a restart would
+          // change nothing, so no banner and no callback.)
+          final offerIsRunningModule = _identityMatches(
+            <String, Object?>{
+              'patch_id': _loadedPatchId,
+              'patch_hash': _loadedPatchHash,
+            },
+            patchId,
+            offerHash,
+          );
+          await _installPatchFromDart(patchBytes);
+          if (patchDir != null) {
+            _writeIosPatchInfo(patchDir, patchId, downloadedHash);
+            _recordInstalledIdentity(
+              patchDir: patchDir,
+              patchId: patchId,
+              patchHash: offerHash,
+            );
+            // The pending patch gets a fresh three-strike budget: any
+            // strikes accrued so far belong to the OLD patch, and the
+            // next boot runs the new one — charging it for its
+            // predecessor's crashes could quarantine a fix before it
+            // ever runs once.
+            _iosResetBootCounter(patchDir);
+          }
+          if (offerIsRunningModule) {
+            status.value = 'Patch active';
+            return false;
+          }
+          status.value = 'Restart to apply';
+          onUpdateReady?.call();
+          return true;
         }
         await _installPatchFromDart(patchBytes);
-        final patchDir = await _getPatchDir();
 
         // Persist patch metadata so rollback can record which patch
         // was bad.  Written before module load so it's available even
         // if the load crashes the process.
         if (patchDir != null) {
-          try {
-            final patchHash = sha256.convert(patchBytes).toString();
-            File('$patchDir/patch_info.json').writeAsStringSync(
-              jsonEncode(<String, Object?>{
-                'patch_id': patchId,
-                'patch_hash': patchHash,
-                'installed_at': DateTime.now().toIso8601String(),
-              }),
-            );
-          } catch (_) {}
+          _writeIosPatchInfo(patchDir, patchId, downloadedHash);
+          _recordInstalledIdentity(
+            patchDir: patchDir,
+            patchId: patchId,
+            patchHash: offerHash,
+          );
         }
 
         return _iosLoadPayload(
@@ -611,7 +701,7 @@ abstract final class CodePush {
           _recordInstalledIdentity(
             patchDir: patchDir,
             patchId: patchId,
-            patchHash: serverPatchHash,
+            patchHash: offerHash,
           );
         }
         status.value = 'Restart to apply';
@@ -819,12 +909,21 @@ abstract final class CodePush {
     String? patchId,
     String? patchHash,
   ) {
-    final sId = stored['patch_id']?.toString();
-    final sHash = stored['patch_hash']?.toString();
-    final idMatch = sId != null && sId == patchId;
-    final hashMatch = sHash != null && patchHash != null && sHash == patchHash;
+    // Empty strings are treated as absent on BOTH sides: '' == '' must
+    // never count as a match, or two unrelated patches whose server
+    // omits ids/hashes as '' would alias each other and an upgrade
+    // would be skipped as "already installed" forever.
+    final sId = _nonEmptyOrNull(stored['patch_id']?.toString());
+    final sHash = _nonEmptyOrNull(stored['patch_hash']?.toString());
+    final oId = _nonEmptyOrNull(patchId);
+    final oHash = _nonEmptyOrNull(patchHash);
+    final idMatch = sId != null && sId == oId;
+    final hashMatch = sHash != null && oHash != null && sHash == oHash;
     return idMatch || hashMatch;
   }
+
+  static String? _nonEmptyOrNull(String? s) =>
+      (s == null || s.isEmpty) ? null : s;
 
   /// Whether [patchId]/[patchHash] matches the locally quarantined
   /// rolled-back patch. Clears a stale marker when the server has moved
@@ -853,7 +952,7 @@ abstract final class CodePush {
 
   /// Whether the server-offered [patchId]/[patchHash] is the patch this
   /// device already installed — read from `installed_patch_identity.json`
-  /// (written on Android install, surviving the restart). Does NOT clear
+  /// (written at install on Android and iOS, surviving the restart). Does NOT clear
   /// the file on mismatch: a different offer is a genuinely new patch to
   /// install, which will overwrite the identity anyway.
   ///
@@ -876,6 +975,51 @@ abstract final class CodePush {
       // Corrupt — don't block a fresh install.
       return false;
     }
+  }
+
+  /// Whether the server-offered [patchId]/[patchHash] matches the patch
+  /// currently PERSISTED ON DISK, read from `patch_info.json` — which
+  /// may be a pending update awaiting restart, not necessarily the
+  /// running module (that is `_loadedPatchId`/`_loadedPatchHash`). Used
+  /// by the iOS upgrade check while a module is already loaded: a match
+  /// means disk already holds the offer; anything missing or unreadable
+  /// counts as NOT matching, because the safe consequence is
+  /// re-persisting identical bytes — never discarding a genuinely new
+  /// patch.
+  @visibleForTesting
+  static bool debugInstalledIdentityMatches({
+    required String? patchDir,
+    required String? patchId,
+    required String? patchHash,
+  }) {
+    if (patchDir == null) return false;
+    final f = File('$patchDir/patch_info.json');
+    if (!f.existsSync()) return false;
+    try {
+      final stored = jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
+      return _identityMatches(stored, patchId, patchHash);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Persists `patch_info.json` for the just-installed iOS patch: the
+  /// rollback paths read it to record which patch was bad, and the
+  /// upgrade check compares offers against it. Best-effort.
+  static void _writeIosPatchInfo(
+    String patchDir,
+    String? patchId,
+    String patchHash,
+  ) {
+    try {
+      File('$patchDir/patch_info.json').writeAsStringSync(
+        jsonEncode(<String, Object?>{
+          'patch_id': patchId,
+          'patch_hash': patchHash,
+          'installed_at': DateTime.now().toIso8601String(),
+        }),
+      );
+    } catch (_) {}
   }
 
   /// A stable, numeric per-install identifier for the `device_hash`
@@ -1313,6 +1457,8 @@ abstract final class CodePush {
     if (infoFile.existsSync()) infoFile.deleteSync();
     _iosResetBootCounter(patchDir);
     _moduleLoaded = false;
+    _loadedPatchId = null;
+    _loadedPatchHash = null;
     moduleResult.value = null;
   }
 
@@ -1378,8 +1524,14 @@ abstract final class CodePush {
       dir.createSync(recursive: true);
     }
 
-    final file = File('$patchDir/$_patchFilename');
-    await file.writeAsBytes(patchBytes, flush: true);
+    // Write-to-tmp then rename: a process kill mid-write must never
+    // leave a truncated container at the final path — the next boot
+    // would roll back and quarantine whatever patch `patch_info.json`
+    // currently names, which may be the GOOD running patch. The `.tmp`
+    // names are already in every cleanup sibling list.
+    final tmp = File('$patchDir/$_patchFilename.tmp');
+    await tmp.writeAsBytes(patchBytes, flush: true);
+    tmp.renameSync('$patchDir/$_patchFilename');
   }
 
   static String get _platform {
@@ -1494,6 +1646,8 @@ abstract final class CodePush {
         }
       }
       _moduleLoaded = true;
+      _loadedPatchId = patchId;
+      _loadedPatchHash = sha256.convert(container).toString();
       moduleResult.value = result;
       status.value = 'Patch active';
       // Clear any previous rollback marker — this patch works.
@@ -1565,6 +1719,12 @@ abstract final class CodePush {
 
       final container = await patchFile.readAsBytes();
       final patchId = _readInstalledPatchId(patchDir);
+
+      // Re-check after the awaits above: a resume-triggered
+      // checkAndInstall can install and load a patch while the probe /
+      // file read were in flight; a second load would throw and
+      // quarantine the wrong patch.
+      if (_moduleLoaded) return;
 
       await _iosLoadPayload(
         container: container,
@@ -1690,6 +1850,8 @@ abstract final class CodePush {
 
     // 3. Reset in-memory module state so the app runs on baseline.
     _moduleLoaded = false;
+    _loadedPatchId = null;
+    _loadedPatchHash = null;
     moduleResult.value = null;
 
     // 4. Report the failure to the server (fire-and-forget).
@@ -2212,9 +2374,8 @@ Future<_HttpResult> _httpPostJson(String url, Map<String, dynamic> body) async {
     request.contentLength = encoded.length;
     request.add(encoded);
     final response = await request.close().timeout(timeout);
-    final bytes = await response
-        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk))
-        .timeout(timeout);
+    final bytes = await response.fold<List<int>>(
+        <int>[], (prev, chunk) => prev..addAll(chunk)).timeout(timeout);
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
     client.close(force: true);
