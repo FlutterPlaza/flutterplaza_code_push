@@ -2022,13 +2022,28 @@ Future<_HttpResult> _httpGet(String url) async {
   // hang would silently disable all future update checks for the
   // process lifetime. Every await is bounded.
   final timeout = CodePush.debugHttpRequestTimeout;
+  // Offers and errors are kilobytes of JSON; cap generously so a
+  // hostile server can't OOM the app through the metadata channel
+  // either (the patch download has its own, larger cap).
+  const maxBytes = 1024 * 1024;
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
   try {
     final request = await client.getUrl(Uri.parse(url)).timeout(timeout);
     final response = await request.close().timeout(timeout);
-    final bytes = await response
-        .fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk))
-        .timeout(timeout);
+    if (response.contentLength > maxBytes) {
+      return const _HttpResult(-1, '', <int>[]);
+    }
+    final bytes = <int>[];
+    await for (final chunk in response.timeout(
+      timeout,
+      onTimeout: (sink) =>
+          sink.addError(TimeoutException('response stalled', timeout)),
+    )) {
+      bytes.addAll(chunk);
+      if (bytes.length > maxBytes) {
+        return const _HttpResult(-1, '', <int>[]);
+      }
+    }
     return _HttpResult(response.statusCode, utf8.decode(bytes), bytes);
   } finally {
     client.close(force: true);
