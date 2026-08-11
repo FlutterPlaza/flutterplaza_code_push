@@ -39,6 +39,21 @@ enum IosLoadedSessionDecision {
   persistAndRestart,
 }
 
+/// Outcome of the iOS cold-start reload gate — see
+/// [CodePush.debugDecideReloadGate].
+enum IosReloadGateDecision {
+  /// The on-disk patch may be fed to the runtime.
+  load,
+
+  /// The patch records a different engine ABI than the live probe:
+  /// loading risks a VM abort. Skip, release the strike, keep baseline.
+  skipIncompatibleAbi,
+
+  /// The on-disk bytes don't match the recorded hash: corruption, not a
+  /// bad patch. Delete WITHOUT quarantining so re-download can heal.
+  dropCorrupt,
+}
+
 /// Service for managing over-the-air code push updates.
 ///
 /// Provides both low-level methods (check, install, rollback) and a
@@ -1074,6 +1089,34 @@ abstract final class CodePush {
   /// its bytes (nothing would be written anyway), then malformed
   /// containers are rejected before they can overwrite the working
   /// patch, and only then is persist-silent vs persist-restart chosen.
+  /// Pure decision for whether the on-disk patch may be fed to the
+  /// runtime at cold-start reload. Priority: engine-ABI compatibility
+  /// first (an incompatible patch must not be loaded regardless of its
+  /// integrity), then integrity. Absent, empty, or `'unknown'` metadata
+  /// skips the corresponding check, so pre-`engine_abi` installs and
+  /// older baselines degrade to loading exactly as before.
+  @visibleForTesting
+  static IosReloadGateDecision debugDecideReloadGate({
+    required String? storedAbi,
+    required String? liveAbi,
+    required String? storedHash,
+    required String? actualHash,
+  }) {
+    final sAbi = _nonEmptyOrNull(storedAbi);
+    final sHash = _nonEmptyOrNull(storedHash);
+    if (sAbi != null &&
+        sAbi != 'unknown' &&
+        liveAbi != null &&
+        liveAbi != 'unknown' &&
+        sAbi != liveAbi) {
+      return IosReloadGateDecision.skipIncompatibleAbi;
+    }
+    if (sHash != null && actualHash != null && sHash != actualHash) {
+      return IosReloadGateDecision.dropCorrupt;
+    }
+    return IosReloadGateDecision.load;
+  }
+
   @visibleForTesting
   static IosLoadedSessionDecision debugDecideLoadedSessionOffer({
     required bool offerMatchesDisk,
@@ -1792,45 +1835,44 @@ abstract final class CodePush {
       final info = _readInstalledPatchInfo(patchDir);
       final patchId = info?['patch_id']?.toString();
 
-      // Engine-compatibility re-check: the patch records which engine
-      // ABI it was installed against. If the engine has since changed
-      // (a store update whose staleness the native mtime heuristic
-      // missed), feeding the patch to the new engine risks a VM abort
-      // that no try/catch can route to rollback. Skip the load and
-      // release the strike — the baseline keeps running and the next
-      // check fetches a compatible patch. Either side reporting
-      // 'unknown' (older baselines) skips the comparison.
-      final storedAbi = _nonEmptyOrNull(info?['engine_abi']?.toString());
-      if (storedAbi != null &&
-          storedAbi != 'unknown' &&
-          liveAbi != 'unknown' &&
-          storedAbi != liveAbi) {
-        _iosResetBootCounter(patchDir);
-        status.value = 'Installed patch was built for a different engine '
-            '($storedAbi vs $liveAbi) — waiting for a compatible update';
-        return;
-      }
-
       final container = await patchFile.readAsBytes();
-
-      // Integrity re-verify: the stored hash covers the container bytes
-      // as installed. A mismatch is on-disk corruption, NOT a bad patch
-      // — delete without quarantining (a rolled_back_patch marker would
-      // wrongly block re-downloading the same, good patch) so the next
-      // check re-downloads cleanly.
-      final storedHash = _nonEmptyOrNull(info?['patch_hash']?.toString());
-      if (storedHash != null &&
-          sha256.convert(container).toString() != storedHash) {
-        try {
-          patchFile.deleteSync();
-        } catch (_) {}
-        try {
-          File('$patchDir/patch_info.json').deleteSync();
-        } catch (_) {}
-        _iosResetBootCounter(patchDir);
-        status.value =
-            'Installed patch failed integrity check — will re-download';
-        return;
+      final gate = debugDecideReloadGate(
+        storedAbi: info?['engine_abi']?.toString(),
+        liveAbi: liveAbi,
+        storedHash: info?['patch_hash']?.toString(),
+        actualHash: sha256.convert(container).toString(),
+      );
+      switch (gate) {
+        case IosReloadGateDecision.skipIncompatibleAbi:
+          // The engine changed under the patch (a store update whose
+          // staleness the native mtime heuristic missed). Feeding it to
+          // the new engine risks a VM abort no try/catch can route to
+          // rollback. Baseline keeps running; the next check fetches a
+          // compatible patch.
+          _iosResetBootCounter(patchDir);
+          status.value = 'Installed patch was built for a different '
+              'engine — waiting for a compatible update';
+          return;
+        case IosReloadGateDecision.dropCorrupt:
+          // Corruption, NOT a bad patch — delete without quarantining
+          // (a rolled_back_patch marker would wrongly block
+          // re-downloading the same, good patch). The identity file
+          // goes too so the on-disk records stay consistent.
+          try {
+            patchFile.deleteSync();
+          } catch (_) {}
+          try {
+            File('$patchDir/patch_info.json').deleteSync();
+          } catch (_) {}
+          try {
+            File('$patchDir/installed_patch_identity.json').deleteSync();
+          } catch (_) {}
+          _iosResetBootCounter(patchDir);
+          status.value =
+              'Installed patch failed integrity check — will re-download';
+          return;
+        case IosReloadGateDecision.load:
+          break;
       }
 
       // Re-check after the awaits above: a resume-triggered

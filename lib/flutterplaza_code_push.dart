@@ -27,6 +27,7 @@ export 'src/code_push.dart'
         CodePushConfig,
         CodePushOverlay,
         CodePushPatchBuilder,
-        IosLoadedSessionDecision;
+        IosLoadedSessionDecision,
+        IosReloadGateDecision;
 export 'src/models.dart';
 export 'src/widget_renderer.dart' show CodePushWidgetArea;
