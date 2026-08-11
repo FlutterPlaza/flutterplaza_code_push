@@ -188,8 +188,7 @@ abstract final class CodePush {
   /// trip (device offline at boot) so a later re-init retries. One
   /// delivered report per process is exactly sufficient — an engine
   /// ABI cannot change within a running process.
-  @visibleForTesting
-  static Future<void> debugReportIncompatibleReload({
+  static Future<void> _reportIncompatibleReload({
     required String serverUrl,
     required String appId,
     required String? patchId,
@@ -210,6 +209,25 @@ abstract final class CodePush {
     );
     if (!delivered) _reportedIncompatibleReload = false;
   }
+
+  /// Test-only wrapper over [_reportIncompatibleReload] — the
+  /// production trigger is the private method (reload path); this seam
+  /// exists so the payload and latch semantics are assertable on host.
+  @visibleForTesting
+  static Future<void> debugReportIncompatibleReload({
+    required String serverUrl,
+    required String appId,
+    required String? patchId,
+    required String? storedAbi,
+    required String? liveAbi,
+  }) =>
+      _reportIncompatibleReload(
+        serverUrl: serverUrl,
+        appId: appId,
+        patchId: patchId,
+        storedAbi: storedAbi,
+        liveAbi: liveAbi,
+      );
 
   /// Test-only: clears the incompatible-reload latch.
   @visibleForTesting
@@ -1913,7 +1931,7 @@ abstract final class CodePush {
           // never waits on telemetry; delivery/latch semantics live in
           // the helper.
           unawaited(
-            debugReportIncompatibleReload(
+            _reportIncompatibleReload(
               serverUrl: serverUrl,
               appId: appId,
               patchId: patchId,
