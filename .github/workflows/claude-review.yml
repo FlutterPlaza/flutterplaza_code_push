@@ -7,8 +7,13 @@ on:
 jobs:
   claude-review:
     # Repo secrets are not available to PRs from forks; skip them.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # Drafts are skipped too — review runs when the PR is ready.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     permissions:
       contents: read
       pull-requests: write
