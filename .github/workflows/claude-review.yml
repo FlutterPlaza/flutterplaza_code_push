@@ -41,7 +41,7 @@ jobs:
           elif [ "$CHANGED" -le 1200 ] && [ "$SENSITIVE" -eq 0 ]; then
             MODEL=claude-sonnet-5
           else
-            MODEL=claude-opus-4-8
+            MODEL=claude-opus-5
           fi
           echo "model=$MODEL" >> "$GITHUB_OUTPUT"
           echo "changed=$CHANGED sensitive=$SENSITIVE model=$MODEL"
