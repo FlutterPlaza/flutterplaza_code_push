@@ -1,17 +1,38 @@
 # flutterplaza_code_push
 
-Over-the-air code push updates for Flutter apps. Push updates to your users
-without going through the app store review process.
+Over-the-air code push updates for Flutter apps. Ship Dart fixes to your
+existing features between store releases, with signed patches and automatic
+crash recovery.
 
 This package provides the **runtime SDK** that you add to your Flutter app.
 It communicates with a code-push-enabled Flutter engine (installed via the
 `fcp` CLI) to check for updates, download patches, apply them, and
 automatically roll back if something goes wrong.
 
+## Before you ship
+
+Code push updates your app's Dart code at runtime through a
+virtual-machine-based update mechanism. Your app's native code, resources,
+and permissions are never modified -- the app itself is only ever updated
+through the store.
+
+Store policies govern this kind of mechanism, and you are the developer of
+record for your app. Review [Google Play's Device and Network Abuse
+policy](https://support.google.com/googleplay/android-developer/answer/9888379)
+and [App Store Review Guideline
+3.3.2](https://developer.apple.com/app-store/review/guidelines/), and make
+your own distribution decision. Distribution channels outside the app stores
+(enterprise/MDM, alternative stores, direct APK) carry no such restriction.
+
+If you want over-the-air updates disabled specifically for Play Store
+installs, set `disableOnPlayStoreInstalls: true` when initializing the SDK
+-- the app then updates only through the store on Play-installed devices,
+while other channels keep code push.
+
 ## Features
 
 - **Automatic update checking** -- checks on launch, periodically, and on app resume
-- **Live patching (iOS)** -- bytecode modules load without restarting the app
+- **Live patching (iOS)** -- bytecode data modules load without restarting the app
 - **Restart-based patching (Android/Desktop)** -- ELF patches applied on next cold restart
 - **Crash protection with auto-rollback** -- reverts bad patches after repeated failed boots
 - **RSA signature verification** -- optional cryptographic signing for patch integrity
@@ -265,6 +286,7 @@ Configuration object for `CodePushOverlay`.
 | `releaseVersion` | `String` | required | The current release version (e.g. `1.0.0+1`) |
 | `checkInterval` | `Duration` | 4 hours | How often to check for updates |
 | `channel` | `String` | `production` | The update channel |
+| `disableOnPlayStoreInstalls` | `bool` | `false` | When true, over-the-air updates are disabled on devices where the app was installed from the Play Store; other install channels keep code push. |
 
 ### `CodePushPatchBuilder`
 
