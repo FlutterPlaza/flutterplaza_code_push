@@ -19,7 +19,10 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to a full commit SHA: this job holds pull-requests:write
+      # and the review token, and a mutable tag the upstream owner can
+      # repoint is a supply-chain hole in a privileged job (issue #26).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
 
@@ -46,7 +49,11 @@ jobs:
           echo "model=$MODEL" >> "$GITHUB_OUTPUT"
           echo "changed=$CHANGED sensitive=$SENSITIVE model=$MODEL"
 
-      - uses: anthropics/claude-code-action@v1
+      # Pinned to what v1 resolved to at pin time (a pure pin for this
+      # repo, not an upgrade). NOTE: code-push-admin/-website pinned an
+      # earlier v1 SHA (d40ddef4c030); aligning all repos is a separate,
+      # deliberate bump.
+      - uses: anthropics/claude-code-action@5ee796a55f92566ecd7e39d70dd613abcbea0d7c # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
@@ -81,13 +88,15 @@ jobs:
 
             ## 🔴 Critical
             Bugs, crashes, security issues, breaking changes — anything that
-            must be fixed before merging. Only Critical findings block the
+            must be fixed before merging. Critical findings always block the
             merge. Write "None" if there are none.
 
             ## 🟠 Medium
-            Issues that should be addressed but don't block the merge
-            (missing edge-case handling, missing tests). The team may table
-            these as tracked follow-ups. Write "None" if there are none.
+            Real defects or risks that are not immediately breaking. Up to two
+            open Mediums may merge, provided each unfixed one is filed as its
+            own issue labelled `deferred-medium` first; three or more block
+            until fixed or refuted down to two. Write "None" if there are
+            none.
 
             ## 🟡 Low
             Minor improvements and suggestions. Write "None" if there are none.
