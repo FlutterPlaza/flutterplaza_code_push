@@ -6,7 +6,11 @@ void main() {
 
   // Wrap your app with CodePushOverlay for automatic OTA updates.
   // It checks for patches on startup, periodically, and on app resume.
-  // When a patch is downloaded, a banner prompts the user to restart.
+  // On Android/desktop a downloaded patch shows a restart banner; on iOS
+  // the first patch is applied live (no banner) and the banner appears
+  // only when a different patch arrives while one is already loaded.
+  // The overlay runs its own check cycle, so the manual button below can
+  // race it (see _manualCheck).
   runApp(
     CodePushOverlay(
       config: CodePushConfig(
@@ -71,7 +75,11 @@ class _CodePushDemoState extends State<CodePushDemo> {
         },
       );
       if (!installed) {
-        setState(() => _status = 'No update available.');
+        // `false` does NOT necessarily mean "no update" — it also means
+        // "another check is already running" (the overlay's own cycle wins
+        // the single-flight guard). Don't report it as "no update".
+        setState(() => _status = 'No new patch installed '
+            '(no update, or a check is already in progress).');
       }
       await _loadStatus();
     } on CodePushException catch (e) {

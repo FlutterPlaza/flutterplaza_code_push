@@ -1586,11 +1586,13 @@ abstract final class CodePush {
   /// Checks the engine for available updates (delegates to Dart side HTTP).
   ///
   /// Throws [CodePushException] on any failure — including on engines
-  /// without code push, where the underlying channel is missing. For a
-  /// failure-soft way to learn when a patch is ready, pass
-  /// `onUpdateReady:` to [init] or [checkAndInstall] instead — note
-  /// that those download and install the patch before the callback
-  /// fires, unlike this check-only call.
+  /// without code push, where the underlying channel is missing. To test
+  /// for that case without throwing, use [hasCodePushEngine] (2s timeout,
+  /// returns `false` rather than throwing) — e.g. to hide update UI on a
+  /// baseline that wasn't built for code push. For a failure-soft way to
+  /// learn when a patch is ready, pass `onUpdateReady:` to [init] or
+  /// [checkAndInstall] instead — note that those download and install the
+  /// patch before the callback fires, unlike this check-only call.
   static Future<UpdateInfo> checkForUpdate() async {
     try {
       final Map<String, dynamic>? result = await _channel
@@ -2378,6 +2380,17 @@ class CodePushConfig {
 ///   ),
 /// );
 /// ```
+///
+/// The overlay calls [CodePush.init] itself in its `initState`. It cancels
+/// an earlier `init`'s periodic timer and takes over the check cycle, but
+/// that earlier `init`'s first check may already be in flight and can still
+/// fire its `onUpdateReady:` once — the two race through a single-flight
+/// guard, so whichever starts first usually wins. **Don't combine
+/// `CodePush.init(onUpdateReady: …)` in `main()` with [CodePushOverlay].**
+/// It's fine to call `CodePush.init(...)` in `main()` *without* an
+/// `onUpdateReady:` (the overlay reuses that config via [CodePush.lastConfig]);
+/// to own the update lifecycle instead, drive [CodePush.init] /
+/// [CodePush.checkAndInstall] directly rather than using this widget.
 class CodePushOverlay extends StatefulWidget {
   const CodePushOverlay({
     super.key,
@@ -2393,7 +2406,9 @@ class CodePushOverlay extends StatefulWidget {
   /// to [CodePush.lastConfig] — the config stored by the most recent
   /// call to [CodePush.init]. This lets apps configure the SDK once in
   /// `main()` and then just write `CodePushOverlay(child: ...)`
-  /// without repeating every field.
+  /// without repeating every field. Configure only (no `onUpdateReady:`)
+  /// when doing this — see the class doc: passing `onUpdateReady:` to a
+  /// `main()`-level `init` alongside the overlay races the two check cycles.
   ///
   /// Passing a non-null [config] here always wins, for cases where the
   /// overlay needs different settings from whatever `init` was called
@@ -2410,15 +2425,25 @@ class CodePushOverlay extends StatefulWidget {
   /// admit a null return.
   ///
   /// To show no banner at all, return `const SizedBox.shrink()`. The
-  /// builder call is itself the "patch ready" signal — it runs only
-  /// once a patch is installed and awaiting restart — but it runs
-  /// during `build` and may be called many times (parent rebuilds,
-  /// media-query changes such as keyboard show/hide or rotation), so
-  /// it must return a widget and must not perform side effects from
+  /// builder call is the "patch ready" signal — it runs once a patch is
+  /// installed and awaiting restart. Note this is the Android/desktop
+  /// path: on iOS a freshly downloaded patch is loaded into the running
+  /// VM and applied without a restart, so the builder is NOT invoked for
+  /// it; on iOS the banner appears only when a different patch arrives
+  /// while one is already loaded (which cannot hot-swap and so waits for
+  /// a restart). If you need a first-patch signal on iOS, listen to
+  /// [CodePush.status] / [CodePush.isPatched] rather than relying on the
+  /// builder.
+  ///
+  /// The builder runs during `build` and may be called many times (parent
+  /// rebuilds, media-query changes such as keyboard show/hide or rotation),
+  /// so it must return a widget and must not perform side effects from
   /// inside the builder. Calling the handed `onDismiss` there does
   /// nothing useful — the overlay is already building, so the banner
   /// still renders this frame and lingers until the next rebuild;
-  /// `showDialog` and navigation throw. To drive your own UI, return
+  /// `showDialog` and navigation throw. Calling `onDismiss` from a user
+  /// action (a button in your returned widget) DOES hide the banner slot
+  /// until the next new patch becomes ready. To drive your own UI, return
   /// your own widget and do the work in its `initState` (or defer with
   /// `WidgetsBinding.instance.addPostFrameCallback`), wiring the handed
   /// `onRestart` / `onDismiss` to your own UI's actions (note `onRestart`
@@ -2430,18 +2455,9 @@ class CodePushOverlay extends StatefulWidget {
   /// app's `MaterialApp` (or a context from inside the app), not the
   /// builder's context.
   ///
-  /// Note that [CodePushOverlay] calls [CodePush.init] itself in its
-  /// `initState`; it cancels an earlier `init`'s periodic timer and takes
-  /// over the check cycle, but that earlier `init`'s first check may
-  /// already be in flight and can still fire its `onUpdateReady:` once —
-  /// the two race through a single-flight guard, so whichever starts first
-  /// usually wins and is the only one that fires. Don't combine
-  /// `CodePush.init(onUpdateReady: …)` in `main()` with [CodePushOverlay];
-  /// to own the update lifecycle, drive [CodePush.init] /
-  /// [CodePush.checkAndInstall] directly instead of using this widget.
-  ///
-  /// Calling the provided `onDismiss` hides the banner slot until the
-  /// next new patch becomes ready.
+  /// [CodePushOverlay]'s class doc covers the `init`-in-`main()` race —
+  /// don't combine `CodePush.init(onUpdateReady: …)` in `main()` with the
+  /// overlay.
   final Widget Function(
     BuildContext context,
     VoidCallback onRestart,

@@ -281,12 +281,20 @@ CodePushOverlay(
 )
 ```
 
+The builder is the "patch ready" signal on the **Android/desktop** path. On
+**iOS** a freshly downloaded patch is applied to the running VM without a
+restart, so the builder is not invoked for it — on iOS the banner appears only
+when a different patch arrives while one is already loaded. For a first-patch
+signal on iOS, listen to `CodePush.status` / `CodePush.isPatched`.
+
 The builder runs during `build` and may run many times, so keep side effects
 out of it: calling `onDismiss` from inside the builder does nothing useful (the
-banner lingers until the next rebuild), and `showDialog`/navigation throw. When
-the overlay wraps your `MaterialApp` (as above), the builder's context has no
-`Navigator`/`Overlay` ancestor — drive dialogs and routes from a `navigatorKey`
-on your `MaterialApp` (or a context inside the app), not the builder's context.
+banner lingers until the next rebuild), and `showDialog`/navigation throw
+(calling `onDismiss` from a user action in your returned widget does hide the
+banner). When the overlay wraps your `MaterialApp` (as above), the builder's
+context has no `Navigator`/`Overlay` ancestor — drive dialogs and routes from a
+`navigatorKey` on your `MaterialApp` (or a context inside the app), not the
+builder's context.
 
 Note: `CodePushOverlay` calls `CodePush.init` itself in its `initState`. It
 cancels an earlier `init`'s periodic timer and takes over the check cycle, but
