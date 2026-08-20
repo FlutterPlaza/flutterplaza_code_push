@@ -2420,20 +2420,25 @@ class CodePushOverlay extends StatefulWidget {
   /// still renders this frame and lingers until the next rebuild;
   /// `showDialog` and navigation throw. To drive your own UI, return
   /// your own widget and do the work in its `initState` (or defer with
-  /// `WidgetsBinding.instance.addPostFrameCallback`), calling the
-  /// handed `onRestart` / `onDismiss` from there.
+  /// `WidgetsBinding.instance.addPostFrameCallback`), wiring the handed
+  /// `onRestart` / `onDismiss` to your own UI's actions (note `onRestart`
+  /// hard-restarts the process, so gate it behind a user action).
   ///
-  /// [CodePushOverlay] sits ABOVE your `MaterialApp`, so the builder's
-  /// `BuildContext` has no `Navigator`/`Overlay` ancestor: showing a
-  /// dialog or pushing a route needs a `navigatorKey` on your app's
-  /// `MaterialApp` (or a context from inside the app), not the
+  /// When the overlay wraps your `MaterialApp` (as in the examples), the
+  /// builder's `BuildContext` has no `Navigator`/`Overlay` ancestor:
+  /// showing a dialog or pushing a route needs a `navigatorKey` on your
+  /// app's `MaterialApp` (or a context from inside the app), not the
   /// builder's context.
   ///
   /// Note that [CodePushOverlay] calls [CodePush.init] itself in its
-  /// `initState`, superseding any earlier `init` (including its
-  /// `onUpdateReady:` callback); apps that want to own the update
-  /// lifecycle should drive [CodePush.init] / [CodePush.checkAndInstall]
-  /// directly instead of using this widget.
+  /// `initState`; it cancels an earlier `init`'s periodic timer and takes
+  /// over the check cycle, but that earlier `init`'s first check may
+  /// already be in flight and can still fire its `onUpdateReady:` once —
+  /// the two race through a single-flight guard, so whichever starts first
+  /// usually wins and is the only one that fires. Don't combine
+  /// `CodePush.init(onUpdateReady: …)` in `main()` with [CodePushOverlay];
+  /// to own the update lifecycle, drive [CodePush.init] /
+  /// [CodePush.checkAndInstall] directly instead of using this widget.
   ///
   /// Calling the provided `onDismiss` hides the banner slot until the
   /// next new patch becomes ready.

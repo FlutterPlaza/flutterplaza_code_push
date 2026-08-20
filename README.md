@@ -273,8 +273,9 @@ CodePushOverlay(
     // return const SizedBox.shrink() to show nothing. The builder call
     // itself is the "patch ready" signal, but it runs during build and
     // may run many times — no side effects here. To drive your own UI,
-    // return your own widget and call the handed onRestart/onDismiss
-    // from its initState or a post-frame callback.
+    // return your own widget and wire the handed onRestart/onDismiss to
+    // your UI's actions from its initState or a post-frame callback
+    // (onRestart hard-restarts the process, so gate it behind a user tap).
     return MyCustomBanner(onRestart: onRestart, onDismiss: onDismiss);
   },
 )
@@ -282,15 +283,19 @@ CodePushOverlay(
 
 The builder runs during `build` and may run many times, so keep side effects
 out of it: calling `onDismiss` from inside the builder does nothing useful (the
-banner lingers until the next rebuild), and `showDialog`/navigation throw. The
-overlay also sits above your `MaterialApp`, so the builder's context has no
-`Navigator`/`Overlay` — drive dialogs and routes from a `navigatorKey` on your
-`MaterialApp` (or a context inside the app), not the builder's context.
+banner lingers until the next rebuild), and `showDialog`/navigation throw. When
+the overlay wraps your `MaterialApp` (as above), the builder's context has no
+`Navigator`/`Overlay` ancestor — drive dialogs and routes from a `navigatorKey`
+on your `MaterialApp` (or a context inside the app), not the builder's context.
 
-Note: `CodePushOverlay` calls `CodePush.init` itself in its `initState`,
-superseding any earlier `init` (including its `onUpdateReady:` callback).
-Apps that want to own the update lifecycle should call `CodePush.init` /
-`CodePush.checkAndInstall` directly instead of using the overlay.
+Note: `CodePushOverlay` calls `CodePush.init` itself in its `initState`. It
+cancels an earlier `init`'s periodic timer and takes over the check cycle, but
+that earlier `init`'s first check may already be in flight and can still fire
+its `onUpdateReady:` once — the two race through a single-flight guard, so
+whichever starts first usually wins. Don't combine
+`CodePush.init(onUpdateReady: …)` in `main()` with `CodePushOverlay`; to own the
+update lifecycle, call `CodePush.init` / `CodePush.checkAndInstall` directly
+instead of using the overlay.
 
 ### `CodePushConfig`
 
