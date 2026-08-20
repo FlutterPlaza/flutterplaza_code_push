@@ -280,6 +280,13 @@ CodePushOverlay(
 )
 ```
 
+The builder runs during `build` and may run many times, so keep side effects
+out of it: calling `onDismiss` from inside the builder does nothing useful (the
+banner lingers until the next rebuild), and `showDialog`/navigation throw. The
+overlay also sits above your `MaterialApp`, so the builder's context has no
+`Navigator`/`Overlay` — drive dialogs and routes from a `navigatorKey` on your
+`MaterialApp` (or a context inside the app), not the builder's context.
+
 Note: `CodePushOverlay` calls `CodePush.init` itself in its `initState`,
 superseding any earlier `init` (including its `onUpdateReady:` callback).
 Apps that want to own the update lifecycle should call `CodePush.init` /
