@@ -2402,9 +2402,11 @@ class CodePushOverlay extends StatefulWidget {
   /// provided, the builder must return a widget — the type does not
   /// admit a null return. To show no banner at all, return
   /// `const SizedBox.shrink()` and drive your own update UI instead
-  /// (for example from [CodePush.checkForUpdate] or by listening to
-  /// [CodePush.status]); calling the provided `onDismiss` hides the
-  /// banner slot until the next ready update.
+  /// by listening to [CodePush.status], as the overlay itself does
+  /// (it is failure-soft on engines without code push, unlike
+  /// [CodePush.checkForUpdate], which throws there); calling the
+  /// provided `onDismiss` hides the banner slot until the next new
+  /// patch becomes ready.
   final Widget Function(
     BuildContext context,
     VoidCallback onRestart,

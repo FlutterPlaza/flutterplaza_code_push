@@ -269,7 +269,9 @@ CodePushOverlay(
   child: MyApp(),
   showDebugBar: false,       // optional, shows status bar at top
   bannerBuilder: (context, onRestart, onDismiss) {
-    // optional, return a custom banner widget
+    // optional, return a custom banner widget — must return a widget;
+    // return const SizedBox.shrink() to show nothing and drive your
+    // own update UI instead
     return MyCustomBanner(onRestart: onRestart, onDismiss: onDismiss);
   },
 )
