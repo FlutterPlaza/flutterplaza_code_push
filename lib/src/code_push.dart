@@ -2410,10 +2410,16 @@ class CodePushOverlay extends StatefulWidget {
   /// admit a null return.
   ///
   /// To show no banner at all, return `const SizedBox.shrink()`. The
-  /// builder is itself the "patch ready" signal — it is only invoked
-  /// once a patch is installed and awaiting restart — so drive your
-  /// own UI from there, using the `onRestart` and `onDismiss`
-  /// callbacks you are handed.
+  /// builder call is itself the "patch ready" signal — it runs only
+  /// once a patch is installed and awaiting restart — but it runs
+  /// during `build` and may be called many times (parent rebuilds,
+  /// media-query changes such as keyboard show/hide or rotation), so
+  /// it must return a widget and must not perform side effects:
+  /// calling `onDismiss` synchronously, `showDialog`, or navigation
+  /// from inside the builder throws. To drive your own UI, return
+  /// your own widget and do the work in its `initState` (or defer
+  /// with `WidgetsBinding.instance.addPostFrameCallback`), calling
+  /// the handed `onRestart` / `onDismiss` from there.
   ///
   /// Note that [CodePushOverlay] calls [CodePush.init] itself in its
   /// `initState`, superseding any earlier `init` (including its

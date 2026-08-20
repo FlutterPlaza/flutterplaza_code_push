@@ -271,12 +271,19 @@ CodePushOverlay(
   bannerBuilder: (context, onRestart, onDismiss) {
     // optional, return a custom banner widget — must return a widget;
     // return const SizedBox.shrink() to show nothing. The builder call
-    // itself is the "patch ready" signal: drive your own UI from here
-    // with the onRestart/onDismiss callbacks you are handed.
+    // itself is the "patch ready" signal, but it runs during build and
+    // may run many times — no side effects here. To drive your own UI,
+    // return your own widget and call the handed onRestart/onDismiss
+    // from its initState or a post-frame callback.
     return MyCustomBanner(onRestart: onRestart, onDismiss: onDismiss);
   },
 )
 ```
+
+Note: `CodePushOverlay` calls `CodePush.init` itself in its `initState`,
+superseding any earlier `init` (including its `onUpdateReady:` callback).
+Apps that want to own the update lifecycle should call `CodePush.init` /
+`CodePush.checkAndInstall` directly instead of using the overlay.
 
 ### `CodePushConfig`
 
