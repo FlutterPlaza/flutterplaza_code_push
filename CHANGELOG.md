@@ -1,3 +1,7 @@
+## Unreleased
+
+- Documentation: `CodePushOverlay.bannerBuilder` no longer instructs returning `null` (which its type never accepted). To show no banner, return `const SizedBox.shrink()` and drive your own update UI.
+
 ## 0.1.11
 
 - Adds Android support: patches download, verify, and apply on the next app restart.

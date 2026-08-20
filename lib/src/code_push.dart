@@ -2396,8 +2396,15 @@ class CodePushOverlay extends StatefulWidget {
   /// The app widget.
   final Widget child;
 
-  /// Optional custom banner builder. If null, uses the default banner.
-  /// Return `null` to hide the banner.
+  /// Optional custom builder for the "update ready" banner.
+  ///
+  /// When [bannerBuilder] is null, the default banner is shown. When
+  /// provided, the builder must return a widget — the type does not
+  /// admit a null return. To show no banner at all, return
+  /// `const SizedBox.shrink()` and drive your own update UI instead
+  /// (for example from [CodePush.checkForUpdate] or by listening to
+  /// [CodePush.status]); calling the provided `onDismiss` hides the
+  /// banner slot until the next ready update.
   final Widget Function(
     BuildContext context,
     VoidCallback onRestart,
