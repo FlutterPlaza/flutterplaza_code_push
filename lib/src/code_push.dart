@@ -1588,7 +1588,9 @@ abstract final class CodePush {
   /// Throws [CodePushException] on any failure — including on engines
   /// without code push, where the underlying channel is missing. For a
   /// failure-soft way to learn when a patch is ready, pass
-  /// `onUpdateReady:` to [init] or [checkAndInstall] instead.
+  /// `onUpdateReady:` to [init] or [checkAndInstall] instead — note
+  /// that those download and install the patch before the callback
+  /// fires, unlike this check-only call.
   static Future<UpdateInfo> checkForUpdate() async {
     try {
       final Map<String, dynamic>? result = await _channel
@@ -2407,11 +2409,17 @@ class CodePushOverlay extends StatefulWidget {
   /// provided, the builder must return a widget — the type does not
   /// admit a null return.
   ///
-  /// To show no banner at all, return `const SizedBox.shrink()` and
-  /// drive your own update UI instead: pass `onUpdateReady:` to
-  /// [CodePush.init] (or [CodePush.checkAndInstall]) to learn when a
-  /// patch is ready, exactly as this overlay does. Both entry points
-  /// are failure-soft on engines without code push.
+  /// To show no banner at all, return `const SizedBox.shrink()`. The
+  /// builder is itself the "patch ready" signal — it is only invoked
+  /// once a patch is installed and awaiting restart — so drive your
+  /// own UI from there, using the `onRestart` and `onDismiss`
+  /// callbacks you are handed.
+  ///
+  /// Note that [CodePushOverlay] calls [CodePush.init] itself in its
+  /// `initState`, superseding any earlier `init` (including its
+  /// `onUpdateReady:` callback); apps that want to own the update
+  /// lifecycle should drive [CodePush.init] / [CodePush.checkAndInstall]
+  /// directly instead of using this widget.
   ///
   /// Calling the provided `onDismiss` hides the banner slot until the
   /// next new patch becomes ready.

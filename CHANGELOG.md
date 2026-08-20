@@ -1,6 +1,6 @@
 ## Unreleased
 
-- Documentation: `CodePushOverlay.bannerBuilder` no longer instructs returning `null` (which its type never accepted). To show no banner, return `const SizedBox.shrink()` and drive your own update UI with `onUpdateReady:` on `CodePush.init` or `CodePush.checkAndInstall`.
+- Documentation: `CodePushOverlay.bannerBuilder` no longer instructs returning `null` (which its type never accepted). To show no banner, return `const SizedBox.shrink()` — the builder call itself is the "patch ready" signal, so drive your own UI from there with the `onRestart`/`onDismiss` callbacks. Also documented: the overlay calls `CodePush.init` itself, superseding any earlier `init`; apps that want to own the update lifecycle should use `CodePush.init`/`checkAndInstall` directly instead of the overlay.
 
 ## 0.1.11
 

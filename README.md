@@ -270,8 +270,9 @@ CodePushOverlay(
   showDebugBar: false,       // optional, shows status bar at top
   bannerBuilder: (context, onRestart, onDismiss) {
     // optional, return a custom banner widget — must return a widget;
-    // return const SizedBox.shrink() to show nothing and drive your
-    // own update UI instead (use onUpdateReady: on CodePush.init)
+    // return const SizedBox.shrink() to show nothing. The builder call
+    // itself is the "patch ready" signal: drive your own UI from here
+    // with the onRestart/onDismiss callbacks you are handed.
     return MyCustomBanner(onRestart: onRestart, onDismiss: onDismiss);
   },
 )
