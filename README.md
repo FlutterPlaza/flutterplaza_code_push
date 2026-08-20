@@ -271,7 +271,7 @@ CodePushOverlay(
   bannerBuilder: (context, onRestart, onDismiss) {
     // optional, return a custom banner widget — must return a widget;
     // return const SizedBox.shrink() to show nothing and drive your
-    // own update UI instead
+    // own update UI instead (use onUpdateReady: on CodePush.init)
     return MyCustomBanner(onRestart: onRestart, onDismiss: onDismiss);
   },
 )

@@ -1,6 +1,6 @@
 ## Unreleased
 
-- Documentation: `CodePushOverlay.bannerBuilder` no longer instructs returning `null` (which its type never accepted). To show no banner, return `const SizedBox.shrink()` and drive your own update UI.
+- Documentation: `CodePushOverlay.bannerBuilder` no longer instructs returning `null` (which its type never accepted). To show no banner, return `const SizedBox.shrink()` and drive your own update UI with `onUpdateReady:` on `CodePush.init` or `CodePush.checkAndInstall`.
 
 ## 0.1.11
 

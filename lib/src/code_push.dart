@@ -1584,6 +1584,11 @@ abstract final class CodePush {
   // ── Low-level engine API ────────────────────────────────────────
 
   /// Checks the engine for available updates (delegates to Dart side HTTP).
+  ///
+  /// Throws [CodePushException] on any failure — including on engines
+  /// without code push, where the underlying channel is missing. For a
+  /// failure-soft way to learn when a patch is ready, pass
+  /// `onUpdateReady:` to [init] or [checkAndInstall] instead.
   static Future<UpdateInfo> checkForUpdate() async {
     try {
       final Map<String, dynamic>? result = await _channel
@@ -2400,13 +2405,16 @@ class CodePushOverlay extends StatefulWidget {
   ///
   /// When [bannerBuilder] is null, the default banner is shown. When
   /// provided, the builder must return a widget — the type does not
-  /// admit a null return. To show no banner at all, return
-  /// `const SizedBox.shrink()` and drive your own update UI instead
-  /// by listening to [CodePush.status], as the overlay itself does
-  /// (it is failure-soft on engines without code push, unlike
-  /// [CodePush.checkForUpdate], which throws there); calling the
-  /// provided `onDismiss` hides the banner slot until the next new
-  /// patch becomes ready.
+  /// admit a null return.
+  ///
+  /// To show no banner at all, return `const SizedBox.shrink()` and
+  /// drive your own update UI instead: pass `onUpdateReady:` to
+  /// [CodePush.init] (or [CodePush.checkAndInstall]) to learn when a
+  /// patch is ready, exactly as this overlay does. Both entry points
+  /// are failure-soft on engines without code push.
+  ///
+  /// Calling the provided `onDismiss` hides the banner slot until the
+  /// next new patch becomes ready.
   final Widget Function(
     BuildContext context,
     VoidCallback onRestart,
