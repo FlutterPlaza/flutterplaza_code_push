@@ -158,7 +158,13 @@ abstract final class CodePush {
     return payload;
   }
 
-  /// Debug status notifier — shows what code push is doing.
+  /// Status notifier — the current code-push state as a short string.
+  ///
+  /// Mostly a diagnostic channel, but the value `'Patch active'` is a STABLE,
+  /// app-facing signal you may key on: it means a patch is loaded and running.
+  /// This is the reliable first-patch check on iOS, where [isPatched] reads
+  /// `false` (the engine channel is disabled there) — listen to this notifier
+  /// and compare `status.value == 'Patch active'`. The overlay keys on it too.
   static final ValueNotifier<String> status = ValueNotifier('init');
 
   /// The result from the last loaded module.
@@ -2434,10 +2440,13 @@ class CodePushOverlay extends StatefulWidget {
   /// while one is already loaded (which cannot hot-swap and so waits for a
   /// restart), or when a resident patch is re-offered after a rollback
   /// reverted the app-facing content. If you need a first-patch signal on
-  /// iOS, listen to [CodePush.moduleResult] (or check
-  /// `CodePush.status.value == 'Patch active'`) rather than
-  /// [CodePush.isPatched], which on iOS always reads `false` (the engine
-  /// channel is disabled there) and is a `Future`, not a listenable.
+  /// iOS, listen to [CodePush.status] and check for `'Patch active'` (a
+  /// stable app-facing value the overlay keys on too). [CodePush.moduleResult]
+  /// carries the module's return value for content-driven UI, but it stays
+  /// `null` for a payload that loaded with no entry point, so it is not a
+  /// complete first-patch signal on its own. Don't use [CodePush.isPatched] —
+  /// on iOS it always reads `false` (the engine channel is disabled there) and
+  /// is a `Future`, not a listenable.
   ///
   /// The builder runs during `build` and may be called many times (parent
   /// rebuilds, media-query changes such as keyboard show/hide or rotation),
@@ -2460,8 +2469,8 @@ class CodePushOverlay extends StatefulWidget {
   /// builder's context.
   ///
   /// [CodePushOverlay]'s class doc covers the `init`-in-`main()` race —
-  /// don't combine `CodePush.init(onUpdateReady: …)` in `main()` with the
-  /// overlay.
+  /// don't call `CodePush.init` in `main()` (even without `onUpdateReady:`)
+  /// alongside the overlay; pass `config:` to the overlay instead.
   final Widget Function(
     BuildContext context,
     VoidCallback onRestart,

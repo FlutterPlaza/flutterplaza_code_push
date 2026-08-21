@@ -144,9 +144,13 @@ class _CodePushDemoState extends State<CodePushDemo> {
           ),
           const SizedBox(height: 8),
 
-          // Rollback (only enabled when patched).
+          // Rollback is always available — it is failure-soft (_rollback
+          // surfaces "No active patch to roll back" when there's nothing to
+          // undo). Do NOT gate on _isPatched: that reads false on iOS even
+          // while a patch is active, which would wrongly disable rollback on
+          // iOS, where it works (Dart-side file removal).
           OutlinedButton(
-            onPressed: _isPatched ? _rollback : null,
+            onPressed: _rollback,
             child: const Text('Rollback'),
           ),
 

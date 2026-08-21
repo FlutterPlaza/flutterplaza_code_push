@@ -80,8 +80,10 @@ void main() {
 ```
 
 That is the only change needed. The overlay checks for updates on launch, every
-4 hours (configurable), and whenever the app returns from the background. When a
-patch is downloaded and installed, a banner appears prompting the user to restart.
+4 hours (configurable), and whenever the app returns from the background. On
+Android/desktop, when a patch is downloaded and installed a banner appears
+prompting the user to restart. On iOS the first patch applies live without a
+restart (no banner) — see the `CodePushOverlay` reference below.
 
 ### Enable the debug status bar
 
