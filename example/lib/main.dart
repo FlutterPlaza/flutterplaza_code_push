@@ -115,7 +115,12 @@ class _CodePushDemoState extends State<CodePushDemo> {
                   Text('Status',
                       style: Theme.of(context).textTheme.titleMedium),
                   const SizedBox(height: 8),
-                  Text('Patched: $_isPatched'),
+                  // NOTE: isPatched / currentPatch read the engine channel,
+                  // which is disabled on iOS — they show false/null there even
+                  // while a patch is active. On iOS use CodePush.moduleResult /
+                  // CodePush.status (see the CodePushPatchBuilder below) as the
+                  // active-patch signal.
+                  Text('Patched (Android/desktop): $_isPatched'),
                   if (_currentPatch != null) ...[
                     Text('Active patch: ${_currentPatch!.version}'),
                     Text('Installed: ${_currentPatch!.installedAt}'),

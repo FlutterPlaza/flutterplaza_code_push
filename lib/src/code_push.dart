@@ -2381,16 +2381,16 @@ class CodePushConfig {
 /// );
 /// ```
 ///
-/// The overlay calls [CodePush.init] itself in its `initState`. It cancels
-/// an earlier `init`'s periodic timer and takes over the check cycle, but
-/// that earlier `init`'s first check may already be in flight and can still
-/// fire its `onUpdateReady:` once — the two race through a single-flight
-/// guard, so whichever starts first usually wins. **Don't combine
-/// `CodePush.init(onUpdateReady: …)` in `main()` with [CodePushOverlay].**
-/// It's fine to call `CodePush.init(...)` in `main()` *without* an
-/// `onUpdateReady:` (the overlay reuses that config via [CodePush.lastConfig]);
-/// to own the update lifecycle instead, drive [CodePush.init] /
-/// [CodePush.checkAndInstall] directly rather than using this widget.
+/// The overlay calls [CodePush.init] itself in its `initState`. Calling
+/// `CodePush.init(...)` in `main()` as well — **even WITHOUT an
+/// `onUpdateReady:`** — starts a second check cycle that races the overlay's:
+/// it usually wins the single-flight guard and installs the first patch, so
+/// `_updateReady` never flips and no banner appears that session (and with an
+/// `onUpdateReady:`, that stray callback can still fire once, unguarded). So:
+/// **pass `config:` to the overlay and do NOT call `CodePush.init` in `main()`**
+/// (see the [config] field). To own the update lifecycle instead, drive
+/// [CodePush.init] / [CodePush.checkAndInstall] directly rather than using
+/// this widget.
 class CodePushOverlay extends StatefulWidget {
   const CodePushOverlay({
     super.key,
@@ -2402,13 +2402,14 @@ class CodePushOverlay extends StatefulWidget {
 
   /// Code push configuration.
   ///
-  /// Optional from 0.1.6 onward. When omitted, the overlay falls back
-  /// to [CodePush.lastConfig] — the config stored by the most recent
-  /// call to [CodePush.init]. This lets apps configure the SDK once in
-  /// `main()` and then just write `CodePushOverlay(child: ...)`
-  /// without repeating every field. Configure only (no `onUpdateReady:`)
-  /// when doing this — see the class doc: passing `onUpdateReady:` to a
-  /// `main()`-level `init` alongside the overlay races the two check cycles.
+  /// Optional from 0.1.6 onward. **Prefer passing `config:` here directly**
+  /// and NOT calling `CodePush.init` in `main()`: a `main()`-level `init`
+  /// (even without `onUpdateReady:`) starts a second check cycle that races
+  /// the overlay's and usually installs the first patch with no banner (see
+  /// the class doc). When [config] is omitted the overlay falls back to
+  /// [CodePush.lastConfig] — the config from the most recent [CodePush.init] —
+  /// which exists for apps that already call `init` for other reasons, but the
+  /// overlay-owns-the-lifecycle path is passing `config:` here.
   ///
   /// Passing a non-null [config] here always wins, for cases where the
   /// overlay needs different settings from whatever `init` was called
@@ -2430,10 +2431,13 @@ class CodePushOverlay extends StatefulWidget {
   /// path: on iOS a freshly downloaded patch is loaded into the running
   /// VM and applied without a restart, so the builder is NOT invoked for
   /// it; on iOS the banner appears only when a different patch arrives
-  /// while one is already loaded (which cannot hot-swap and so waits for
-  /// a restart). If you need a first-patch signal on iOS, listen to
-  /// [CodePush.status] / [CodePush.isPatched] rather than relying on the
-  /// builder.
+  /// while one is already loaded (which cannot hot-swap and so waits for a
+  /// restart), or when a resident patch is re-offered after a rollback
+  /// reverted the app-facing content. If you need a first-patch signal on
+  /// iOS, listen to [CodePush.moduleResult] (or check
+  /// `CodePush.status.value == 'Patch active'`) rather than
+  /// [CodePush.isPatched], which on iOS always reads `false` (the engine
+  /// channel is disabled there) and is a `Future`, not a listenable.
   ///
   /// The builder runs during `build` and may be called many times (parent
   /// rebuilds, media-query changes such as keyboard show/hide or rotation),

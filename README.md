@@ -284,8 +284,11 @@ CodePushOverlay(
 The builder is the "patch ready" signal on the **Android/desktop** path. On
 **iOS** a freshly downloaded patch is applied to the running VM without a
 restart, so the builder is not invoked for it — on iOS the banner appears only
-when a different patch arrives while one is already loaded. For a first-patch
-signal on iOS, listen to `CodePush.status` / `CodePush.isPatched`.
+when a different patch arrives while one is already loaded, or when a resident
+patch is re-offered after a rollback reverted the app-facing content. For a
+first-patch signal on iOS, listen to `CodePush.moduleResult` (or check
+`CodePush.status.value == 'Patch active'`) rather than `CodePush.isPatched`,
+which on iOS always reads `false`.
 
 The builder runs during `build` and may run many times, so keep side effects
 out of it: calling `onDismiss` from inside the builder does nothing useful (the
@@ -296,13 +299,12 @@ context has no `Navigator`/`Overlay` ancestor — drive dialogs and routes from 
 `navigatorKey` on your `MaterialApp` (or a context inside the app), not the
 builder's context.
 
-Note: `CodePushOverlay` calls `CodePush.init` itself in its `initState`. It
-cancels an earlier `init`'s periodic timer and takes over the check cycle, but
-that earlier `init`'s first check may already be in flight and can still fire
-its `onUpdateReady:` once — the two race through a single-flight guard, so
-whichever starts first usually wins. Don't combine
-`CodePush.init(onUpdateReady: …)` in `main()` with `CodePushOverlay`; to own the
-update lifecycle, call `CodePush.init` / `CodePush.checkAndInstall` directly
+Note: `CodePushOverlay` calls `CodePush.init` itself in its `initState`.
+Calling `CodePush.init(...)` in `main()` as well — even without an
+`onUpdateReady:` — starts a second check cycle that races the overlay's and
+usually installs the first patch with no banner that session. **Pass `config:`
+to the overlay and don't call `CodePush.init` in `main()`.** To own the update
+lifecycle instead, call `CodePush.init` / `CodePush.checkAndInstall` directly
 instead of using the overlay.
 
 ### `CodePushConfig`

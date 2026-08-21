@@ -3,7 +3,8 @@
 - Documentation fixes for `CodePushOverlay.bannerBuilder`:
   - No longer instructs returning `null` (which its type never accepted). To show no banner, return `const SizedBox.shrink()`.
   - The builder call is the "patch ready" signal, but it runs during `build` and may run many times — return a widget and keep side effects out of the builder (do the work in your widget's `initState` or a post-frame callback, wiring the handed `onRestart`/`onDismiss` to your UI's actions).
-  - Documents that combining `CodePush.init(onUpdateReady: …)` in `main()` with the overlay races (the earlier callback can still fire once); to own the update lifecycle, use `CodePush.init`/`checkAndInstall` directly instead of the overlay.
+  - The builder-is-the-signal is the **Android/desktop** path: on iOS a fresh patch is applied live without a restart, so the builder is not invoked for the first patch. For a first-patch signal on iOS, use `CodePush.moduleResult` / `CodePush.status`, not `CodePush.isPatched` (which reads `false` on iOS).
+  - Documents that combining `CodePush.init(...)` in `main()` with the overlay races — even without `onUpdateReady:` — and usually installs the first patch with no banner; pass `config:` to the overlay instead, or drive `CodePush.init`/`checkAndInstall` directly to own the lifecycle.
 
 ## 0.1.11
 
