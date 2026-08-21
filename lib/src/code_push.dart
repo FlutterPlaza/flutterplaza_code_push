@@ -158,13 +158,19 @@ abstract final class CodePush {
     return payload;
   }
 
-  /// Status notifier — the current code-push state as a short string.
+  /// Status notifier — the current code-push state as a short string, for debug
+  /// UIs and logging. It changes as code push works and each step OVERWRITES
+  /// it (e.g. `'Patch active'` becomes `'Patch already installed'` at the next
+  /// check cycle, and again on every app resume), so it is a TRANSITION signal,
+  /// not a level you can poll.
   ///
-  /// Mostly a diagnostic channel, but the value `'Patch active'` is a STABLE,
-  /// app-facing signal you may key on: it means a patch is loaded and running.
-  /// This is the reliable first-patch check on iOS, where [isPatched] reads
-  /// `false` (the engine channel is disabled there) — listen to this notifier
-  /// and compare `status.value == 'Patch active'`. The overlay keys on it too.
+  /// The one app-facing use: to detect that a patch loaded (the reliable
+  /// first-patch signal on iOS, where [isPatched] reads `false` — the engine
+  /// channel is disabled there), LATCH a `bool` the first time the value
+  /// becomes `'Patch active'` and never reset it, exactly as [CodePushOverlay]
+  /// does internally. Do NOT render UI on `status.value == 'Patch active'`
+  /// directly: the value is `'Patch active'` only for the load instant and is
+  /// something else for the rest of the session.
   static final ValueNotifier<String> status = ValueNotifier('init');
 
   /// The result from the last loaded module.
@@ -2391,8 +2397,8 @@ class CodePushConfig {
 /// `CodePush.init(...)` in `main()` as well — **even WITHOUT an
 /// `onUpdateReady:`** — starts a second check cycle that races the overlay's:
 /// it usually wins the single-flight guard and installs the first patch, so
-/// `_updateReady` never flips and no banner appears that session (and with an
-/// `onUpdateReady:`, that stray callback can still fire once, unguarded). So:
+/// no banner appears that session (and with an `onUpdateReady:`, that stray
+/// callback can still fire once, unguarded). So:
 /// **pass `config:` to the overlay and do NOT call `CodePush.init` in `main()`**
 /// (see the [config] field). To own the update lifecycle instead, drive
 /// [CodePush.init] / [CodePush.checkAndInstall] directly rather than using
@@ -2440,13 +2446,14 @@ class CodePushOverlay extends StatefulWidget {
   /// while one is already loaded (which cannot hot-swap and so waits for a
   /// restart), or when a resident patch is re-offered after a rollback
   /// reverted the app-facing content. If you need a first-patch signal on
-  /// iOS, listen to [CodePush.status] and check for `'Patch active'` (a
-  /// stable app-facing value the overlay keys on too). [CodePush.moduleResult]
-  /// carries the module's return value for content-driven UI, but it stays
-  /// `null` for a payload that loaded with no entry point, so it is not a
-  /// complete first-patch signal on its own. Don't use [CodePush.isPatched] —
-  /// on iOS it always reads `false` (the engine channel is disabled there) and
-  /// is a `Future`, not a listenable.
+  /// iOS, LATCH a `bool` the first time [CodePush.status] becomes
+  /// `'Patch active'` (an edge, not a level — the value moves on to something
+  /// else at the next check cycle and never returns), exactly as this overlay
+  /// does internally. [CodePush.moduleResult] carries the module's return
+  /// value for content-driven UI, but it stays `null` for a payload that
+  /// loaded with no entry point, so it is not a complete signal on its own.
+  /// Don't use [CodePush.isPatched] — on iOS it always reads `false` (the
+  /// engine channel is disabled there) and is a `Future`, not a listenable.
   ///
   /// The builder runs during `build` and may be called many times (parent
   /// rebuilds, media-query changes such as keyboard show/hide or rotation),
