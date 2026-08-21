@@ -76,11 +76,13 @@ class _CodePushDemoState extends State<CodePushDemo> {
         },
       );
       if (!installed) {
-        // `false` does NOT necessarily mean "no update" — it also means
-        // "another check is already running" (the overlay's own cycle wins
-        // the single-flight guard). Don't report it as "no update".
-        setState(() => _status = 'No new patch installed '
-            '(no update, or a check is already in progress).');
+        // `false` is not just "no update" — checkAndInstall also returns false
+        // for "a check is already running", a download failure, a hash
+        // mismatch, a server error, and more. The specific reason is in
+        // CodePush.status, which checkAndInstall writes before every false
+        // return, so surface that rather than guessing.
+        setState(
+            () => _status = 'No new patch installed: ${CodePush.status.value}');
       }
       await _loadStatus();
     } on CodePushException catch (e) {
@@ -165,6 +167,20 @@ class _CodePushDemoState extends State<CodePushDemo> {
           OutlinedButton(
             onPressed: _rollback,
             child: const Text('Rollback'),
+          ),
+
+          const SizedBox(height: 24),
+
+          // The iOS patch signal the note above prescribes: moduleResult is a
+          // level, so a ValueListenableBuilder over it reflects the resident
+          // patch even after the overlay re-keys this subtree. It holds the raw
+          // payload (a Map/List on iOS, or a string), so render defensively.
+          ValueListenableBuilder<Object?>(
+            valueListenable: CodePush.moduleResult,
+            builder: (context, result, _) {
+              if (result == null) return const Text('No live patch payload');
+              return Text('Live patch payload: $result');
+            },
           ),
 
           const SizedBox(height: 24),

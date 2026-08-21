@@ -2457,7 +2457,9 @@ class CodePushOverlay extends StatefulWidget {
   /// listen to [CodePush.moduleResult] with a `ValueListenableBuilder<Object?>`
   /// — it is a LEVEL, so it survives this overlay re-keying its child subtree
   /// when a patch loads; caveat: it is `null` for a patch that loaded with no
-  /// return value, so it signals content, not merely "a patch is active".
+  /// return value, and after a revert to baseline (rollback or an automatic
+  /// post-failure revert, while the module stays resident), so it signals
+  /// content, not merely "a patch is active".
   /// Don't latch on [CodePush.status] from a widget under the overlay:
   /// `'Patch active'` is a fleeting edge, and the re-key disposes the latch.
   /// And don't use [CodePush.isPatched] — on iOS it always reads `false` (the
@@ -2661,7 +2663,10 @@ class _DefaultUpdateBanner extends StatelessWidget {
 
 /// A widget that rebuilds when a code push module result is available.
 ///
-/// Use this to apply OTA patches to specific parts of your UI.
+/// Use this to apply *string* OTA patch payloads to specific parts of your UI.
+/// Only string results reach the builder — a `Map`/`List` payload (the common
+/// iOS shape) yields the baseline branch (`patchData == null`); to react to
+/// those, listen to [CodePush.moduleResult] directly.
 ///
 /// ```dart
 /// CodePushPatchBuilder(
@@ -2686,11 +2691,14 @@ class CodePushPatchBuilder extends StatelessWidget {
   /// Only *string* module results are ever passed through — a `Map`/`List`
   /// payload (the common iOS shape) yields the baseline branch
   /// (`patchData == null`). If the string starts with `'$patchKey:'`, the text
-  /// after the colon is passed to the builder. If null, every string result is
-  /// passed through as-is.
+  /// after the colon is passed to the builder. If null, every non-empty string
+  /// result is passed through as-is (an empty string yields the baseline
+  /// branch).
   final String? patchKey;
 
-  /// Builder called with the patch data string (or null if no patch).
+  /// Builder called with the patch data string, or null when there is no
+  /// patch, when the module result is not a string (a `Map`/`List` payload —
+  /// the common iOS shape), or when it does not match [patchKey].
   final Widget Function(BuildContext context, String? patchData, Widget? child)
       builder;
 

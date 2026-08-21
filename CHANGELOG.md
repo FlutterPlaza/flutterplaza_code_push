@@ -1,12 +1,19 @@
 ## Unreleased
 
-- Documentation fixes for `CodePushOverlay.bannerBuilder`:
-  - No longer instructs returning `null` (which its type never accepted). To show no banner, return `const SizedBox.shrink()`.
-  - The builder call is the "patch ready" signal, but it runs during `build` and may run many times — return a widget and keep side effects out of the builder (do the work in your widget's `initState` or a post-frame callback, wiring the handed `onRestart`/`onDismiss` to your UI's actions).
-  - The builder-is-the-signal is the **Android/desktop** path: on iOS a fresh patch is applied live without a restart, so the builder is not invoked for the first patch. For an app-facing iOS patch signal, listen to `CodePush.moduleResult` (a level, so it survives the overlay re-keying its subtree; `null` for a patch with no return value). Don't latch on `CodePush.status` (`Patch active` is a fleeting edge the re-key discards), and `CodePush.isPatched` reads `false` on iOS.
-  - Documents that combining `CodePush.init(...)` in `main()` with the overlay races — even without `onUpdateReady:` — and usually installs the first patch with no banner; pass `config:` to the overlay instead, or drive `CodePush.init`/`checkAndInstall` directly to own the lifecycle.
-- `CodePush.status` docs: clarified it is a fleeting transition signal (each step overwrites it), not an app-facing level — use `CodePush.moduleResult` for iOS patch UI.
-- `checkForUpdate` docs: it throws `CodePushException` on engines without code push; use `hasCodePushEngine` (non-throwing, 2s timeout) to detect code-push support without catching.
+- Documentation fixes only; no API or behavior changes.
+- `CodePushOverlay.bannerBuilder`: return a widget to show no banner
+  (`const SizedBox.shrink()`) — it never accepted `null`. Keep side effects out
+  of the builder; wire the handed `onRestart`/`onDismiss` to your UI instead.
+- On iOS a patch applies live without a restart. Use `CodePush.moduleResult` to
+  react to a patch in your UI; `CodePush.status` is a transient signal and
+  `CodePush.isPatched` reads `false` on iOS.
+- `CodePushPatchBuilder` reacts to string patch payloads only; for other
+  payloads listen to `CodePush.moduleResult` directly.
+- `checkForUpdate` throws on engines without code push; use `hasCodePushEngine`
+  to detect support without catching.
+- Combining `CodePush.init(...)` in `main()` with `CodePushOverlay` can install
+  the first patch with no banner — pass `config:` to the overlay, or drive
+  `CodePush.init`/`checkAndInstall` yourself.
 
 ## 0.1.11
 

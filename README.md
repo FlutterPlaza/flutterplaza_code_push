@@ -261,9 +261,10 @@ module — **the app-facing iOS patch signal**. It is a level (unlike the
 overlay re-keying its subtree when a patch loads. Listen with a
 `ValueListenableBuilder<Object?>` to drive OTA UI without a restart.
 
-Caveat: it stays `null` for a patch that loaded with no return value, so it
-signals *content*, not merely that a patch is active — a pure code patch leaves
-it `null`.
+Caveat: it reads `null` in two cases — a patch that loaded with no return value
+(a pure code patch), and after a revert to baseline (a deliberate rollback or
+an automatic post-failure revert, while the module stays resident). So it
+signals *content*, not merely that a patch is active.
 
 ```dart
 ValueListenableBuilder<Object?>(
@@ -309,8 +310,8 @@ when a different patch arrives while one is already loaded, or when a resident
 patch is re-offered after a rollback reverted the app-facing content. For an
 app-facing iOS patch signal, listen to `CodePush.moduleResult` (a level — it
 survives the overlay re-keying its subtree when a patch loads; `null` for a
-patch with no return value, so it signals content, not merely "a patch is
-active"). Don't latch on `CodePush.status` from a widget under the overlay
+patch with no return value and after a revert to baseline, so it signals
+content, not merely "a patch is active"). Don't latch on `CodePush.status` from a widget under the overlay
 (`Patch active` is a fleeting edge and the re-key disposes the latch), and
 don't use `CodePush.isPatched` — on iOS it always reads `false`.
 
@@ -364,8 +365,8 @@ Only *string* module results reach the builder — a `Map`/`List` payload (the
 common iOS shape) yields the baseline branch (`patchData == null`). If
 `patchKey` is provided, the builder only receives data from string results
 that start with that key (e.g. `promo_banner:Hello World` passes
-`Hello World` to the builder). If `patchKey` is null, every string result is
-passed through as-is.
+`Hello World` to the builder). If `patchKey` is null, every non-empty string
+result is passed through as-is (an empty string yields the baseline branch).
 
 ## Models
 
