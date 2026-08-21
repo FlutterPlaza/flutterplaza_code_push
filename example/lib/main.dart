@@ -7,8 +7,9 @@ void main() {
   // Wrap your app with CodePushOverlay for automatic OTA updates.
   // It checks for patches on startup, periodically, and on app resume.
   // On Android/desktop a downloaded patch shows a restart banner; on iOS
-  // the first patch is applied live (no banner) and the banner appears
-  // only when a different patch arrives while one is already loaded.
+  // the first patch is applied live (no banner) and the banner appears only
+  // when a different patch arrives while one is already loaded, or when a
+  // resident patch is re-offered after a rollback reverted the content.
   // The overlay runs its own check cycle, so the manual button below can
   // race it (see _manualCheck).
   runApp(
@@ -117,12 +118,15 @@ class _CodePushDemoState extends State<CodePushDemo> {
                   const SizedBox(height: 8),
                   // NOTE: isPatched / currentPatch read the engine channel,
                   // which is disabled on iOS — they show false/null there even
-                  // while a patch is active. On iOS use CodePush.moduleResult
-                  // (a level; see the CodePushPatchBuilder below) as the
-                  // active-patch signal — NOT CodePush.status: 'Patch active'
-                  // is a fleeting edge, and the overlay re-keys the app subtree
-                  // when a patch loads, so any latch a widget here holds is
-                  // discarded (this State itself is recreated on iOS load).
+                  // while a patch is active. On iOS, listen to
+                  // CodePush.moduleResult (a level) with a
+                  // ValueListenableBuilder<Object?> as the active-patch signal
+                  // — NOT CodePush.status: 'Patch active' is a fleeting edge,
+                  // and the overlay re-keys the app subtree when a patch loads,
+                  // so any latch a widget here holds is discarded (this State
+                  // itself is recreated on iOS load). The CodePushPatchBuilder
+                  // below is a convenience for string patches keyed by prefix,
+                  // not the auto-parsed Map moduleResult holds.
                   Text('Patched (Android/desktop): $_isPatched'),
                   if (_currentPatch != null) ...[
                     Text('Active patch: ${_currentPatch!.version}'),

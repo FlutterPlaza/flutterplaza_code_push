@@ -255,17 +255,26 @@ level, which survives the re-key), below.
 
 ### `CodePush.moduleResult`
 
-A `ValueNotifier<Object?>` that holds the result from the last loaded
-bytecode module (iOS live patches). Apps can listen to this to apply OTA
-patches to their UI without a restart.
+A `ValueNotifier<Object?>` that holds the result from the last loaded bytecode
+module — **the app-facing iOS patch signal**. It is a level (unlike the
+`status` edge and `isPatched`, which reads `false` on iOS), so it survives the
+overlay re-keying its subtree when a patch loads. Listen with a
+`ValueListenableBuilder<Object?>` to drive OTA UI without a restart.
+
+Caveat: it stays `null` for a patch that loaded with no return value, so it
+signals *content*, not merely that a patch is active — a pure code patch leaves
+it `null`.
 
 ```dart
-CodePush.moduleResult.addListener(() {
-  final result = CodePush.moduleResult.value;
-  if (result is Map<String, dynamic>) {
-    // Use the patch data to update your UI.
-  }
-});
+ValueListenableBuilder<Object?>(
+  valueListenable: CodePush.moduleResult,
+  builder: (context, result, _) {
+    if (result is Map<String, dynamic>) {
+      // Use the patch data to update your UI.
+    }
+    return const SizedBox.shrink();
+  },
+);
 ```
 
 ## Widgets
