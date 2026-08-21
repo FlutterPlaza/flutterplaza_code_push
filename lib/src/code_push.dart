@@ -158,14 +158,31 @@ abstract final class CodePush {
     return payload;
   }
 
-  /// Debug status notifier — shows what code push is doing.
+  /// Status notifier — the current code-push state as a short string, for debug
+  /// UIs and logging. Each step OVERWRITES it (e.g. `'Patch active'` becomes
+  /// `'Patch already installed'` at the next check, and again on every resume),
+  /// so it is a fleeting TRANSITION, not a level you can poll.
+  ///
+  /// Do NOT use it as an app-facing "a patch loaded" signal. [CodePushOverlay]
+  /// latches the `'Patch active'` edge internally, but on that same transition
+  /// it re-keys its child subtree — disposing any latch a widget under it holds
+  /// — and the edge never returns. For an app-facing iOS signal use
+  /// [moduleResult] (a level, so it survives the re-key).
   static final ValueNotifier<String> status = ValueNotifier('init');
 
-  /// The result from the last loaded module.
+  /// The result from the last loaded module — the app-facing iOS patch signal.
   ///
-  /// On iOS, bytecode modules return a JSON string which is auto-parsed
-  /// into a `Map<String, dynamic>`. Apps can listen to this to apply
-  /// OTA patches to their UI.
+  /// On iOS, bytecode modules return a JSON string which is auto-parsed into a
+  /// `Map<String, dynamic>` (or `List`) before it reaches here. Listen with a
+  /// `ValueListenableBuilder<Object?>` to drive OTA UI: unlike [status] (a
+  /// fleeting edge) and [isPatched] (always `false` on iOS), this is a LEVEL,
+  /// so it survives [CodePushOverlay] re-keying its subtree when a patch loads.
+  /// Caveat: it reads `null` in two cases — a patch that loaded with no return
+  /// value (a pure code patch), and after a revert to baseline (a deliberate
+  /// [rollback], or an automatic revert after a failed patch), which clears it.
+  /// So it signals *content*, not merely that some patch is active.
+  /// ([CodePushPatchBuilder] is a convenience for string patches addressed by a
+  /// `key:` prefix — not the auto-parsed value here.)
   static final ValueNotifier<Object?> moduleResult = ValueNotifier(null);
   static bool _moduleLoaded = false;
 
@@ -1584,6 +1601,15 @@ abstract final class CodePush {
   // ── Low-level engine API ────────────────────────────────────────
 
   /// Checks the engine for available updates (delegates to Dart side HTTP).
+  ///
+  /// Throws [CodePushException] on any failure — including on engines
+  /// without code push, where the underlying channel is missing. To test
+  /// for that case without throwing, use [hasCodePushEngine] (2s timeout,
+  /// returns `false` rather than throwing) — e.g. to hide update UI on a
+  /// baseline that wasn't built for code push. For a failure-soft way to
+  /// learn when a patch is ready, pass `onUpdateReady:` to [init] or
+  /// [checkAndInstall] instead — note that those download and install the
+  /// patch before the callback fires, unlike this check-only call.
   static Future<UpdateInfo> checkForUpdate() async {
     try {
       final Map<String, dynamic>? result = await _channel
@@ -1643,7 +1669,10 @@ abstract final class CodePush {
 
   /// Returns whether the app is currently running with a code push patch.
   ///
-  /// Returns `false` if the code push engine is not available.
+  /// Returns `false` if the code push engine is not available. This reads the
+  /// engine channel, which is disabled on **iOS**, so it always returns `false`
+  /// on iOS even while a patch is active — use [moduleResult] for an iOS patch
+  /// signal.
   static Future<bool> get isPatched async {
     try {
       return await _channel.invokeMethod<bool>('CodePush.isPatched') ?? false;
@@ -2371,6 +2400,17 @@ class CodePushConfig {
 ///   ),
 /// );
 /// ```
+///
+/// The overlay calls [CodePush.init] itself in its `initState`. Calling
+/// `CodePush.init(...)` in `main()` as well — **even WITHOUT an
+/// `onUpdateReady:`** — starts a second check cycle that races the overlay's:
+/// it usually wins the single-flight guard and installs the first patch, so
+/// no banner appears that session (and with an `onUpdateReady:`, that stray
+/// callback can still fire once, unguarded). So:
+/// **pass `config:` to the overlay and do NOT call `CodePush.init` in `main()`**
+/// (see the [config] field). To own the update lifecycle instead, drive
+/// [CodePush.init] / [CodePush.checkAndInstall] directly rather than using
+/// this widget.
 class CodePushOverlay extends StatefulWidget {
   const CodePushOverlay({
     super.key,
@@ -2382,11 +2422,14 @@ class CodePushOverlay extends StatefulWidget {
 
   /// Code push configuration.
   ///
-  /// Optional from 0.1.6 onward. When omitted, the overlay falls back
-  /// to [CodePush.lastConfig] — the config stored by the most recent
-  /// call to [CodePush.init]. This lets apps configure the SDK once in
-  /// `main()` and then just write `CodePushOverlay(child: ...)`
-  /// without repeating every field.
+  /// Optional from 0.1.6 onward. **Prefer passing `config:` here directly**
+  /// and NOT calling `CodePush.init` in `main()`: a `main()`-level `init`
+  /// (even without `onUpdateReady:`) starts a second check cycle that races
+  /// the overlay's and usually installs the first patch with no banner (see
+  /// the class doc). When [config] is omitted the overlay falls back to
+  /// [CodePush.lastConfig] — the config from the most recent [CodePush.init] —
+  /// which exists for apps that already call `init` for other reasons, but the
+  /// overlay-owns-the-lifecycle path is passing `config:` here.
   ///
   /// Passing a non-null [config] here always wins, for cases where the
   /// overlay needs different settings from whatever `init` was called
@@ -2396,8 +2439,55 @@ class CodePushOverlay extends StatefulWidget {
   /// The app widget.
   final Widget child;
 
-  /// Optional custom banner builder. If null, uses the default banner.
-  /// Return `null` to hide the banner.
+  /// Optional custom builder for the "update ready" banner.
+  ///
+  /// When [bannerBuilder] is null, the default banner is shown. When
+  /// provided, the builder must return a widget — the type does not
+  /// admit a null return.
+  ///
+  /// To show no banner at all, return `const SizedBox.shrink()`. The
+  /// builder call is the "patch ready" signal — it runs once a patch is
+  /// installed and awaiting restart. Note this is the Android/desktop
+  /// path: on iOS a freshly downloaded patch is loaded into the running
+  /// VM and applied without a restart, so the builder is NOT invoked for
+  /// it; on iOS the banner appears only when a different patch arrives
+  /// while one is already loaded (which cannot hot-swap and so waits for a
+  /// restart), or when a resident patch is re-offered after a rollback
+  /// reverted the app-facing content. For an app-facing iOS patch signal,
+  /// listen to [CodePush.moduleResult] with a `ValueListenableBuilder<Object?>`
+  /// — it is a LEVEL, so it survives this overlay re-keying its child subtree
+  /// when a patch loads; caveat: it is `null` for a patch that loaded with no
+  /// return value, and after a revert to baseline (rollback or an automatic
+  /// post-failure revert, while the module stays resident), so it signals
+  /// content, not merely "a patch is active".
+  /// Don't latch on [CodePush.status] from a widget under the overlay:
+  /// `'Patch active'` is a fleeting edge, and the re-key disposes the latch.
+  /// And don't use [CodePush.isPatched] — on iOS it always reads `false` (the
+  /// engine channel is disabled there).
+  ///
+  /// The builder runs during `build` and may be called many times (parent
+  /// rebuilds, media-query changes such as keyboard show/hide or rotation),
+  /// so it must return a widget and must not perform side effects from
+  /// inside the builder. Calling the handed `onDismiss` there does
+  /// nothing useful — the overlay is already building, so the banner
+  /// still renders this frame and lingers until the next rebuild;
+  /// `showDialog` and navigation throw. Calling `onDismiss` from a user
+  /// action (a button in your returned widget) DOES hide the banner slot
+  /// until the next new patch becomes ready. To drive your own UI, return
+  /// your own widget and do the work in its `initState` (or defer with
+  /// `WidgetsBinding.instance.addPostFrameCallback`), wiring the handed
+  /// `onRestart` / `onDismiss` to your own UI's actions (note `onRestart`
+  /// hard-restarts the process, so gate it behind a user action).
+  ///
+  /// When the overlay wraps your `MaterialApp` (as in the examples), the
+  /// builder's `BuildContext` has no `Navigator`/`Overlay` ancestor:
+  /// showing a dialog or pushing a route needs a `navigatorKey` on your
+  /// app's `MaterialApp` (or a context from inside the app), not the
+  /// builder's context.
+  ///
+  /// [CodePushOverlay]'s class doc covers the `init`-in-`main()` race —
+  /// don't call `CodePush.init` in `main()` (even without `onUpdateReady:`)
+  /// alongside the overlay; pass `config:` to the overlay instead.
   final Widget Function(
     BuildContext context,
     VoidCallback onRestart,
@@ -2573,7 +2663,10 @@ class _DefaultUpdateBanner extends StatelessWidget {
 
 /// A widget that rebuilds when a code push module result is available.
 ///
-/// Use this to apply OTA patches to specific parts of your UI.
+/// Use this to apply *string* OTA patch payloads to specific parts of your UI.
+/// Only string results reach the builder — a `Map`/`List` payload (the common
+/// iOS shape) yields the baseline branch (`patchData == null`); to react to
+/// those, listen to [CodePush.moduleResult] directly.
 ///
 /// ```dart
 /// CodePushPatchBuilder(
@@ -2595,12 +2688,17 @@ class CodePushPatchBuilder extends StatelessWidget {
   });
 
   /// Optional key to filter which patch data this builder responds to.
-  /// If the module result is a pipe-delimited string starting with this key,
-  /// the remaining data is passed to the builder. If null, all results
-  /// are passed through.
+  /// Only *string* module results are ever passed through — a `Map`/`List`
+  /// payload (the common iOS shape) yields the baseline branch
+  /// (`patchData == null`). If the string starts with `'$patchKey:'`, the text
+  /// after the colon is passed to the builder. If null, every non-empty string
+  /// result is passed through as-is (an empty string yields the baseline
+  /// branch).
   final String? patchKey;
 
-  /// Builder called with the patch data string (or null if no patch).
+  /// Builder called with the patch data string, or null when there is no
+  /// patch, when the module result is not a string (a `Map`/`List` payload —
+  /// the common iOS shape), or when it does not match [patchKey].
   final Widget Function(BuildContext context, String? patchData, Widget? child)
       builder;
 

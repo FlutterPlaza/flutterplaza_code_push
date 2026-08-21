@@ -6,7 +6,12 @@ void main() {
 
   // Wrap your app with CodePushOverlay for automatic OTA updates.
   // It checks for patches on startup, periodically, and on app resume.
-  // When a patch is downloaded, a banner prompts the user to restart.
+  // On Android/desktop a downloaded patch shows a restart banner; on iOS
+  // the first patch is applied live (no banner) and the banner appears only
+  // when a different patch arrives while one is already loaded, or when a
+  // resident patch is re-offered after a rollback reverted the content.
+  // The overlay runs its own check cycle, so the manual button below can
+  // race it (see _manualCheck).
   runApp(
     CodePushOverlay(
       config: CodePushConfig(
@@ -71,7 +76,13 @@ class _CodePushDemoState extends State<CodePushDemo> {
         },
       );
       if (!installed) {
-        setState(() => _status = 'No update available.');
+        // `false` is not just "no update" — checkAndInstall also returns false
+        // for "a check is already running", a download failure, a hash
+        // mismatch, a server error, and more. The specific reason is in
+        // CodePush.status, which checkAndInstall writes before every false
+        // return, so surface that rather than guessing.
+        setState(
+            () => _status = 'No new patch installed: ${CodePush.status.value}');
       }
       await _loadStatus();
     } on CodePushException catch (e) {
@@ -87,6 +98,12 @@ class _CodePushDemoState extends State<CodePushDemo> {
       await _loadStatus();
     } on CodePushException catch (e) {
       setState(() => _status = 'Rollback failed: ${e.message}');
+    } catch (e) {
+      // The iOS Dart-side rollback deletes the resident patch file, which can
+      // throw a FileSystemException (not a CodePushException) if it is already
+      // gone or unreadable — catch it so the button never leaves an exception
+      // unhandled.
+      setState(() => _status = 'Rollback failed: $e');
     }
   }
 
@@ -107,7 +124,18 @@ class _CodePushDemoState extends State<CodePushDemo> {
                   Text('Status',
                       style: Theme.of(context).textTheme.titleMedium),
                   const SizedBox(height: 8),
-                  Text('Patched: $_isPatched'),
+                  // NOTE: isPatched / currentPatch read the engine channel,
+                  // which is disabled on iOS — they show false/null there even
+                  // while a patch is active. On iOS, listen to
+                  // CodePush.moduleResult (a level) with a
+                  // ValueListenableBuilder<Object?> as the active-patch signal
+                  // — NOT CodePush.status: 'Patch active' is a fleeting edge,
+                  // and the overlay re-keys the app subtree when a patch loads,
+                  // so any latch a widget here holds is discarded (this State
+                  // itself is recreated on iOS load). The CodePushPatchBuilder
+                  // below is a convenience for string patches keyed by prefix,
+                  // not the auto-parsed Map moduleResult holds.
+                  Text('Patched (Android/desktop): $_isPatched'),
                   if (_currentPatch != null) ...[
                     Text('Active patch: ${_currentPatch!.version}'),
                     Text('Installed: ${_currentPatch!.installedAt}'),
@@ -131,10 +159,28 @@ class _CodePushDemoState extends State<CodePushDemo> {
           ),
           const SizedBox(height: 8),
 
-          // Rollback (only enabled when patched).
+          // Rollback is always available — it is failure-soft (_rollback
+          // surfaces "No active patch to roll back" when there's nothing to
+          // undo). Do NOT gate on _isPatched: that reads false on iOS even
+          // while a patch is active, which would wrongly disable rollback on
+          // iOS, where it works (Dart-side file removal).
           OutlinedButton(
-            onPressed: _isPatched ? _rollback : null,
+            onPressed: _rollback,
             child: const Text('Rollback'),
+          ),
+
+          const SizedBox(height: 24),
+
+          // The iOS patch signal the note above prescribes: moduleResult is a
+          // level, so a ValueListenableBuilder over it reflects the resident
+          // patch even after the overlay re-keys this subtree. It holds the raw
+          // payload (a Map/List on iOS, or a string), so render defensively.
+          ValueListenableBuilder<Object?>(
+            valueListenable: CodePush.moduleResult,
+            builder: (context, result, _) {
+              if (result == null) return const Text('No live patch payload');
+              return Text('Live patch payload: $result');
+            },
           ),
 
           const SizedBox(height: 24),

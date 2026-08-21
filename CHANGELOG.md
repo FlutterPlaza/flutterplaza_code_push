@@ -1,3 +1,20 @@
+## Unreleased
+
+- Documentation fixes only; no API or behavior changes.
+- `CodePushOverlay.bannerBuilder`: return a widget to show no banner
+  (`const SizedBox.shrink()`) — it never accepted `null`. Keep side effects out
+  of the builder; wire the handed `onRestart`/`onDismiss` to your UI instead.
+- On iOS a patch applies live without a restart. Use `CodePush.moduleResult` to
+  react to a patch in your UI; `CodePush.status` is a transient signal and
+  `CodePush.isPatched` reads `false` on iOS.
+- `CodePushPatchBuilder` reacts to string patch payloads only; for other
+  payloads listen to `CodePush.moduleResult` directly.
+- `checkForUpdate` throws on engines without code push; use `hasCodePushEngine`
+  to detect support without catching.
+- Combining `CodePush.init(...)` in `main()` with `CodePushOverlay` can install
+  the first patch with no banner — pass `config:` to the overlay, or drive
+  `CodePush.init`/`checkAndInstall` yourself.
+
 ## 0.1.11
 
 - Adds Android support: patches download, verify, and apply on the next app restart.

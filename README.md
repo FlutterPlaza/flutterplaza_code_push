@@ -80,8 +80,10 @@ void main() {
 ```
 
 That is the only change needed. The overlay checks for updates on launch, every
-4 hours (configurable), and whenever the app returns from the background. When a
-patch is downloaded and installed, a banner appears prompting the user to restart.
+4 hours (configurable), and whenever the app returns from the background. On
+Android/desktop, when a patch is downloaded and installed a banner appears
+prompting the user to restart. On iOS the first patch applies live without a
+restart (no banner) — see the `CodePushOverlay` reference below.
 
 ### Enable the debug status bar
 
@@ -95,7 +97,7 @@ CodePushOverlay(
     appId: 'your-app-id',
     releaseVersion: '1.0.0+1',
   ),
-  showDebugBar: true, // Shows "CP: Checking server...", "CP: Patch active", etc.
+  showDebugBar: true, // Shows "CP: Checking server...", "CP: Restart to apply", etc.
   child: MyApp(),
 )
 ```
@@ -200,7 +202,10 @@ CodePush.restart();
 
 ### `CodePush.isPatched`
 
-Returns whether the app is currently running with a code push patch.
+Returns whether the app is currently running with a code push patch. Note this
+reads the engine channel, which is disabled on **iOS** — it always returns
+`false` on iOS even while a patch is active. For an iOS patch signal, use
+`CodePush.moduleResult` (see below).
 
 ```dart
 final bool patched = await CodePush.isPatched;
@@ -229,8 +234,9 @@ final String version = await CodePush.releaseVersion;
 
 ### `CodePush.status`
 
-A `ValueNotifier<String>` that broadcasts what code push is currently doing.
-Useful for debug UIs or logging.
+A `ValueNotifier<String>` that broadcasts what code push is currently doing —
+for debug UIs and logging. Each step overwrites it, so it is a **transition**
+signal, not a level you can poll.
 
 ```dart
 CodePush.status.addListener(() {
@@ -241,19 +247,35 @@ CodePush.status.addListener(() {
 Values include: `init`, `Checking server...`, `Downloading patch...`,
 `Patch active`, `No update (204)`, `Restart to apply`, etc.
 
+Don't use this as an app-facing "a patch loaded" signal. `CodePushOverlay`
+latches the `Patch active` edge internally, but on that transition it re-keys
+its child subtree, disposing any latch a widget under it holds — and the edge
+never returns. For an app-facing iOS signal use `CodePush.moduleResult` (a
+level, which survives the re-key), below.
+
 ### `CodePush.moduleResult`
 
-A `ValueNotifier<Object?>` that holds the result from the last loaded
-bytecode module (iOS live patches). Apps can listen to this to apply OTA
-patches to their UI without a restart.
+A `ValueNotifier<Object?>` that holds the result from the last loaded bytecode
+module — **the app-facing iOS patch signal**. It is a level (unlike the
+`status` edge and `isPatched`, which reads `false` on iOS), so it survives the
+overlay re-keying its subtree when a patch loads. Listen with a
+`ValueListenableBuilder<Object?>` to drive OTA UI without a restart.
+
+Caveat: it reads `null` in two cases — a patch that loaded with no return value
+(a pure code patch), and after a revert to baseline (a deliberate rollback or
+an automatic post-failure revert, while the module stays resident). So it
+signals *content*, not merely that a patch is active.
 
 ```dart
-CodePush.moduleResult.addListener(() {
-  final result = CodePush.moduleResult.value;
-  if (result is Map<String, dynamic>) {
-    // Use the patch data to update your UI.
-  }
-});
+ValueListenableBuilder<Object?>(
+  valueListenable: CodePush.moduleResult,
+  builder: (context, result, _) {
+    if (result is Map<String, dynamic>) {
+      // Use the patch data to update your UI.
+    }
+    return const SizedBox.shrink();
+  },
+);
 ```
 
 ## Widgets
@@ -269,11 +291,46 @@ CodePushOverlay(
   child: MyApp(),
   showDebugBar: false,       // optional, shows status bar at top
   bannerBuilder: (context, onRestart, onDismiss) {
-    // optional, return a custom banner widget
+    // optional, return a custom banner widget — must return a widget;
+    // return const SizedBox.shrink() to show nothing. The builder call
+    // itself is the "patch ready" signal, but it runs during build and
+    // may run many times — no side effects here. To drive your own UI,
+    // return your own widget and wire the handed onRestart/onDismiss to
+    // your UI's actions from its initState or a post-frame callback
+    // (onRestart hard-restarts the process, so gate it behind a user tap).
     return MyCustomBanner(onRestart: onRestart, onDismiss: onDismiss);
   },
 )
 ```
+
+The builder is the "patch ready" signal on the **Android/desktop** path. On
+**iOS** a freshly downloaded patch is applied to the running VM without a
+restart, so the builder is not invoked for it — on iOS the banner appears only
+when a different patch arrives while one is already loaded, or when a resident
+patch is re-offered after a rollback reverted the app-facing content. For an
+app-facing iOS patch signal, listen to `CodePush.moduleResult` (a level — it
+survives the overlay re-keying its subtree when a patch loads; `null` for a
+patch with no return value and after a revert to baseline, so it signals
+content, not merely "a patch is active"). Don't latch on `CodePush.status` from a widget under the overlay
+(`Patch active` is a fleeting edge and the re-key disposes the latch), and
+don't use `CodePush.isPatched` — on iOS it always reads `false`.
+
+The builder runs during `build` and may run many times, so keep side effects
+out of it: calling `onDismiss` from inside the builder does nothing useful (the
+banner lingers until the next rebuild), and `showDialog`/navigation throw
+(calling `onDismiss` from a user action in your returned widget does hide the
+banner). When the overlay wraps your `MaterialApp` (as above), the builder's
+context has no `Navigator`/`Overlay` ancestor — drive dialogs and routes from a
+`navigatorKey` on your `MaterialApp` (or a context inside the app), not the
+builder's context.
+
+Note: `CodePushOverlay` calls `CodePush.init` itself in its `initState`.
+Calling `CodePush.init(...)` in `main()` as well — even without an
+`onUpdateReady:` — starts a second check cycle that races the overlay's and
+usually installs the first patch with no banner that session. **Pass `config:`
+to the overlay and don't call `CodePush.init` in `main()`.** To own the update
+lifecycle instead, call `CodePush.init` / `CodePush.checkAndInstall` directly
+instead of using the overlay.
 
 ### `CodePushConfig`
 
@@ -304,10 +361,12 @@ CodePushPatchBuilder(
 )
 ```
 
-If `patchKey` is provided, the builder only receives data from module results
+Only *string* module results reach the builder — a `Map`/`List` payload (the
+common iOS shape) yields the baseline branch (`patchData == null`). If
+`patchKey` is provided, the builder only receives data from string results
 that start with that key (e.g. `promo_banner:Hello World` passes
-`Hello World` to the builder). If `patchKey` is null, all module results are
-passed through.
+`Hello World` to the builder). If `patchKey` is null, every non-empty string
+result is passed through as-is (an empty string yields the baseline branch).
 
 ## Models
 
@@ -399,8 +458,8 @@ hash verification still applies).
 | Desktop  | ELF        | Yes              | No          |
 
 - **iOS**: Bytecode patches are loaded as data modules at runtime. The app does
-  not need to restart. Listen to `CodePush.moduleResult` or use
-  `CodePushPatchBuilder` to react to live patches.
+  not need to restart. Listen to `CodePush.moduleResult` for any patch payload;
+  `CodePushPatchBuilder` is a convenience wrapper for *string* payloads only.
 - **Android and Desktop**: ELF patches are written to disk and loaded by the
   engine on the next cold restart. The `onUpdateReady` callback (or the overlay
   banner) lets you prompt the user to restart.
