@@ -360,10 +360,12 @@ CodePushPatchBuilder(
 )
 ```
 
-If `patchKey` is provided, the builder only receives data from module results
+Only *string* module results reach the builder — a `Map`/`List` payload (the
+common iOS shape) yields the baseline branch (`patchData == null`). If
+`patchKey` is provided, the builder only receives data from string results
 that start with that key (e.g. `promo_banner:Hello World` passes
-`Hello World` to the builder). If `patchKey` is null, all module results are
-passed through.
+`Hello World` to the builder). If `patchKey` is null, every string result is
+passed through as-is.
 
 ## Models
 
@@ -455,8 +457,8 @@ hash verification still applies).
 | Desktop  | ELF        | Yes              | No          |
 
 - **iOS**: Bytecode patches are loaded as data modules at runtime. The app does
-  not need to restart. Listen to `CodePush.moduleResult` or use
-  `CodePushPatchBuilder` to react to live patches.
+  not need to restart. Listen to `CodePush.moduleResult` for any patch payload;
+  `CodePushPatchBuilder` is a convenience wrapper for *string* payloads only.
 - **Android and Desktop**: ELF patches are written to disk and loaded by the
   engine on the next cold restart. The `onUpdateReady` callback (or the overlay
   banner) lets you prompt the user to restart.

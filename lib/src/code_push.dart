@@ -167,8 +167,7 @@ abstract final class CodePush {
   /// latches the `'Patch active'` edge internally, but on that same transition
   /// it re-keys its child subtree — disposing any latch a widget under it holds
   /// — and the edge never returns. For an app-facing iOS signal use
-  /// [moduleResult] (a level, so it survives the re-key), or own the lifecycle
-  /// with [checkAndInstall] instead of the overlay.
+  /// [moduleResult] (a level, so it survives the re-key).
   static final ValueNotifier<String> status = ValueNotifier('init');
 
   /// The result from the last loaded module — the app-facing iOS patch signal.
@@ -178,11 +177,12 @@ abstract final class CodePush {
   /// `ValueListenableBuilder<Object?>` to drive OTA UI: unlike [status] (a
   /// fleeting edge) and [isPatched] (always `false` on iOS), this is a LEVEL,
   /// so it survives [CodePushOverlay] re-keying its subtree when a patch loads.
-  /// Caveat: it stays `null` for a patch that loaded with no return value, so
-  /// it signals *content*, not merely that some patch is active — a pure code
-  /// patch leaves it `null`. ([CodePushPatchBuilder] is a convenience for
-  /// string patches addressed by a `key:` prefix — not the auto-parsed value
-  /// here.)
+  /// Caveat: it reads `null` in two cases — a patch that loaded with no return
+  /// value (a pure code patch), and after a revert to baseline (a deliberate
+  /// [rollback], or an automatic revert after a failed patch), which clears it.
+  /// So it signals *content*, not merely that some patch is active.
+  /// ([CodePushPatchBuilder] is a convenience for string patches addressed by a
+  /// `key:` prefix — not the auto-parsed value here.)
   static final ValueNotifier<Object?> moduleResult = ValueNotifier(null);
   static bool _moduleLoaded = false;
 
@@ -2683,9 +2683,11 @@ class CodePushPatchBuilder extends StatelessWidget {
   });
 
   /// Optional key to filter which patch data this builder responds to.
-  /// If the module result is a pipe-delimited string starting with this key,
-  /// the remaining data is passed to the builder. If null, all results
-  /// are passed through.
+  /// Only *string* module results are ever passed through — a `Map`/`List`
+  /// payload (the common iOS shape) yields the baseline branch
+  /// (`patchData == null`). If the string starts with `'$patchKey:'`, the text
+  /// after the colon is passed to the builder. If null, every string result is
+  /// passed through as-is.
   final String? patchKey;
 
   /// Builder called with the patch data string (or null if no patch).

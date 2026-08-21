@@ -96,6 +96,12 @@ class _CodePushDemoState extends State<CodePushDemo> {
       await _loadStatus();
     } on CodePushException catch (e) {
       setState(() => _status = 'Rollback failed: ${e.message}');
+    } catch (e) {
+      // The iOS Dart-side rollback deletes the resident patch file, which can
+      // throw a FileSystemException (not a CodePushException) if it is already
+      // gone or unreadable — catch it so the button never leaves an exception
+      // unhandled.
+      setState(() => _status = 'Rollback failed: $e');
     }
   }
 
