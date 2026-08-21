@@ -159,25 +159,28 @@ abstract final class CodePush {
   }
 
   /// Status notifier — the current code-push state as a short string, for debug
-  /// UIs and logging. It changes as code push works and each step OVERWRITES
-  /// it (e.g. `'Patch active'` becomes `'Patch already installed'` at the next
-  /// check cycle, and again on every app resume), so it is a TRANSITION signal,
-  /// not a level you can poll.
+  /// UIs and logging. Each step OVERWRITES it (e.g. `'Patch active'` becomes
+  /// `'Patch already installed'` at the next check, and again on every resume),
+  /// so it is a fleeting TRANSITION, not a level you can poll.
   ///
-  /// The one app-facing use: to detect that a patch loaded (the reliable
-  /// first-patch signal on iOS, where [isPatched] reads `false` — the engine
-  /// channel is disabled there), LATCH a `bool` the first time the value
-  /// becomes `'Patch active'` and never reset it, exactly as [CodePushOverlay]
-  /// does internally. Do NOT render UI on `status.value == 'Patch active'`
-  /// directly: the value is `'Patch active'` only for the load instant and is
-  /// something else for the rest of the session.
+  /// Do NOT use it as an app-facing "a patch loaded" signal. [CodePushOverlay]
+  /// latches the `'Patch active'` edge internally, but on that same transition
+  /// it re-keys its child subtree — disposing any latch a widget under it holds
+  /// — and the edge never returns. For an app-facing iOS signal use
+  /// [moduleResult] (a level, so it survives the re-key), or own the lifecycle
+  /// with [checkAndInstall] instead of the overlay.
   static final ValueNotifier<String> status = ValueNotifier('init');
 
-  /// The result from the last loaded module.
+  /// The result from the last loaded module — the app-facing iOS patch signal.
   ///
-  /// On iOS, bytecode modules return a JSON string which is auto-parsed
-  /// into a `Map<String, dynamic>`. Apps can listen to this to apply
-  /// OTA patches to their UI.
+  /// On iOS, bytecode modules return a JSON string which is auto-parsed into a
+  /// `Map<String, dynamic>`. Listen to this (e.g. with a `ValueListenableBuilder`
+  /// or [CodePushPatchBuilder]) to drive OTA UI: unlike [status] (a fleeting
+  /// edge) and [isPatched] (always `false` on iOS), this is a LEVEL, so it
+  /// survives [CodePushOverlay] re-keying its subtree when a patch loads.
+  /// Caveat: it stays `null` for a patch that loaded with no return value, so
+  /// it signals *content*, not merely that some patch is active — a pure code
+  /// patch leaves it `null`.
   static final ValueNotifier<Object?> moduleResult = ValueNotifier(null);
   static bool _moduleLoaded = false;
 
@@ -2445,15 +2448,15 @@ class CodePushOverlay extends StatefulWidget {
   /// it; on iOS the banner appears only when a different patch arrives
   /// while one is already loaded (which cannot hot-swap and so waits for a
   /// restart), or when a resident patch is re-offered after a rollback
-  /// reverted the app-facing content. If you need a first-patch signal on
-  /// iOS, LATCH a `bool` the first time [CodePush.status] becomes
-  /// `'Patch active'` (an edge, not a level — the value moves on to something
-  /// else at the next check cycle and never returns), exactly as this overlay
-  /// does internally. [CodePush.moduleResult] carries the module's return
-  /// value for content-driven UI, but it stays `null` for a payload that
-  /// loaded with no entry point, so it is not a complete signal on its own.
-  /// Don't use [CodePush.isPatched] — on iOS it always reads `false` (the
-  /// engine channel is disabled there) and is a `Future`, not a listenable.
+  /// reverted the app-facing content. For an app-facing iOS patch signal,
+  /// listen to [CodePush.moduleResult] (e.g. via a `ValueListenableBuilder` or
+  /// [CodePushPatchBuilder]) — it is a LEVEL, so it survives this overlay
+  /// re-keying its child subtree when a patch loads; caveat: it is `null` for a
+  /// patch that loaded with no return value, so it signals content, not merely
+  /// "a patch is active". Don't latch on [CodePush.status] from a widget under
+  /// the overlay: `'Patch active'` is a fleeting edge, and the re-key disposes
+  /// the latch. And don't use [CodePush.isPatched] — on iOS it always reads
+  /// `false` (the engine channel is disabled there).
   ///
   /// The builder runs during `build` and may be called many times (parent
   /// rebuilds, media-query changes such as keyboard show/hide or rotation),

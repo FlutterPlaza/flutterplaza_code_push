@@ -117,9 +117,12 @@ class _CodePushDemoState extends State<CodePushDemo> {
                   const SizedBox(height: 8),
                   // NOTE: isPatched / currentPatch read the engine channel,
                   // which is disabled on iOS — they show false/null there even
-                  // while a patch is active. On iOS use CodePush.moduleResult /
-                  // CodePush.status (see the CodePushPatchBuilder below) as the
-                  // active-patch signal.
+                  // while a patch is active. On iOS use CodePush.moduleResult
+                  // (a level; see the CodePushPatchBuilder below) as the
+                  // active-patch signal — NOT CodePush.status: 'Patch active'
+                  // is a fleeting edge, and the overlay re-keys the app subtree
+                  // when a patch loads, so any latch a widget here holds is
+                  // discarded (this State itself is recreated on iOS load).
                   Text('Patched (Android/desktop): $_isPatched'),
                   if (_currentPatch != null) ...[
                     Text('Active patch: ${_currentPatch!.version}'),

@@ -97,7 +97,7 @@ CodePushOverlay(
     appId: 'your-app-id',
     releaseVersion: '1.0.0+1',
   ),
-  showDebugBar: true, // Shows "CP: Checking server...", "CP: Patch active", etc.
+  showDebugBar: true, // Shows "CP: Checking server...", "CP: Restart to apply", etc.
   child: MyApp(),
 )
 ```
@@ -204,8 +204,8 @@ CodePush.restart();
 
 Returns whether the app is currently running with a code push patch. Note this
 reads the engine channel, which is disabled on **iOS** — it always returns
-`false` on iOS even while a patch is active. For an iOS patch signal, latch on
-`CodePush.status` becoming `Patch active` (see below).
+`false` on iOS even while a patch is active. For an iOS patch signal, use
+`CodePush.moduleResult` (see below).
 
 ```dart
 final bool patched = await CodePush.isPatched;
@@ -247,12 +247,11 @@ CodePush.status.addListener(() {
 Values include: `init`, `Checking server...`, `Downloading patch...`,
 `Patch active`, `No update (204)`, `Restart to apply`, etc.
 
-The one app-facing use is detecting a patch loaded (the reliable first-patch
-signal on iOS, where `isPatched` reads `false`): **latch a `bool` the first
-time the value becomes `Patch active`** and never reset it — the value moves on
-to something else at the next check and never returns, so don't render UI on
-`status.value == 'Patch active'` directly. `CodePushOverlay` does exactly this
-latch internally.
+Don't use this as an app-facing "a patch loaded" signal. `CodePushOverlay`
+latches the `Patch active` edge internally, but on that transition it re-keys
+its child subtree, disposing any latch a widget under it holds — and the edge
+never returns. For an app-facing iOS signal use `CodePush.moduleResult` (a
+level, which survives the re-key), below.
 
 ### `CodePush.moduleResult`
 
@@ -298,13 +297,13 @@ The builder is the "patch ready" signal on the **Android/desktop** path. On
 **iOS** a freshly downloaded patch is applied to the running VM without a
 restart, so the builder is not invoked for it — on iOS the banner appears only
 when a different patch arrives while one is already loaded, or when a resident
-patch is re-offered after a rollback reverted the app-facing content. For a
-first-patch signal on iOS, **latch a `bool` the first time `CodePush.status`
-becomes `Patch active`** (an edge, not a level — it moves on at the next check
-and never returns), as the overlay does internally. `CodePush.moduleResult`
-carries the module's return value for content-driven UI but is `null` for a
-no-op payload, so it is not a complete signal on its own. Don't use
-`CodePush.isPatched` — on iOS it always reads `false`.
+patch is re-offered after a rollback reverted the app-facing content. For an
+app-facing iOS patch signal, listen to `CodePush.moduleResult` (a level — it
+survives the overlay re-keying its subtree when a patch loads; `null` for a
+patch with no return value, so it signals content, not merely "a patch is
+active"). Don't latch on `CodePush.status` from a widget under the overlay
+(`Patch active` is a fleeting edge and the re-key disposes the latch), and
+don't use `CodePush.isPatched` — on iOS it always reads `false`.
 
 The builder runs during `build` and may run many times, so keep side effects
 out of it: calling `onDismiss` from inside the builder does nothing useful (the
