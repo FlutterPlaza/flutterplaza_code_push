@@ -169,6 +169,27 @@ void main() {
       expect(updateChecks, 1, reason: 'losers return before the network');
       expect(downloads, 1);
     });
+
+    test('a losing overlapped check writes its own reason to status',
+        () async {
+      // Contract: checkAndInstall leaves its reason in CodePush.status
+      // before EVERY false return — including the single-flight early
+      // return, which previously left the other check's in-flight state
+      // in place (so a caller surfacing status after `false` rendered a
+      // foreign operation's progress as its own result).
+      offeredHash = patchHash;
+      offerDelay = const Duration(milliseconds: 300);
+      serve();
+
+      final winner = check();
+      // Let the winner latch the guard and reach the (stalled) server.
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(await check(), isFalse);
+      expect(CodePush.status.value, 'A check is already running');
+
+      await winner;
+    });
   });
 
   group('download size cap', () {

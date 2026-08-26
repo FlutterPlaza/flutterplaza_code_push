@@ -456,7 +456,18 @@ abstract final class CodePush {
     // is deliberately global (not per appId/channel): apps use a single
     // config, and a losing caller's `false` means "another check is
     // already running", not "no update".
-    if (_checkInFlight) return false;
+    //
+    // Write [status] before this early return too — checkAndInstall's
+    // contract is that every `false` return leaves its reason in [status],
+    // and without this write a losing caller would surface the OTHER
+    // check's in-flight state as if it were its own result. The in-flight
+    // check keeps overwriting [status] as it progresses, so this write is
+    // transient and cannot mask a 'Patch active' edge (notifications are
+    // synchronous, so that edge has already been delivered).
+    if (_checkInFlight) {
+      status.value = 'A check is already running';
+      return false;
+    }
     _checkInFlight = true;
     try {
       print('[CP] checkAndInstall start');
