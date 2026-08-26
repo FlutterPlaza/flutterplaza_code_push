@@ -58,6 +58,11 @@ class _CodePushDemoState extends State<CodePushDemo> {
   Future<void> _loadStatus() async {
     final patched = await CodePush.isPatched;
     final patch = await CodePush.currentPatch;
+    // Guard every setState that follows an await: the overlay re-keys the
+    // app subtree when a patch activates (see the build-method note below),
+    // which disposes this State mid-await — a late setState would then
+    // throw in debug builds.
+    if (!mounted) return;
     setState(() {
       _isPatched = patched;
       _currentPatch = patch;
@@ -72,9 +77,13 @@ class _CodePushDemoState extends State<CodePushDemo> {
         appId: 'your-app-id',
         releaseVersion: '1.0.0+1',
         onUpdateReady: () {
+          // This callback fires long after the await below resumes, so it
+          // needs its own mounted guard.
+          if (!mounted) return;
           setState(() => _status = 'Patch installed! Restart to apply.');
         },
       );
+      if (!mounted) return;
       if (!installed) {
         // `false` is not just "no update" — checkAndInstall also returns false
         // for "a check is already running", a download failure, a hash
@@ -86,6 +95,7 @@ class _CodePushDemoState extends State<CodePushDemo> {
       }
       await _loadStatus();
     } on CodePushException catch (e) {
+      if (!mounted) return;
       setState(() => _status = 'Error: ${e.message}');
     }
   }
@@ -94,15 +104,18 @@ class _CodePushDemoState extends State<CodePushDemo> {
     setState(() => _status = 'Rolling back...');
     try {
       await CodePush.rollback();
+      if (!mounted) return;
       setState(() => _status = 'Rolled back. Restart to revert.');
       await _loadStatus();
     } on CodePushException catch (e) {
+      if (!mounted) return;
       setState(() => _status = 'Rollback failed: ${e.message}');
     } catch (e) {
       // The iOS Dart-side rollback deletes the resident patch file, which can
       // throw a FileSystemException (not a CodePushException) if it is already
       // gone or unreadable — catch it so the button never leaves an exception
       // unhandled.
+      if (!mounted) return;
       setState(() => _status = 'Rollback failed: $e');
     }
   }
