@@ -518,7 +518,6 @@ abstract final class CodePush {
       // any installed patch, so the fleet returns to the store baseline
       // within one check interval of the switch being flipped.
       if (data['ota_disabled'] == true) {
-        status.value = 'OTA disabled by server';
         try {
           // Unconditional: the rollback knows where each platform keeps
           // the patch (engine on Android/desktop, file removal on iOS
@@ -531,7 +530,12 @@ abstract final class CodePush {
           status.value =
               'OTA disabled by server — patch removed (restart to apply)';
         } catch (_) {
-          // Best-effort: a clean device has nothing to revert.
+          // Best-effort: a clean device has nothing to revert. The
+          // status is written AFTER the awaited rollback attempt (in
+          // both branches): a concurrent check() during that await
+          // stamps 'A check is already running', and the kill-switch
+          // signal must be what stands when we return.
+          status.value = 'OTA disabled by server';
         }
         return false;
       }

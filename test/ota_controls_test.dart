@@ -78,6 +78,35 @@ void main() {
       expect(CodePush.status.value, isNot(contains('patch removed')));
     });
 
+    test(
+        'clean device: kill-switch status survives a concurrent check '
+        'during the revert attempt', () async {
+      serveOtaDisabled();
+      Future<bool>? loser;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(engineChannel, (MethodCall call) async {
+        if (call.method == 'CodePush.rollback') {
+          // The winner is parked on the revert await with the
+          // single-flight guard held — exactly the window where a
+          // concurrent check stamps its loser status. The kill-switch
+          // branch must rewrite AFTER this await so the fleet-wide
+          // signal is what stands when the winner returns.
+          loser ??= check();
+          return false; // Unpatched device: the revert attempt no-ops.
+        }
+        return null;
+      });
+
+      final installed = await check();
+
+      expect(installed, isFalse);
+      expect(loser, isNotNull);
+      expect(await loser, isFalse);
+      expect(CodePush.status.value, contains('OTA disabled'));
+      expect(CodePush.status.value, isNot(contains('patch removed')));
+      expect(CodePush.status.value, isNot(contains('already running')));
+    });
+
     test('patched device: reverts to the store baseline', () async {
       serveOtaDisabled();
       final engineCalls = <String>[];
