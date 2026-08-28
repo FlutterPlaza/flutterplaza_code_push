@@ -83,6 +83,7 @@ void main() {
         'during the revert attempt', () async {
       serveOtaDisabled();
       Future<bool>? loser;
+      String? statusDuringRevert;
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(engineChannel, (MethodCall call) async {
         if (call.method == 'CodePush.rollback') {
@@ -92,6 +93,10 @@ void main() {
           // branch must rewrite AFTER this await so the fleet-wide
           // signal is what stands when the winner returns.
           loser ??= check();
+          // Captured (not expect()ed) here: a TestFailure thrown inside
+          // this handler is swallowed by the kill-switch catch around
+          // the rollback await; the body assertion below fails loudly.
+          statusDuringRevert = CodePush.status.value;
           return false; // Unpatched device: the revert attempt no-ops.
         }
         return null;
@@ -101,6 +106,9 @@ void main() {
 
       expect(installed, isFalse);
       expect(loser, isNotNull);
+      expect(statusDuringRevert, contains('already running'),
+          reason: 'the loser must actually have stamped its status inside '
+              'the revert window — otherwise this test is vacuous');
       expect(await loser, isFalse);
       expect(CodePush.status.value, contains('OTA disabled'));
       expect(CodePush.status.value, isNot(contains('patch removed')));

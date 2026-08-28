@@ -23,6 +23,8 @@ void main() {
   Duration offerDelay = Duration.zero;
   String? offeredHash;
   String? offeredUrlOverride;
+  String? offeredEngineFingerprint;
+  Future<void> Function()? onTelemetry;
 
   void serve() {
     server.listen((HttpRequest req) async {
@@ -36,9 +38,14 @@ void main() {
             'patch_available': true,
             'patch_id': 'p1',
             if (offeredHash != null) 'patch_hash': offeredHash,
+            if (offeredEngineFingerprint != null)
+              'engine_fingerprint': offeredEngineFingerprint,
             'patch_url':
                 offeredUrlOverride ?? 'http://127.0.0.1:${server.port}/patch',
           }));
+      } else if (req.uri.path.endsWith('/telemetry/client-error')) {
+        if (onTelemetry != null) await onTelemetry!();
+        req.response.statusCode = HttpStatus.ok;
       } else {
         downloads++;
         req.response.statusCode = HttpStatus.ok;
@@ -55,6 +62,8 @@ void main() {
     offerDelay = Duration.zero;
     offeredHash = null;
     offeredUrlOverride = null;
+    offeredEngineFingerprint = null;
+    onTelemetry = null;
     CodePush.debugResetBaselineHashCache();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(engineChannel, (MethodCall call) async {
@@ -192,6 +201,41 @@ void main() {
       expect(await loser, isFalse);
 
       await winner;
+    });
+
+    test(
+        'incompatible-baseline terminal status survives a concurrent check '
+        'during the telemetry POST', () async {
+      // Regression guard for the reordered terminal writes: the engine
+      // ABI-mismatch branch reports telemetry (awaited) BEFORE writing
+      // its terminal status. A concurrent check() arriving inside that
+      // await stamps 'A check is already running'; the terminal write
+      // must land AFTER the await so the actionable message is what
+      // stands when the winner returns. Moving that write back up next
+      // to its branch condition turns this test red.
+      offeredHash = patchHash;
+      offeredEngineFingerprint = 'flutter-9.9.9'; // mocked engine: 'abi'
+      Future<bool>? loser;
+      String? statusDuringReport;
+      onTelemetry = () async {
+        // The winner is parked on the awaited telemetry POST with the
+        // single-flight guard held — exactly the reordered-write window.
+        loser ??= check();
+        statusDuringReport = CodePush.status.value;
+      };
+      serve();
+
+      expect(await check(), isFalse);
+      expect(loser, isNotNull, reason: 'the telemetry hook must have fired');
+      expect(await loser, isFalse);
+      expect(statusDuringReport, 'A check is already running',
+          reason: 'the loser must have stamped its status inside the '
+              'window, or this test is not exercising the race');
+      expect(
+        CodePush.status.value,
+        startsWith('Incompatible baseline: engine ABI mismatch'),
+      );
+      expect(downloads, 0, reason: 'mismatch is refused before download');
     });
   });
 

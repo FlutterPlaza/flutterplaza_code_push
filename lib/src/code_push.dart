@@ -163,6 +163,12 @@ abstract final class CodePush {
   /// `'Patch already installed'` at the next check, and again on every resume),
   /// so it is a fleeting TRANSITION, not a level you can poll.
   ///
+  /// One ordering guarantee holds across those transitions: when
+  /// [checkAndInstall] returns `false`, its reason was that check's final
+  /// write, so reading the value right after the `await` is reliable — the
+  /// guarantee is about WHICH transition a check ends on, not about the
+  /// value staying put afterwards.
+  ///
   /// Do NOT use it as an app-facing "a patch loaded" signal. [CodePushOverlay]
   /// latches the `'Patch active'` edge internally, but on that same transition
   /// it re-keys its child subtree — disposing any latch a widget under it holds
@@ -442,6 +448,13 @@ abstract final class CodePush {
   /// Checks the server for updates, downloads and installs if available.
   ///
   /// Returns `true` if a patch was installed (restart needed).
+  ///
+  /// Status contract: every `false` return leaves its reason as the FINAL
+  /// [status] write of that check, so reading [status] immediately after the
+  /// `await` reliably explains the result (a later check will overwrite it).
+  /// A concurrent call loses the single-flight guard: it stamps
+  /// `'A check is already running'` and returns `false` without disturbing
+  /// the active check's terminal message.
   static Future<bool> checkAndInstall({
     required String serverUrl,
     required String appId,
