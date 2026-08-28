@@ -181,12 +181,15 @@ void main() {
       offerDelay = const Duration(milliseconds: 300);
       serve();
 
+      // Both calls in the same synchronous turn: the winner latches the
+      // guard before its first await, and the loser's status write also
+      // lands before ITS first await — so no wall-clock sequencing is
+      // needed (a delay could even over-sleep past the offer window and
+      // turn the "loser" into a real second check).
       final winner = check();
-      // Let the winner latch the guard and reach the (stalled) server.
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-
-      expect(await check(), isFalse);
+      final loser = check();
       expect(CodePush.status.value, 'A check is already running');
+      expect(await loser, isFalse);
 
       await winner;
     });

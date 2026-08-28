@@ -618,7 +618,6 @@ abstract final class CodePush {
       );
 
       if (actualEngineFingerprint == null) {
-        status.value = 'Incompatible baseline: engine has no code push support';
         await _reportIncompatibleBaseline(
           serverUrl: serverUrl,
           appId: appId,
@@ -628,6 +627,12 @@ abstract final class CodePush {
           expectedFingerprint: expectedEngineFingerprint,
           actualFingerprint: null,
         );
+        // Terminal status is written AFTER the awaited report: a
+        // concurrent check() during that POST stamps 'A check is
+        // already running', and this actionable message must be what
+        // stands when we return. It's an error state, not progress, so
+        // writing it last loses nothing.
+        status.value = 'Incompatible baseline: engine has no code push support';
         return false;
       }
 
@@ -638,8 +643,6 @@ abstract final class CodePush {
       if (expectedEngineFingerprint != null &&
           actualEngineFingerprint != 'unknown' &&
           expectedEngineFingerprint != actualEngineFingerprint) {
-        status.value = 'Incompatible baseline: engine ABI mismatch '
-            '($actualEngineFingerprint vs $expectedEngineFingerprint)';
         await _reportIncompatibleBaseline(
           serverUrl: serverUrl,
           appId: appId,
@@ -648,6 +651,11 @@ abstract final class CodePush {
           expectedFingerprint: expectedEngineFingerprint,
           actualFingerprint: actualEngineFingerprint,
         );
+        // After the await, so a concurrent check()'s guard write can't
+        // overwrite this terminal status (see the null-fingerprint
+        // branch above).
+        status.value = 'Incompatible baseline: engine ABI mismatch '
+            '($actualEngineFingerprint vs $expectedEngineFingerprint)';
         return false;
       }
 
@@ -1917,15 +1925,19 @@ abstract final class CodePush {
             'bytes=${container.length}',
           );
         }
-        status.value = 'Patch format is unexpected — rolling back. '
-            'Upgrade flutter_compile to the latest version and '
-            'rebuild the patch.';
         await _iosImmediateRollback(
           serverUrl: serverUrl,
           appId: appId,
           patchId: patchId,
           errorMessage: 'Patch format mismatch — rejected before load',
         );
+        // Written after the awaited rollback (file deletes + telemetry
+        // POST): a concurrent check() during that window stamps 'A
+        // check is already running', and this upgrade hint must be the
+        // status that stands when we return.
+        status.value = 'Patch format is unexpected — rolling back. '
+            'Upgrade flutter_compile to the latest version and '
+            'rebuild the patch.';
         return false;
       }
 
@@ -2004,7 +2016,6 @@ abstract final class CodePush {
         );
       }
       print('[CP] MODULE LOAD THREW ($origin) — $e');
-      status.value = 'Module error: $e — rolling back patch';
       // Real load failure. Delete immediately instead of waiting for
       // the three-strike auto-rollback.
       await _iosImmediateRollback(
@@ -2013,6 +2024,10 @@ abstract final class CodePush {
         patchId: patchId,
         errorMessage: 'Patch load threw $e — deleted immediately',
       );
+      // Terminal status goes after the awaited rollback so a
+      // concurrent check()'s 'A check is already running' write during
+      // that window can't be what callers observe on return.
+      status.value = 'Module error: $e — rolling back patch';
       return false;
     }
   }

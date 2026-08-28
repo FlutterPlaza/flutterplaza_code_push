@@ -77,8 +77,10 @@ class _CodePushDemoState extends State<CodePushDemo> {
         appId: 'your-app-id',
         releaseVersion: '1.0.0+1',
         onUpdateReady: () {
-          // This callback fires long after the await below resumes, so it
-          // needs its own mounted guard.
+          // checkAndInstall invokes this synchronously, before the await
+          // below resumes — but the overlay can re-key this subtree while
+          // the check is in flight, so the callback can land on a
+          // disposed State. Hence the mounted guard.
           if (!mounted) return;
           setState(() => _status = 'Patch installed! Restart to apply.');
         },
