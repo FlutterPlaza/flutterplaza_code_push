@@ -163,6 +163,12 @@ abstract final class CodePush {
   /// `'Patch already installed'` at the next check, and again on every resume),
   /// so it is a fleeting TRANSITION, not a level you can poll.
   ///
+  /// One ordering guarantee holds across those transitions: when
+  /// [checkAndInstall] returns `false`, its reason was that check's final
+  /// write, so reading the value right after the `await` is reliable — the
+  /// guarantee is about WHICH transition a check ends on, not about the
+  /// value staying put afterwards.
+  ///
   /// Do NOT use it as an app-facing "a patch loaded" signal. [CodePushOverlay]
   /// latches the `'Patch active'` edge internally, but on that same transition
   /// it re-keys its child subtree — disposing any latch a widget under it holds
@@ -442,6 +448,16 @@ abstract final class CodePush {
   /// Checks the server for updates, downloads and installs if available.
   ///
   /// Returns `true` if a patch was installed (restart needed).
+  ///
+  /// Status contract: every `false` return leaves its reason as the FINAL
+  /// [status] write of that check, so reading [status] immediately after the
+  /// `await` reliably explains the result (a later check will overwrite it).
+  /// A concurrent call loses the single-flight guard: it stamps
+  /// `'A check is already running'` and returns `false` without disturbing
+  /// the active check's terminal message — except on the iOS post-download
+  /// load path, where the guard is released before the load completes, so
+  /// its writes are best-effort ordering rather than a guarantee (a
+  /// concurrent full check may overwrite them).
   static Future<bool> checkAndInstall({
     required String serverUrl,
     required String appId,
@@ -456,7 +472,18 @@ abstract final class CodePush {
     // is deliberately global (not per appId/channel): apps use a single
     // config, and a losing caller's `false` means "another check is
     // already running", not "no update".
-    if (_checkInFlight) return false;
+    //
+    // Write [status] before this early return too — checkAndInstall's
+    // contract is that every `false` return leaves its reason in [status],
+    // and without this write a losing caller would surface the OTHER
+    // check's in-flight state as if it were its own result. The in-flight
+    // check keeps overwriting [status] as it progresses, so this write is
+    // transient and cannot mask a 'Patch active' edge (notifications are
+    // synchronous, so that edge has already been delivered).
+    if (_checkInFlight) {
+      status.value = 'A check is already running';
+      return false;
+    }
     _checkInFlight = true;
     try {
       print('[CP] checkAndInstall start');
@@ -507,7 +534,6 @@ abstract final class CodePush {
       // any installed patch, so the fleet returns to the store baseline
       // within one check interval of the switch being flipped.
       if (data['ota_disabled'] == true) {
-        status.value = 'OTA disabled by server';
         try {
           // Unconditional: the rollback knows where each platform keeps
           // the patch (engine on Android/desktop, file removal on iOS
@@ -520,7 +546,12 @@ abstract final class CodePush {
           status.value =
               'OTA disabled by server — patch removed (restart to apply)';
         } catch (_) {
-          // Best-effort: a clean device has nothing to revert.
+          // Best-effort: a clean device has nothing to revert. The
+          // status is written AFTER the awaited rollback attempt (in
+          // both branches): a concurrent check() during that await
+          // stamps 'A check is already running', and the kill-switch
+          // signal must be what stands when we return.
+          status.value = 'OTA disabled by server';
         }
         return false;
       }
@@ -607,7 +638,6 @@ abstract final class CodePush {
       );
 
       if (actualEngineFingerprint == null) {
-        status.value = 'Incompatible baseline: engine has no code push support';
         await _reportIncompatibleBaseline(
           serverUrl: serverUrl,
           appId: appId,
@@ -617,6 +647,12 @@ abstract final class CodePush {
           expectedFingerprint: expectedEngineFingerprint,
           actualFingerprint: null,
         );
+        // Terminal status is written AFTER the awaited report: a
+        // concurrent check() during that POST stamps 'A check is
+        // already running', and this actionable message must be what
+        // stands when we return. It's an error state, not progress, so
+        // writing it last loses nothing.
+        status.value = 'Incompatible baseline: engine has no code push support';
         return false;
       }
 
@@ -627,8 +663,6 @@ abstract final class CodePush {
       if (expectedEngineFingerprint != null &&
           actualEngineFingerprint != 'unknown' &&
           expectedEngineFingerprint != actualEngineFingerprint) {
-        status.value = 'Incompatible baseline: engine ABI mismatch '
-            '($actualEngineFingerprint vs $expectedEngineFingerprint)';
         await _reportIncompatibleBaseline(
           serverUrl: serverUrl,
           appId: appId,
@@ -637,6 +671,11 @@ abstract final class CodePush {
           expectedFingerprint: expectedEngineFingerprint,
           actualFingerprint: actualEngineFingerprint,
         );
+        // After the await, so a concurrent check()'s guard write can't
+        // overwrite this terminal status (see the null-fingerprint
+        // branch above).
+        status.value = 'Incompatible baseline: engine ABI mismatch '
+            '($actualEngineFingerprint vs $expectedEngineFingerprint)';
         return false;
       }
 
@@ -1906,15 +1945,22 @@ abstract final class CodePush {
             'bytes=${container.length}',
           );
         }
-        status.value = 'Patch format is unexpected — rolling back. '
-            'Upgrade flutter_compile to the latest version and '
-            'rebuild the patch.';
         await _iosImmediateRollback(
           serverUrl: serverUrl,
           appId: appId,
           patchId: patchId,
           errorMessage: 'Patch format mismatch — rejected before load',
         );
+        // Written after the awaited rollback (file deletes + telemetry
+        // POST) so this upgrade hint is the last write this method
+        // makes. The single-flight guard is not held here (the install
+        // path returns this future without awaiting it, and cold-boot /
+        // reload callers never take the guard), so a concurrent full
+        // check can still overwrite it later — best-effort ordering,
+        // not a guarantee.
+        status.value = 'Patch format is unexpected — rolling back. '
+            'Upgrade flutter_compile to the latest version and '
+            'rebuild the patch.';
         return false;
       }
 
@@ -1993,7 +2039,6 @@ abstract final class CodePush {
         );
       }
       print('[CP] MODULE LOAD THREW ($origin) — $e');
-      status.value = 'Module error: $e — rolling back patch';
       // Real load failure. Delete immediately instead of waiting for
       // the three-strike auto-rollback.
       await _iosImmediateRollback(
@@ -2002,6 +2047,11 @@ abstract final class CodePush {
         patchId: patchId,
         errorMessage: 'Patch load threw $e — deleted immediately',
       );
+      // Terminal status goes after the awaited rollback so it is the
+      // last write this method makes. The single-flight guard is not
+      // held on this path, so a concurrent full check can still
+      // overwrite it later — best-effort ordering, not a guarantee.
+      status.value = 'Module error: $e — rolling back patch';
       return false;
     }
   }

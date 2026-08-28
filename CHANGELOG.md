@@ -1,6 +1,8 @@
 ## Unreleased
 
-- Documentation fixes only; no API or behavior changes.
+- Overlapping `checkAndInstall` calls now report their own reason
+  ("A check is already running") in `CodePush.status` instead of surfacing the
+  other check's state.
 - `CodePushOverlay.bannerBuilder`: return a widget to show no banner
   (`const SizedBox.shrink()`) — it never accepted `null`. Keep side effects out
   of the builder; wire the handed `onRestart`/`onDismiss` to your UI instead.

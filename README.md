@@ -245,7 +245,18 @@ CodePush.status.addListener(() {
 ```
 
 Values include: `init`, `Checking server...`, `Downloading patch...`,
-`Patch active`, `No update (204)`, `Restart to apply`, etc.
+`Patch active`, `No update (204)`, `Restart to apply`,
+`A check is already running`, etc.
+
+One ordering guarantee holds across those transitions: when `checkAndInstall`
+returns `false`, the reason is that check's **final** `status` write, so
+reading the value immediately after the `await` reliably explains the result.
+A concurrent (losing) call stamps `A check is already running` without
+disturbing the active check's terminal message. The guarantee is about which
+transition a check ends on — the value still does not stay put afterwards.
+The one exception is the iOS post-download load path, where the guard is
+released before the load completes: its writes are best-effort ordering,
+and a concurrent full check may overwrite them.
 
 Don't use this as an app-facing "a patch loaded" signal. `CodePushOverlay`
 latches the `Patch active` edge internally, but on that transition it re-keys
