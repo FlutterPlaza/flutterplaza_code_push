@@ -454,7 +454,10 @@ abstract final class CodePush {
   /// `await` reliably explains the result (a later check will overwrite it).
   /// A concurrent call loses the single-flight guard: it stamps
   /// `'A check is already running'` and returns `false` without disturbing
-  /// the active check's terminal message.
+  /// the active check's terminal message — except on the iOS post-download
+  /// load path, where the guard is released before the load completes, so
+  /// its writes are best-effort ordering rather than a guarantee (a
+  /// concurrent full check may overwrite them).
   static Future<bool> checkAndInstall({
     required String serverUrl,
     required String appId,
