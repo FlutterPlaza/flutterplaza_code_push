@@ -1932,9 +1932,12 @@ abstract final class CodePush {
           errorMessage: 'Patch format mismatch — rejected before load',
         );
         // Written after the awaited rollback (file deletes + telemetry
-        // POST): a concurrent check() during that window stamps 'A
-        // check is already running', and this upgrade hint must be the
-        // status that stands when we return.
+        // POST) so this upgrade hint is the last write this method
+        // makes. The single-flight guard is not held here (the install
+        // path returns this future without awaiting it, and cold-boot /
+        // reload callers never take the guard), so a concurrent full
+        // check can still overwrite it later — best-effort ordering,
+        // not a guarantee.
         status.value = 'Patch format is unexpected — rolling back. '
             'Upgrade flutter_compile to the latest version and '
             'rebuild the patch.';
@@ -2024,9 +2027,10 @@ abstract final class CodePush {
         patchId: patchId,
         errorMessage: 'Patch load threw $e — deleted immediately',
       );
-      // Terminal status goes after the awaited rollback so a
-      // concurrent check()'s 'A check is already running' write during
-      // that window can't be what callers observe on return.
+      // Terminal status goes after the awaited rollback so it is the
+      // last write this method makes. The single-flight guard is not
+      // held on this path, so a concurrent full check can still
+      // overwrite it later — best-effort ordering, not a guarantee.
       status.value = 'Module error: $e — rolling back patch';
       return false;
     }
