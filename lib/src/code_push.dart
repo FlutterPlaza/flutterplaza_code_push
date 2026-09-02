@@ -519,9 +519,7 @@ abstract final class CodePush {
       // epoch at fire time; the guard serializes any concurrent
       // re-arms, so this cannot stampede.
       final done = _checkDone;
-      if (done != null &&
-          entryEpoch == _initEpoch &&
-          _inFlightEpoch != _initEpoch) {
+      if (done != null && _inFlightEpoch != _initEpoch) {
         unawaited(done.future.then((_) {
           if (entryEpoch != _initEpoch) return;
           unawaited(checkAndInstall(
@@ -683,6 +681,17 @@ abstract final class CodePush {
             patchHash: serverPatchHash,
           )) {
         status.value = 'Patch already installed';
+        // Re-deliver the update-ready notification when an install from
+        // THIS session is still pending a restart: a live caller whose
+        // first check lost to a chain that then completed the install
+        // (the #30 install-window door) would otherwise land here and
+        // never hear that an update awaits — patch installed, no
+        // banner. The return value stays false (nothing newly
+        // downloaded); only the notification is re-announced, and only
+        // to a caller whose session is current.
+        if (_installPendingRestart && entryEpoch == _initEpoch) {
+          onUpdateReady?.call();
+        }
         return false;
       }
 
@@ -901,16 +910,21 @@ abstract final class CodePush {
                 // The server withdrew a pending update and reverted to
                 // the module that is running right now: disk converged,
                 // a restart would change nothing — no banner, no
-                // callback.
+                // callback, and nothing pending a restart any more.
+                _installPendingRestart = false;
                 status.value = statusPatchActive;
                 return false;
               }
               // persistAndRestart — or persistSilently after a rollback
               // reverted the app-facing content this session: the
               // module is resident but moduleResult was cleared, so a
-              // restart DOES change what the user sees. Surface it.
+              // restart DOES change what the user sees. Surface it —
+              // but never through a superseded session's callback; the
+              // pending-restart latch lets the live session's next
+              // check re-announce instead.
+              _installPendingRestart = true;
               status.value = 'Restart to apply';
-              onUpdateReady?.call();
+              if (entryEpoch == _initEpoch) onUpdateReady?.call();
               return true;
           }
         }
@@ -958,8 +972,14 @@ abstract final class CodePush {
             patchHash: offerHash,
           );
         }
+        // The install is committed regardless of who ran it, so the
+        // status is true either way — but the notification must not go
+        // to a superseded session's callback. The pending-restart latch
+        // lets the live session's next check (including the #30
+        // re-arm's) re-announce through the already-installed branch.
+        _installPendingRestart = true;
         status.value = 'Restart to apply';
-        onUpdateReady?.call();
+        if (entryEpoch == _initEpoch) onUpdateReady?.call();
         return true;
       }
     } catch (e) {
@@ -974,6 +994,15 @@ abstract final class CodePush {
 
   /// Guards [checkAndInstall] against overlapping invocations.
   static bool _checkInFlight = false;
+
+  /// True once an install THIS SESSION committed and still awaits a
+  /// restart. The already-installed branch consults it to re-announce
+  /// update-ready to a live caller whose own check had nothing new to
+  /// download — the #30 install-window door: without this, a stale
+  /// chain finishing the install consumed the only notification and
+  /// the live session's banner never appeared. Cleared by rollback and
+  /// by the server-withdrawal convergence branch.
+  static bool _installPendingRestart = false;
 
   /// Completes when the in-flight [checkAndInstall] releases the guard,
   /// so a live caller that lost to a STALE check can re-arm (#30
@@ -1813,6 +1842,9 @@ abstract final class CodePush {
   /// service with the SAME patch — a marker would block that until an
   /// unrelated patch shipped.
   static Future<void> _rollbackInternal({required bool quarantine}) async {
+    // Whatever was pending a restart is being removed — the
+    // already-installed branch must stop re-announcing it (#30 latch).
+    _installPendingRestart = false;
     // Try engine-side rollback first (works on Android/desktop).
     try {
       final bool? success = await _channel.invokeMethod<bool>(
@@ -2272,7 +2304,15 @@ abstract final class CodePush {
     _crashProtectionOnce = null;
   }
 
+  /// How many times crash protection has actually ENTERED its body this
+  /// process. The latch's whole guarantee is that this stays at 1 per
+  /// launch no matter how many init() chains run; the counter is bumped
+  /// before the platform check so host tests can observe it.
+  @visibleForTesting
+  static int debugCrashProtectionRuns = 0;
+
   static Future<void> _runCrashProtectionImpl() async {
+    debugCrashProtectionRuns++;
     if (!Platform.isIOS) return; // Engine handles non-iOS.
     try {
       final patchDir = await _getPatchDir();
