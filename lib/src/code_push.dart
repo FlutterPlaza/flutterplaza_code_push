@@ -2831,6 +2831,17 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   /// The overlay's own update-ready handler, handed to every entry point so
   /// all of them raise the same banner slot.
   void _markUpdateReady() {
+    // One banner per restart episode across BOTH delivery paths — the
+    // status latch AND the update-cycle callback (round 9: a resume
+    // check's re-announce arrived through the callback and undid a
+    // dismissal the notifier-side guard had honored). While the
+    // restart level stands and this episode already showed its banner,
+    // a dismissal stands too; the episode resets when the status
+    // leaves the level, so a fresh install re-offers.
+    if (CodePush.status.value == CodePush.statusRestartToApply) {
+      if (_restartLevelHandled && !_updateReady) return;
+      _restartLevelHandled = true;
+    }
     if (mounted) setState(() => _updateReady = true);
   }
 
@@ -2854,10 +2865,8 @@ class _CodePushOverlayState extends State<CodePushOverlay>
     // so the banner appears no matter who ran the install. ONE banner
     // per episode: while the level stands, a dismissal stands too.
     if (CodePush.status.value == CodePush.statusRestartToApply) {
-      if (!_restartLevelHandled) {
-        _restartLevelHandled = true;
-        if (!_updateReady) _markUpdateReady();
-      }
+      // _markUpdateReady owns the episode rule for both delivery paths.
+      if (!_restartLevelHandled && !_updateReady) _markUpdateReady();
     } else {
       _restartLevelHandled = false;
     }

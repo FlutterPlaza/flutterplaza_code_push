@@ -287,6 +287,35 @@ void main() {
 
   group('restart-pending status latch (PR #36 rounds 6-7)', () {
     testWidgets(
+        'the CALLBACK path cannot undo a dismissal either: a re-announce '
+        'during the same episode stays dismissed, a new episode re-offers',
+        (tester) async {
+      await pumpOverlay(tester, config: config);
+
+      CodePush.status.value = CodePush.statusRestartToApply;
+      await tester.pump();
+      await tester.tap(find.text('LATER'));
+      await tester.pump();
+      expect(find.text('Update ready. Restart to apply.'), findsNothing);
+
+      // The update cycle re-announces through the overlay's callback
+      // (a resume check hitting already-installed) while the level
+      // still stands.
+      signalUpdateReady();
+      await tester.pump();
+      expect(find.text('Update ready. Restart to apply.'), findsNothing,
+          reason: 'both delivery paths honor the episode rule');
+
+      // A fresh install transitions the status - new episode: the
+      // callback shows a new banner.
+      CodePush.status.value = 'Checking server...';
+      await tester.pump();
+      CodePush.status.value = CodePush.statusRestartToApply;
+      await tester.pump();
+      expect(find.text('Update ready. Restart to apply.'), findsOneWidget);
+    });
+
+    testWidgets(
         'a dismissed banner STAYS dismissed while the restart level '
         'persists — later notifier events do not undo the dismissal',
         (tester) async {
