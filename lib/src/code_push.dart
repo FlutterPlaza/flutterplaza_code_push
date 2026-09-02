@@ -942,9 +942,12 @@ abstract final class CodePush {
               // check re-announce instead.
               _installPendingRestart = true;
               status.value = 'Restart to apply';
-              if (entryEpoch == _initEpoch) {
+              // Stamp the session's announcement token only when a
+              // callback actually hears it — a callback-less installer
+              // must leave the token for the next caller that can.
+              if (entryEpoch == _initEpoch && onUpdateReady != null) {
                 _pendingRestartAnnouncedEpoch = _initEpoch;
-                onUpdateReady?.call();
+                onUpdateReady();
               }
               return true;
           }
@@ -1000,9 +1003,11 @@ abstract final class CodePush {
         // re-arm's) re-announce through the already-installed branch.
         _installPendingRestart = true;
         status.value = 'Restart to apply';
-        if (entryEpoch == _initEpoch) {
+        // Same token rule as the iOS tail: only a heard announcement
+        // consumes it.
+        if (entryEpoch == _initEpoch && onUpdateReady != null) {
           _pendingRestartAnnouncedEpoch = _initEpoch;
-          onUpdateReady?.call();
+          onUpdateReady();
         }
         return true;
       }

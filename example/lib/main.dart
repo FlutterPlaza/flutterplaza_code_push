@@ -72,11 +72,18 @@ class _CodePushDemoState extends State<CodePushDemo> {
   Future<void> _manualCheck() async {
     setState(() => _status = 'Checking for updates...');
     try {
+      // The callback, not the return value, is the restart-prompt
+      // signal: it can fire even when checkAndInstall returns false
+      // (a patch installed earlier this session still awaiting its
+      // restart). Track it so the false-branch below doesn't clobber
+      // the prompt it just showed.
+      var updateAnnounced = false;
       final installed = await CodePush.checkAndInstall(
         serverUrl: 'https://your-server.com',
         appId: 'your-app-id',
         releaseVersion: '1.0.0+1',
         onUpdateReady: () {
+          updateAnnounced = true;
           // checkAndInstall invokes this synchronously, before the await
           // below resumes — but the overlay can re-key this subtree while
           // the check is in flight, so the callback can land on a
@@ -97,8 +104,10 @@ class _CodePushDemoState extends State<CodePushDemo> {
         // the first callback-passing call is told so ('Patch already
         // installed' in status) — treat the callback, not the return
         // value, as the "show the restart prompt" signal.
-        setState(
-            () => _status = 'No new patch installed: ${CodePush.status.value}');
+        if (!updateAnnounced) {
+          setState(() =>
+              _status = 'No new patch installed: ${CodePush.status.value}');
+        }
       }
       await _loadStatus();
     } on CodePushException catch (e) {
