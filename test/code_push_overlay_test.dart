@@ -287,6 +287,36 @@ void main() {
 
   group('restart-pending status latch (PR #36 rounds 6-7)', () {
     testWidgets(
+        'a dismissed banner STAYS dismissed while the restart level '
+        'persists — later notifier events do not undo the dismissal',
+        (tester) async {
+      await pumpOverlay(tester, config: config);
+
+      CodePush.status.value = CodePush.statusRestartToApply;
+      await tester.pump();
+      expect(find.text('Update ready. Restart to apply.'), findsOneWidget);
+
+      await tester.tap(find.text('LATER'));
+      await tester.pump();
+      expect(find.text('Update ready. Restart to apply.'), findsNothing);
+
+      // A second delivery of the same episode: another notifier event
+      // re-runs the listener while the status level still stands.
+      CodePush.moduleResult.value = Object();
+      await tester.pump();
+      expect(find.text('Update ready. Restart to apply.'), findsNothing,
+          reason: 'one banner per episode; the level must not re-latch');
+
+      // A NEW episode (status leaves and returns) shows a new banner.
+      CodePush.status.value = 'Checking server...';
+      await tester.pump();
+      CodePush.status.value = CodePush.statusRestartToApply;
+      await tester.pump();
+      expect(find.text('Update ready. Restart to apply.'), findsOneWidget);
+      CodePush.moduleResult.value = null;
+    });
+
+    testWidgets(
         'an edge to statusRestartToApply during the overlay\'s life '
         'shows the banner', (tester) async {
       await pumpOverlay(tester, config: config);

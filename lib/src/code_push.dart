@@ -2765,6 +2765,15 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   bool _updateReady = false;
   bool _patchActive = false;
 
+  /// Whether the CURRENT restart-pending episode already produced a
+  /// banner via the status latch. Without it, any later notifier event
+  /// (moduleResult, a status rewrite) re-evaluates the still-standing
+  /// level and re-shows a banner the user dismissed — the round-8
+  /// dual-delivery finding. Reset when the status leaves the level, so
+  /// a genuinely new install (which transitions through other statuses)
+  /// starts a fresh episode.
+  bool _restartLevelHandled = false;
+
   /// The update-cycle override THIS state captured in [initState].
   /// Resume and dispose consult the capture, not the static, so an
   /// override installed or cleared mid-lifetime cannot make dispose
@@ -2842,10 +2851,15 @@ class _CodePushOverlayState extends State<CodePushOverlay>
     // one token per session, consumed by whichever caller installs
     // first — in the shipped example that is the manual button, and the
     // banner would silently lose. Every listener sees the status write,
-    // so the banner appears no matter who ran the install.
-    if (!_updateReady &&
-        CodePush.status.value == CodePush.statusRestartToApply) {
-      _markUpdateReady();
+    // so the banner appears no matter who ran the install. ONE banner
+    // per episode: while the level stands, a dismissal stands too.
+    if (CodePush.status.value == CodePush.statusRestartToApply) {
+      if (!_restartLevelHandled) {
+        _restartLevelHandled = true;
+        if (!_updateReady) _markUpdateReady();
+      }
+    } else {
+      _restartLevelHandled = false;
     }
   }
 
