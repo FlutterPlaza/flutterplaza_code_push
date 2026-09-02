@@ -134,14 +134,30 @@ void main() {
       // single-flight guard from here until the response is released).
       await firstRequest.future.timeout(const Duration(seconds: 30));
 
+      // Discriminator: the live chain must PROVABLY lose the guard to
+      // the held stale check before we release it — otherwise the test
+      // would also pass on a slow live chain whose first check simply
+      // ran after the stale one finished, with no re-arm involved.
+      final liveLost = Completer<void>();
+      void onStatus() {
+        if (CodePush.status.value == 'A check is already running' &&
+            !liveLost.isCompleted) {
+          liveLost.complete();
+        }
+      }
+
+      CodePush.status.addListener(onStatus);
+      addTearDown(() => CodePush.status.removeListener(onStatus));
+
       CodePush.init(
         serverUrl: 'http://127.0.0.1:${server.port}',
         appId: 'live-owner',
         releaseVersion: '1.0.0+1',
       );
-      // Give the live chain time to reach checkAndInstall, lose the
-      // guard to the stale in-flight check, and register its re-arm.
-      await Future<void>.delayed(const Duration(milliseconds: 300));
+      await liveLost.future.timeout(const Duration(seconds: 30));
+      expect(held, 1,
+          reason: 'the stale request must still be held when '
+              'the live chain loses the guard');
       releaseFirst.complete();
       // The stale chain's post-offer epoch check kills it; the guard
       // clears; the re-arm fires the live session's own check.
@@ -160,6 +176,75 @@ void main() {
         hasLength(1),
         reason: 'exactly one re-armed check — no stampede',
       );
+    },
+  );
+
+  test(
+    'the pending-restart latch re-announces once per session through the '
+    'already-installed branch, and never re-fires on later checks '
+    '(PR #36 round 3)',
+    () async {
+      // Stage an installed patch on disk and serve an offer for the
+      // SAME patch, so checkAndInstall deterministically takes the
+      // already-installed branch.
+      final patchDir = await Directory.systemTemp.createTemp('cp_latch_test');
+      addTearDown(() => patchDir.deleteSync(recursive: true));
+      File('${patchDir.path}/patch.vmcode').writeAsStringSync('x');
+      File('${patchDir.path}/installed_patch_identity.json').writeAsStringSync(
+          '{"patch_id":"p-1","patch_hash":"h-1","release_version":"1.0.0+1"}');
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(engineChannel,
+          (MethodCall call) async {
+        if (call.method == 'CodePush.getPatchDir') return patchDir.path;
+        return null;
+      });
+      handler = (HttpRequest req) async {
+        req.response.statusCode = HttpStatus.ok;
+        req.response.headers.contentType = ContentType.json;
+        req.response.write(
+            '{"patch_available":true,"patch_id":"p-1","patch_hash":"h-1",'
+            '"patch_url":"http://127.0.0.1:${server.port}/patch"}');
+        await req.response.close();
+      };
+      CodePush.debugResetBaselineHashCache();
+
+      var ready = 0;
+      final url = 'http://127.0.0.1:${server.port}';
+      Future<bool> check() => CodePush.checkAndInstall(
+            serverUrl: url,
+            appId: 'latch-app',
+            releaseVersion: '1.0.0+1',
+            onUpdateReady: () => ready++,
+          );
+
+      // No pending install: the already-installed branch stays silent.
+      CodePush.debugSetInstallPendingRestart(false);
+      expect(await check(), isFalse);
+      expect(ready, 0, reason: 'no announcement without a pending install');
+
+      // Pending install: exactly ONE announcement for this session...
+      CodePush.debugSetInstallPendingRestart(true);
+      expect(await check(), isFalse);
+      expect(ready, 1, reason: 're-announce once');
+      // ...and none on the session's later periodic/resume checks.
+      expect(await check(), isFalse);
+      expect(await check(), isFalse);
+      expect(ready, 1, reason: 'edge-triggered, not a sticky level');
+
+      // A NEW session (later init bumps the epoch) gets one more.
+      CodePush.init(
+        serverUrl: url,
+        appId: 'latch-app',
+        releaseVersion: '1.0.0+1',
+      );
+      expect(await check(), isFalse);
+      expect(ready, 2, reason: 'one announcement per session');
+
+      // Clearing the latch (rollback path) stops re-announcing.
+      CodePush.debugSetInstallPendingRestart(false);
+      expect(await check(), isFalse);
+      expect(ready, 2);
     },
   );
 

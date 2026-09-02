@@ -686,10 +686,14 @@ abstract final class CodePush {
         // first check lost to a chain that then completed the install
         // (the #30 install-window door) would otherwise land here and
         // never hear that an update awaits — patch installed, no
-        // banner. The return value stays false (nothing newly
-        // downloaded); only the notification is re-announced, and only
-        // to a caller whose session is current.
-        if (_installPendingRestart && entryEpoch == _initEpoch) {
+        // banner. ONE announcement per session (the announced-epoch
+        // marker): without it this branch is a sticky level and every
+        // periodic/resume check re-fires the banner until restart. The
+        // return value stays false (nothing newly downloaded).
+        if (_installPendingRestart &&
+            entryEpoch == _initEpoch &&
+            _pendingRestartAnnouncedEpoch != _initEpoch) {
+          _pendingRestartAnnouncedEpoch = _initEpoch;
           onUpdateReady?.call();
         }
         return false;
@@ -912,6 +916,7 @@ abstract final class CodePush {
                 // a restart would change nothing — no banner, no
                 // callback, and nothing pending a restart any more.
                 _installPendingRestart = false;
+                _pendingRestartAnnouncedEpoch = -1;
                 status.value = statusPatchActive;
                 return false;
               }
@@ -924,7 +929,10 @@ abstract final class CodePush {
               // check re-announce instead.
               _installPendingRestart = true;
               status.value = 'Restart to apply';
-              if (entryEpoch == _initEpoch) onUpdateReady?.call();
+              if (entryEpoch == _initEpoch) {
+                _pendingRestartAnnouncedEpoch = _initEpoch;
+                onUpdateReady?.call();
+              }
               return true;
           }
         }
@@ -979,7 +987,10 @@ abstract final class CodePush {
         // re-arm's) re-announce through the already-installed branch.
         _installPendingRestart = true;
         status.value = 'Restart to apply';
-        if (entryEpoch == _initEpoch) onUpdateReady?.call();
+        if (entryEpoch == _initEpoch) {
+          _pendingRestartAnnouncedEpoch = _initEpoch;
+          onUpdateReady?.call();
+        }
         return true;
       }
     } catch (e) {
@@ -1002,7 +1013,25 @@ abstract final class CodePush {
   /// chain finishing the install consumed the only notification and
   /// the live session's banner never appeared. Cleared by rollback and
   /// by the server-withdrawal convergence branch.
+  ///
+  /// [_pendingRestartAnnouncedEpoch] records which SESSION already got
+  /// its announcement (delivered at install time or re-announced here),
+  /// making the notification edge-triggered per session: the periodic
+  /// timer and resume checks of the same session never re-fire it, and
+  /// a genuinely new session (a later init, e.g. an overlay remount)
+  /// gets exactly one.
   static bool _installPendingRestart = false;
+  static int _pendingRestartAnnouncedEpoch = -1;
+
+  /// Test hooks for the pending-restart latch (process-global state).
+  @visibleForTesting
+  static void debugSetInstallPendingRestart(bool value) {
+    _installPendingRestart = value;
+    if (!value) _pendingRestartAnnouncedEpoch = -1;
+  }
+
+  @visibleForTesting
+  static bool get debugInstallPendingRestart => _installPendingRestart;
 
   /// Completes when the in-flight [checkAndInstall] releases the guard,
   /// so a live caller that lost to a STALE check can re-arm (#30
@@ -1845,6 +1874,7 @@ abstract final class CodePush {
     // Whatever was pending a restart is being removed — the
     // already-installed branch must stop re-announcing it (#30 latch).
     _installPendingRestart = false;
+    _pendingRestartAnnouncedEpoch = -1;
     // Try engine-side rollback first (works on Android/desktop).
     try {
       final bool? success = await _channel.invokeMethod<bool>(
