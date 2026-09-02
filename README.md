@@ -248,6 +248,9 @@ Values include: `init`, `Checking server...`, `Downloading patch...`,
 `Patch active`, `No update (204)`, `Restart to apply`,
 `A check is already running`, etc.
 
+The patch-loaded value is exported as `CodePush.statusPatchActive` — compare
+against that constant rather than against a copy of the string.
+
 One ordering guarantee holds across those transitions: when `checkAndInstall`
 returns `false`, the reason is that check's **final** `status` write, so
 reading the value immediately after the `await` reliably explains the result.

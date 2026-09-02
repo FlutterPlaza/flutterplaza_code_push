@@ -158,8 +158,19 @@ abstract final class CodePush {
     return payload;
   }
 
+  /// The [status] value written when a patch is loaded and running.
+  ///
+  /// Every writer of that state and every reader that latches the edge —
+  /// including [CodePushOverlay]'s own latch — go through this constant, so
+  /// the text can never drift apart between them. Compare against it rather
+  /// than against a copy of the literal.
+  ///
+  /// It remains a fleeting TRANSITION, not a level: see [status] for why an
+  /// app-facing "a patch loaded" signal should read [moduleResult] instead.
+  static const String statusPatchActive = 'Patch active';
+
   /// Status notifier — the current code-push state as a short string, for debug
-  /// UIs and logging. Each step OVERWRITES it (e.g. `'Patch active'` becomes
+  /// UIs and logging. Each step OVERWRITES it (e.g. [statusPatchActive] becomes
   /// `'Patch already installed'` at the next check, and again on every resume),
   /// so it is a fleeting TRANSITION, not a level you can poll.
   ///
@@ -170,10 +181,10 @@ abstract final class CodePush {
   /// value staying put afterwards.
   ///
   /// Do NOT use it as an app-facing "a patch loaded" signal. [CodePushOverlay]
-  /// latches the `'Patch active'` edge internally, but on that same transition
-  /// it re-keys its child subtree — disposing any latch a widget under it holds
-  /// — and the edge never returns. For an app-facing iOS signal use
-  /// [moduleResult] (a level, so it survives the re-key).
+  /// latches the [statusPatchActive] edge internally, but on that same
+  /// transition it re-keys its child subtree — disposing any latch a widget
+  /// under it holds — and the edge never returns. For an app-facing iOS
+  /// signal use [moduleResult] (a level, so it survives the re-key).
   static final ValueNotifier<String> status = ValueNotifier('init');
 
   /// The result from the last loaded module — the app-facing iOS patch signal.
@@ -478,7 +489,7 @@ abstract final class CodePush {
     // and without this write a losing caller would surface the OTHER
     // check's in-flight state as if it were its own result. The in-flight
     // check keeps overwriting [status] as it progresses, so this write is
-    // transient and cannot mask a 'Patch active' edge (notifications are
+    // transient and cannot mask a statusPatchActive edge (notifications are
     // synchronous, so that edge has already been delivered).
     if (_checkInFlight) {
       status.value = 'A check is already running';
@@ -789,7 +800,7 @@ abstract final class CodePush {
                   patchHash: offerHash,
                 );
               }
-              status.value = 'Patch active';
+              status.value = statusPatchActive;
               return false;
             case IosLoadedSessionDecision.rejectMalformed:
               // This branch never goes through _iosLoadPayload's format
@@ -836,7 +847,7 @@ abstract final class CodePush {
                 // the module that is running right now: disk converged,
                 // a restart would change nothing — no banner, no
                 // callback.
-                status.value = 'Patch active';
+                status.value = statusPatchActive;
                 return false;
               }
               // persistAndRestart — or persistSilently after a rollback
@@ -2013,7 +2024,7 @@ abstract final class CodePush {
       _loadedPatchHash = sha256.convert(container).toString();
       _contentRevertedThisSession = false;
       moduleResult.value = result;
-      status.value = 'Patch active';
+      status.value = statusPatchActive;
       // Clear any previous rollback marker — this patch works.
       if (patchDir != null) {
         try {
@@ -2511,7 +2522,8 @@ class CodePushOverlay extends StatefulWidget {
   /// post-failure revert, while the module stays resident), so it signals
   /// content, not merely "a patch is active".
   /// Don't latch on [CodePush.status] from a widget under the overlay:
-  /// `'Patch active'` is a fleeting edge, and the re-key disposes the latch.
+  /// [CodePush.statusPatchActive] is a fleeting edge, and the re-key disposes
+  /// the latch.
   /// And don't use [CodePush.isPatched] — on iOS it always reads `false` (the
   /// engine channel is disabled there).
   ///
@@ -2547,6 +2559,25 @@ class CodePushOverlay extends StatefulWidget {
   /// Whether to show the debug status bar at the top. Defaults to false.
   final bool showDebugBar;
 
+  /// Test-only seam: takes over the update-cycle calls the overlay makes on
+  /// its own behalf — the [CodePush.init] in `initState`, the
+  /// [CodePush.checkAndInstall] on app resume, and the [CodePush.dispose] on
+  /// unmount. When it is set, the overlay never touches the live client.
+  ///
+  /// The [bannerBuilder] contract — the builder's widget is what renders once
+  /// an update is ready, and the handed `onDismiss` removes it — is otherwise
+  /// unassertable on a host test runner: `initState` drives the real update
+  /// cycle (server check, patch-directory file I/O) and the update-ready
+  /// signal is private to that flow. With the seam set, a test captures the
+  /// `onUpdateReady` callback it is handed and fires it directly.
+  ///
+  /// Set it before pumping the overlay and restore it to `null` in
+  /// `tearDown`: it is a static, so a leaked override would silently disable
+  /// the update cycle for every later test in the same process.
+  @visibleForTesting
+  static void Function(CodePushConfig config, VoidCallback onUpdateReady)?
+      debugUpdateCycleOverride;
+
   @override
   State<CodePushOverlay> createState() => _CodePushOverlayState();
 }
@@ -2579,6 +2610,11 @@ class _CodePushOverlayState extends State<CodePushOverlay>
     CodePush.status.addListener(_onModuleLoaded);
     CodePush.moduleResult.addListener(_onModuleLoaded);
     final cfg = _config;
+    final override = CodePushOverlay.debugUpdateCycleOverride;
+    if (override != null) {
+      override(cfg, _markUpdateReady);
+      return;
+    }
     CodePush.init(
       serverUrl: cfg.serverUrl,
       appId: cfg.appId,
@@ -2586,14 +2622,27 @@ class _CodePushOverlayState extends State<CodePushOverlay>
       interval: cfg.checkInterval,
       channel: cfg.channel,
       disableOnPlayStoreInstalls: cfg.disableOnPlayStoreInstalls,
-      onUpdateReady: () {
-        if (mounted) setState(() => _updateReady = true);
-      },
+      onUpdateReady: _markUpdateReady,
     );
   }
 
+  /// The overlay's own update-ready handler, handed to every entry point so
+  /// all of them raise the same banner slot.
+  void _markUpdateReady() {
+    if (mounted) setState(() => _updateReady = true);
+  }
+
+  /// Lowers the banner slot until the next update becomes ready. Handed to
+  /// [CodePushOverlay.bannerBuilder] as `onDismiss`, so a custom banner may
+  /// call it long after the frame that built it — `mounted` is not implied.
+  void _dismissBanner() {
+    if (mounted) setState(() => _updateReady = false);
+  }
+
   void _onModuleLoaded() {
-    if (mounted && !_patchActive && CodePush.status.value == 'Patch active') {
+    if (mounted &&
+        !_patchActive &&
+        CodePush.status.value == CodePush.statusPatchActive) {
       setState(() => _patchActive = true);
     }
   }
@@ -2602,7 +2651,9 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   void dispose() {
     CodePush.status.removeListener(_onModuleLoaded);
     CodePush.moduleResult.removeListener(_onModuleLoaded);
-    CodePush.dispose();
+    // Under the test seam the overlay never started the live cycle, so it
+    // must not tear one down either — CodePush.dispose() is process-global.
+    if (CodePushOverlay.debugUpdateCycleOverride == null) CodePush.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -2611,14 +2662,17 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       final cfg = _config;
+      final override = CodePushOverlay.debugUpdateCycleOverride;
+      if (override != null) {
+        override(cfg, _markUpdateReady);
+        return;
+      }
       CodePush.checkAndInstall(
         serverUrl: cfg.serverUrl,
         appId: cfg.appId,
         releaseVersion: cfg.releaseVersion,
         channel: cfg.channel,
-        onUpdateReady: () {
-          if (mounted) setState(() => _updateReady = true);
-        },
+        onUpdateReady: _markUpdateReady,
       );
     }
   }
@@ -2665,11 +2719,11 @@ class _CodePushOverlayState extends State<CodePushOverlay>
                   ? widget.bannerBuilder!(
                       context,
                       CodePush.restart,
-                      () => setState(() => _updateReady = false),
+                      _dismissBanner,
                     )
                   : _DefaultUpdateBanner(
                       onRestart: CodePush.restart,
-                      onDismiss: () => setState(() => _updateReady = false),
+                      onDismiss: _dismissBanner,
                     ),
             ),
         ],
