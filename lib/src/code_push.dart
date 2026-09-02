@@ -475,6 +475,16 @@ abstract final class CodePush {
   ///
   /// Returns `true` if a patch was installed (restart needed).
   ///
+  /// [onUpdateReady] can fire even on a `false` return: when an install
+  /// from THIS session still awaits its restart, the first caller (per
+  /// session) that passes a callback and finds the patch already
+  /// installed receives the pending-restart announcement — that is how
+  /// a caller whose own first check lost a race to the installing chain
+  /// still learns an update awaits. One announcement per session; a
+  /// caller passing no callback does not consume it. UIs with several
+  /// listeners should observe [status]/[moduleResult] rather than rely
+  /// on every call's callback firing.
+  ///
   /// Status contract: every `false` return leaves its reason as the FINAL
   /// [status] write of that check, so reading [status] immediately after the
   /// `await` reliably explains the result (a later check will overwrite it).
@@ -690,11 +700,14 @@ abstract final class CodePush {
         // marker): without it this branch is a sticky level and every
         // periodic/resume check re-fires the banner until restart. The
         // return value stays false (nothing newly downloaded).
+        // A caller with no callback must not consume the session's one
+        // announcement token — the next caller that CAN hear it gets it.
         if (_installPendingRestart &&
+            onUpdateReady != null &&
             entryEpoch == _initEpoch &&
             _pendingRestartAnnouncedEpoch != _initEpoch) {
           _pendingRestartAnnouncedEpoch = _initEpoch;
-          onUpdateReady?.call();
+          onUpdateReady();
         }
         return false;
       }

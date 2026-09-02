@@ -91,7 +91,12 @@ class _CodePushDemoState extends State<CodePushDemo> {
         // for "a check is already running", a download failure, a hash
         // mismatch, a server error, and more. The specific reason is in
         // CodePush.status, which checkAndInstall writes before every false
-        // return, so surface that rather than guessing.
+        // return, so surface that rather than guessing. Note that
+        // onUpdateReady above can fire even on a false return: when a
+        // patch installed earlier this session still awaits a restart,
+        // the first callback-passing call is told so ('Patch already
+        // installed' in status) — treat the callback, not the return
+        // value, as the "show the restart prompt" signal.
         setState(
             () => _status = 'No new patch installed: ${CodePush.status.value}');
       }
