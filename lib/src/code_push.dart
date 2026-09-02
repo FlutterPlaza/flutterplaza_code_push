@@ -1,4 +1,4 @@
-import 'dart:async' show Timer, TimeoutException, unawaited;
+import 'dart:async' show Completer, Timer, TimeoutException, unawaited;
 import 'dart:convert' show base64Encode, jsonDecode, jsonEncode, utf8;
 import 'dart:io' show Directory, File, FileMode, HttpClient, Platform, exit;
 import 'dart:math' show Random;
@@ -506,11 +506,38 @@ abstract final class CodePush {
     // check keeps overwriting [status] as it progresses, so this write is
     // transient and cannot mask a statusPatchActive edge (notifications are
     // synchronous, so that edge has already been delivered).
+    final entryEpoch = _initEpoch;
     if (_checkInFlight) {
       status.value = 'A check is already running';
+      // Re-arm ONLY when a LIVE caller lost to a STALE in-flight check
+      // — the #30 starvation shape: a superseded chain took the guard
+      // just before the supersede, and without a retry the live
+      // session's first check waits for the periodic timer (default
+      // 4h) or an app resume. Same-epoch overlaps (timer + resume +
+      // manual) keep the long-standing quiet-loser semantics — no
+      // retry — which several tests pin. The retry re-checks the
+      // epoch at fire time; the guard serializes any concurrent
+      // re-arms, so this cannot stampede.
+      final done = _checkDone;
+      if (done != null &&
+          entryEpoch == _initEpoch &&
+          _inFlightEpoch != _initEpoch) {
+        unawaited(done.future.then((_) {
+          if (entryEpoch != _initEpoch) return;
+          unawaited(checkAndInstall(
+            serverUrl: serverUrl,
+            appId: appId,
+            releaseVersion: releaseVersion,
+            channel: channel,
+            onUpdateReady: onUpdateReady,
+          ));
+        }));
+      }
       return false;
     }
     _checkInFlight = true;
+    _inFlightEpoch = entryEpoch;
+    _checkDone = Completer<void>();
     try {
       print('[CP] checkAndInstall start');
       status.value = 'Checking server...';
@@ -548,6 +575,15 @@ abstract final class CodePush {
           '${deviceHash != null ? '&device_hash=$deviceHash' : ''}';
 
       final r = await _httpGet(url);
+      // A dispose() or newer init() during the offer round trip owns
+      // the session now — a stale chain must not proceed to download
+      // and install with superseded serverUrl/appId (#30). Checked at
+      // the two network chokepoints, which bound every irreversible
+      // side effect in this method.
+      if (entryEpoch != _initEpoch) {
+        status.value = 'Check superseded by a newer init';
+        return false;
+      }
       if (r.statusCode == 204 || r.statusCode != 200) {
         status.value = 'No update (${r.statusCode})';
         return false;
@@ -747,6 +783,10 @@ abstract final class CodePush {
       status.value = 'Downloading patch...';
       print('[CP] downloading from $patchUrl');
       final dlR = await _httpGetBytes(patchUrl);
+      if (entryEpoch != _initEpoch) {
+        status.value = 'Check superseded by a newer init';
+        return false;
+      }
       if (dlR.statusCode != 200) {
         status.value = 'Download failed (${dlR.statusCode})';
         return false;
@@ -927,11 +967,20 @@ abstract final class CodePush {
       return false;
     } finally {
       _checkInFlight = false;
+      _checkDone?.complete();
+      _checkDone = null;
     }
   }
 
   /// Guards [checkAndInstall] against overlapping invocations.
   static bool _checkInFlight = false;
+
+  /// Completes when the in-flight [checkAndInstall] releases the guard,
+  /// so a live caller that lost to a STALE check can re-arm (#30
+  /// starvation). [_inFlightEpoch] records which session's check holds
+  /// the guard; a live-vs-live loss keeps the quiet-loser semantics.
+  static Completer<void>? _checkDone;
+  static int _inFlightEpoch = 0;
 
   /// Maximum accepted patch download size. Visible for tests; real
   /// patches are tens of megabytes, so the default is generous.
@@ -2205,7 +2254,25 @@ abstract final class CodePush {
     return null;
   }
 
-  static Future<void> _runCrashProtection() async {
+  /// The boot counter is a per-LAUNCH concept, but init() can run more
+  /// than once per launch (main() + CodePushOverlay is the documented
+  /// combination). Without this latch each init's chain incremented the
+  /// counter, so two inits + two early exits could trip the three-strike
+  /// rollback on a healthy patch. Crash protection therefore runs at
+  /// most once per process; later chains await the same future.
+  static Future<void>? _crashProtectionOnce;
+
+  static Future<void> _runCrashProtection() =>
+      _crashProtectionOnce ??= _runCrashProtectionImpl();
+
+  /// Resets the per-process crash-protection latch. Tests only — a real
+  /// process must never run crash protection twice per launch.
+  @visibleForTesting
+  static void debugResetCrashProtectionLatch() {
+    _crashProtectionOnce = null;
+  }
+
+  static Future<void> _runCrashProtectionImpl() async {
     if (!Platform.isIOS) return; // Engine handles non-iOS.
     try {
       final patchDir = await _getPatchDir();
@@ -2602,6 +2669,14 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   bool _updateReady = false;
   bool _patchActive = false;
 
+  /// The update-cycle override THIS state captured in [initState].
+  /// Resume and dispose consult the capture, not the static, so an
+  /// override installed or cleared mid-lifetime cannot make dispose
+  /// tear down a live cycle this widget never started (or leak one it
+  /// did start). Null ⇒ this state drives the real cycle.
+  void Function(CodePushConfig config, VoidCallback onUpdateReady)?
+      _cycleOverride;
+
   /// Effective config: an explicit `widget.config` always wins, then
   /// falls back to `CodePush.lastConfig` (set by an earlier
   /// `CodePush.init(...)` call, typically at the top of `main()`).
@@ -2626,6 +2701,7 @@ class _CodePushOverlayState extends State<CodePushOverlay>
     CodePush.moduleResult.addListener(_onModuleLoaded);
     final cfg = _config;
     final override = CodePushOverlay.debugUpdateCycleOverride;
+    _cycleOverride = override;
     if (override != null) {
       override(cfg, _markUpdateReady);
       return;
@@ -2668,7 +2744,9 @@ class _CodePushOverlayState extends State<CodePushOverlay>
     CodePush.moduleResult.removeListener(_onModuleLoaded);
     // Under the test seam the overlay never started the live cycle, so it
     // must not tear one down either — CodePush.dispose() is process-global.
-    if (CodePushOverlay.debugUpdateCycleOverride == null) CodePush.dispose();
+    // Decided by the override captured in initState, not the static: the
+    // two can disagree if a test (un)installs the seam mid-lifetime.
+    if (_cycleOverride == null) CodePush.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -2677,7 +2755,9 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       final cfg = _config;
-      final override = CodePushOverlay.debugUpdateCycleOverride;
+      // Same capture rule as dispose(): resume follows whichever mode
+      // this state started in.
+      final override = _cycleOverride;
       if (override != null) {
         override(cfg, _markUpdateReady);
         return;

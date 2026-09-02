@@ -1,5 +1,5 @@
 import 'dart:convert' show LineSplitter;
-import 'dart:io' show File;
+import 'dart:io' show Directory, File;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -260,16 +260,22 @@ void main() {
     test('is the only place the literal appears in the library source', () {
       // The point of the constant is that a future status-text edit moves
       // every writer and the overlay's latch together. Prose in doc comments
-      // is free to name the text; executable code is not.
-      final lines = LineSplitter.split(
-        File('lib/src/code_push.dart').readAsStringSync(),
-      );
-      final offenders = lines
-          .map((line) => line.trim())
-          .where((line) => !line.startsWith('//'))
-          .where((line) => line.contains("'Patch active'"))
-          .where((line) => !line.contains('statusPatchActive ='))
-          .toList();
+      // is free to name the text; executable code is not. Scans EVERY
+      // library source file, and strips trailing comments so a
+      // `// ... 'Patch active'` remark cannot false-positive.
+      final offenders = <String>[];
+      for (final entity in Directory('lib').listSync(recursive: true)) {
+        if (entity is! File || !entity.path.endsWith('.dart')) continue;
+        for (final raw in LineSplitter.split(entity.readAsStringSync())) {
+          var line = raw.trim();
+          if (line.startsWith('//')) continue;
+          final comment = line.indexOf('//');
+          if (comment >= 0) line = line.substring(0, comment);
+          if (!line.contains("'Patch active'")) continue;
+          if (line.contains('statusPatchActive =')) continue;
+          offenders.add('${entity.path}: $line');
+        }
+      }
 
       expect(
         offenders,
