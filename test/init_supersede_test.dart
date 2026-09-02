@@ -1,5 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+
+import 'package:crypto/crypto.dart';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -283,6 +286,72 @@ void main() {
         2,
         reason: 'the test-only reset re-enables exactly one more run',
       );
+    },
+  );
+
+  test(
+    'an install with NO callback leaves the announcement token: the next '
+    'callback-passing check receives it (round-5 rule, real install tail)',
+    () async {
+      final patchDir = await Directory.systemTemp.createTemp('cp_token_test');
+      addTearDown(() => patchDir.deleteSync(recursive: true));
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(engineChannel,
+          (MethodCall call) async {
+        if (call.method == 'CodePush.getPatchDir') return patchDir.path;
+        if (call.method == 'CodePush.installPatch') {
+          // The real engine persists the payload; the already-installed
+          // check requires the file to exist, so the mock must too.
+          File('${patchDir.path}/patch.vmcode').writeAsStringSync('x');
+          return true;
+        }
+        return null;
+      });
+
+      final patchBytes = utf8.encode('fake-patch-payload');
+      final patchHash = sha256.convert(patchBytes).toString();
+      handler = (HttpRequest req) async {
+        if (req.uri.path == '/patch') {
+          req.response.statusCode = HttpStatus.ok;
+          req.response.add(patchBytes);
+        } else {
+          req.response.statusCode = HttpStatus.ok;
+          req.response.headers.contentType = ContentType.json;
+          req.response.write(jsonEncode({
+            'patch_available': true,
+            'patch_id': 'tok-1',
+            'patch_hash': patchHash,
+            'patch_url': 'http://127.0.0.1:${server.port}/patch',
+          }));
+        }
+        await req.response.close();
+      };
+      CodePush.debugResetBaselineHashCache();
+      CodePush.debugSetInstallPendingRestart(false);
+
+      final url = 'http://127.0.0.1:${server.port}';
+      // Install WITHOUT a callback: the token must survive.
+      final installed = await CodePush.checkAndInstall(
+        serverUrl: url,
+        appId: 'tok-app',
+        releaseVersion: '1.0.0+1',
+      );
+      expect(installed, isTrue);
+      expect(CodePush.debugInstallPendingRestart, isTrue);
+
+      // The next caller WITH a callback gets the session announcement
+      // through the already-installed branch.
+      var ready = 0;
+      final second = await CodePush.checkAndInstall(
+        serverUrl: url,
+        appId: 'tok-app',
+        releaseVersion: '1.0.0+1',
+        onUpdateReady: () => ready++,
+      );
+      expect(second, isFalse);
+      expect(ready, 1,
+          reason: 'a callback-less install must not consume the token');
     },
   );
 }

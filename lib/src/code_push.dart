@@ -169,6 +169,14 @@ abstract final class CodePush {
   /// app-facing "a patch loaded" signal should read [moduleResult] instead.
   static const String statusPatchActive = 'Patch active';
 
+  /// The [status] value written when a patch has been installed and a
+  /// restart will apply it. Named so the overlay (and apps) can latch
+  /// the RESTART-PENDING edge from [status] instead of depending on a
+  /// [checkAndInstall] callback — the callback announcement is a
+  /// one-token-per-session signal that whichever caller installs first
+  /// consumes, while every listener sees this status edge.
+  static const String statusRestartToApply = 'Restart to apply';
+
   /// Status notifier — the current code-push state as a short string, for debug
   /// UIs and logging. Each step OVERWRITES it (e.g. [statusPatchActive] becomes
   /// `'Patch already installed'` at the next check, and again on every resume),
@@ -941,7 +949,7 @@ abstract final class CodePush {
               // pending-restart latch lets the live session's next
               // check re-announce instead.
               _installPendingRestart = true;
-              status.value = 'Restart to apply';
+              status.value = statusRestartToApply;
               // Stamp the session's announcement token only when a
               // callback actually hears it — a callback-less installer
               // must leave the token for the next caller that can.
@@ -1002,7 +1010,7 @@ abstract final class CodePush {
         // lets the live session's next check (including the #30
         // re-arm's) re-announce through the already-installed branch.
         _installPendingRestart = true;
-        status.value = 'Restart to apply';
+        status.value = statusRestartToApply;
         // Same token rule as the iOS tail: only a heard announcement
         // consumes it.
         if (entryEpoch == _initEpoch && onUpdateReady != null) {
@@ -2819,10 +2827,19 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   }
 
   void _onModuleLoaded() {
-    if (mounted &&
-        !_patchActive &&
-        CodePush.status.value == CodePush.statusPatchActive) {
+    if (!mounted) return;
+    if (!_patchActive && CodePush.status.value == CodePush.statusPatchActive) {
       setState(() => _patchActive = true);
+    }
+    // The restart-pending edge reaches the overlay through STATUS, not
+    // through a checkAndInstall callback: the callback announcement is
+    // one token per session, consumed by whichever caller installs
+    // first — in the shipped example that is the manual button, and the
+    // banner would silently lose. Every listener sees the status write,
+    // so the banner appears no matter who ran the install.
+    if (!_updateReady &&
+        CodePush.status.value == CodePush.statusRestartToApply) {
+      _markUpdateReady();
     }
   }
 
