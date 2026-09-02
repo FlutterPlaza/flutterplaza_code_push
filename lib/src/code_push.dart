@@ -2795,6 +2795,12 @@ class _CodePushOverlayState extends State<CodePushOverlay>
     WidgetsBinding.instance.addObserver(this);
     CodePush.status.addListener(_onModuleLoaded);
     CodePush.moduleResult.addListener(_onModuleLoaded);
+    // Level-triggered catch-up: the two listeners only see EDGES, but
+    // this overlay can mount AFTER a patch activated or an install
+    // committed (deferred route, remount) — the notifier already holds
+    // the level and will never fire for it. Evaluate the current
+    // values once, exactly as the listener would.
+    _onModuleLoaded();
     final cfg = _config;
     final override = CodePushOverlay.debugUpdateCycleOverride;
     _cycleOverride = override;

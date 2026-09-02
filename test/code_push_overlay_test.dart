@@ -284,4 +284,33 @@ void main() {
       );
     });
   });
+
+  group('restart-pending status latch (PR #36 rounds 6-7)', () {
+    testWidgets(
+        'an edge to statusRestartToApply during the overlay\'s life '
+        'shows the banner', (tester) async {
+      await pumpOverlay(tester, config: config);
+      expect(find.text('Update ready. Restart to apply.'), findsNothing);
+
+      CodePush.status.value = CodePush.statusRestartToApply;
+      await tester.pump();
+
+      expect(find.text('Update ready. Restart to apply.'), findsOneWidget,
+          reason: 'every listener sees the status edge, regardless of '
+              'which caller\'s callback consumed the session token');
+    });
+
+    testWidgets(
+        'an overlay mounting AFTER the install still shows the banner '
+        '(level, not just edge)', (tester) async {
+      CodePush.status.value = CodePush.statusRestartToApply;
+
+      await pumpOverlay(tester, config: config);
+      await tester.pump();
+
+      expect(find.text('Update ready. Restart to apply.'), findsOneWidget,
+          reason: 'initState evaluates the current level once, so a '
+              'late-mounting overlay is not blind to a pending restart');
+    });
+  });
 }
