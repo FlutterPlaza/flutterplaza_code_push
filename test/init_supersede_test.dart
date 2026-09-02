@@ -86,6 +86,5 @@ void main() {
         reason: 'the superseded session must not reach the server',
       );
     },
-    skip: 'blocked on the update-flow epoch guard — issue #30',
   );
 }

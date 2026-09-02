@@ -357,6 +357,7 @@ abstract final class CodePush {
         releaseVersion: releaseVersion,
         interval: interval,
         channel: channel,
+        epoch: epoch,
         onUpdateReady: onUpdateReady,
       );
     }());
@@ -371,6 +372,7 @@ abstract final class CodePush {
     required String releaseVersion,
     required Duration interval,
     required String channel,
+    required int epoch,
     VoidCallback? onUpdateReady,
   }) {
     // Crash protection runs async because it needs the engine's patch
@@ -382,6 +384,14 @@ abstract final class CodePush {
     // unconditionally on init which left no room for the boot counter
     // to trip — see CHANGELOG 0.1.7 for the race condition this fixes.
     _runCrashProtection().then((_) async {
+      // A dispose() or a newer init() during crash protection owns the
+      // session now. Without this guard the stale continuation runs the
+      // whole boot sequence — iOS reload, launch timer, quarantine, and
+      // a checkAndInstall carrying the SUPERSEDED serverUrl/appId — and
+      // whichever chain resolves first takes the single-flight guard,
+      // starving the live session's first check (#30). Same discipline
+      // as init's store-install branch: re-check after EVERY await.
+      if (epoch != _initEpoch) return;
       // Re-apply a patch that was installed on a previous launch. On
       // iOS the patch is loaded into the running VM rather than mapped
       // at boot by the engine, so without this the patch would only be
@@ -395,9 +405,13 @@ abstract final class CodePush {
       // hangs cannot be reported as a successful launch, leaving the
       // boot counter incremented for the next attempt).
       await _iosReloadInstalledPatch(serverUrl: serverUrl, appId: appId);
+      if (epoch != _initEpoch) return;
 
       // Start launch success timer only after crash protection completes,
-      // so a rollback doesn't get immediately overwritten by a success report.
+      // so a rollback doesn't get immediately overwritten by a success
+      // report. A superseded/disposed session must never report launch
+      // success, so the epoch guard above also protects gate 5 —
+      // dispose() has already cancelled any running launch timer.
       _startLaunchTimer();
 
       // Quarantine any just-rolled-back patch synchronously BEFORE the
@@ -413,6 +427,7 @@ abstract final class CodePush {
       // breadcrumb ever appeared (restored backup, future engine change).
       if (!Platform.isIOS) {
         final quarantineDir = await _getPatchDir();
+        if (epoch != _initEpoch) return;
         if (quarantineDir != null) {
           _quarantineFromBreadcrumb(quarantineDir);
         }
