@@ -949,6 +949,7 @@ abstract final class CodePush {
               // pending-restart latch lets the live session's next
               // check re-announce instead.
               _installPendingRestart = true;
+              _installSeq++;
               status.value = statusRestartToApply;
               // Stamp the session's announcement token only when a
               // callback actually hears it — a callback-less installer
@@ -1010,6 +1011,7 @@ abstract final class CodePush {
         // lets the live session's next check (including the #30
         // re-arm's) re-announce through the already-installed branch.
         _installPendingRestart = true;
+        _installSeq++;
         status.value = statusRestartToApply;
         // Same token rule as the iOS tail: only a heard announcement
         // consumes it.
@@ -1049,6 +1051,22 @@ abstract final class CodePush {
   static bool _installPendingRestart = false;
   static int _pendingRestartAnnouncedEpoch = -1;
 
+  /// Whether an install from this session still awaits its restart.
+  ///
+  /// The status channel is BUSY (every check overwrites it), so UI that
+  /// needs the pending-restart level must read it here, not by string-
+  /// comparing [status] — the overlay's banner is driven off this.
+  static bool get isRestartPending => _installPendingRestart;
+
+  /// Monotonic count of installs committed this session. Each commit is
+  /// a new "episode": a banner dismissal belongs to the episode it was
+  /// made in, so a LATER install re-offers while a re-announce of the
+  /// same pending install does not.
+  static int _installSeq = 0;
+
+  /// The current install episode (see [_installSeq]).
+  static int get installSeq => _installSeq;
+
   /// Test hooks for the pending-restart latch (process-global state).
   @visibleForTesting
   static void debugSetInstallPendingRestart(bool value) {
@@ -1058,6 +1076,12 @@ abstract final class CodePush {
 
   @visibleForTesting
   static bool get debugInstallPendingRestart => _installPendingRestart;
+
+  /// Simulates an install commit for widget tests: a new episode.
+  @visibleForTesting
+  static void debugBumpInstallSeq() {
+    _installSeq++;
+  }
 
   /// Completes when the in-flight [checkAndInstall] releases the guard,
   /// so a live caller that lost to a STALE check can re-arm (#30
@@ -2765,14 +2789,13 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   bool _updateReady = false;
   bool _patchActive = false;
 
-  /// Whether the CURRENT restart-pending episode already produced a
-  /// banner via the status latch. Without it, any later notifier event
-  /// (moduleResult, a status rewrite) re-evaluates the still-standing
-  /// level and re-shows a banner the user dismissed — the round-8
-  /// dual-delivery finding. Reset when the status leaves the level, so
-  /// a genuinely new install (which transitions through other statuses)
-  /// starts a fresh episode.
-  bool _restartLevelHandled = false;
+  /// The install episode ([CodePush.installSeq]) whose banner the user
+  /// dismissed, or -1. The status channel is BUSY — every check
+  /// overwrites it — so episodes are anchored on the SDK's install
+  /// sequence, not on status strings (rounds 8-10): a dismissal stands
+  /// for its own episode however the status churns, and a LATER
+  /// install (a new episode) re-offers.
+  int _dismissedInstallSeq = -1;
 
   /// The update-cycle override THIS state captured in [initState].
   /// Resume and dispose consult the capture, not the static, so an
@@ -2831,16 +2854,14 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   /// The overlay's own update-ready handler, handed to every entry point so
   /// all of them raise the same banner slot.
   void _markUpdateReady() {
-    // One banner per restart episode across BOTH delivery paths — the
-    // status latch AND the update-cycle callback (round 9: a resume
-    // check's re-announce arrived through the callback and undid a
-    // dismissal the notifier-side guard had honored). While the
-    // restart level stands and this episode already showed its banner,
-    // a dismissal stands too; the episode resets when the status
-    // leaves the level, so a fresh install re-offers.
-    if (CodePush.status.value == CodePush.statusRestartToApply) {
-      if (_restartLevelHandled && !_updateReady) return;
-      _restartLevelHandled = true;
+    // One banner per install EPISODE, on every delivery path: a
+    // dismissal recorded for the current episode suppresses re-shows
+    // regardless of how the busy status channel has churned since
+    // (round 10: the previous status-keyed guard was dead code — the
+    // re-announce site overwrites the status before the callback).
+    if (CodePush.isRestartPending &&
+        CodePush.installSeq == _dismissedInstallSeq) {
+      return;
     }
     if (mounted) setState(() => _updateReady = true);
   }
@@ -2849,6 +2870,11 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   /// [CodePushOverlay.bannerBuilder] as `onDismiss`, so a custom banner may
   /// call it long after the frame that built it — `mounted` is not implied.
   void _dismissBanner() {
+    // Record which episode was dismissed, so only a LATER install
+    // re-offers (see _dismissedInstallSeq).
+    if (CodePush.isRestartPending) {
+      _dismissedInstallSeq = CodePush.installSeq;
+    }
     if (mounted) setState(() => _updateReady = false);
   }
 
@@ -2857,18 +2883,16 @@ class _CodePushOverlayState extends State<CodePushOverlay>
     if (!_patchActive && CodePush.status.value == CodePush.statusPatchActive) {
       setState(() => _patchActive = true);
     }
-    // The restart-pending edge reaches the overlay through STATUS, not
-    // through a checkAndInstall callback: the callback announcement is
-    // one token per session, consumed by whichever caller installs
-    // first — in the shipped example that is the manual button, and the
-    // banner would silently lose. Every listener sees the status write,
-    // so the banner appears no matter who ran the install. ONE banner
-    // per episode: while the level stands, a dismissal stands too.
-    if (CodePush.status.value == CodePush.statusRestartToApply) {
-      // _markUpdateReady owns the episode rule for both delivery paths.
-      if (!_restartLevelHandled && !_updateReady) _markUpdateReady();
-    } else {
-      _restartLevelHandled = false;
+    // The pending-restart signal reaches the overlay through the SDK's
+    // OWN state, not through status strings (the status channel is
+    // overwritten by every check) and not solely through a callback
+    // (the announcement token goes to whichever caller installs
+    // first). Every notifier event re-evaluates the level, so the
+    // banner appears no matter who ran the install and no matter what
+    // the status happens to read — and _markUpdateReady's episode rule
+    // keeps a dismissal standing until a LATER install.
+    if (CodePush.isRestartPending && !_updateReady) {
+      _markUpdateReady();
     }
   }
 

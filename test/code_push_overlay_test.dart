@@ -285,91 +285,79 @@ void main() {
     });
   });
 
-  group('restart-pending status latch (PR #36 rounds 6-7)', () {
+  group('restart-pending episodes (PR #36 rounds 6-10)', () {
+    setUp(() {
+      CodePush.debugSetInstallPendingRestart(false);
+    });
+    tearDown(() {
+      CodePush.debugSetInstallPendingRestart(false);
+    });
+
     testWidgets(
-        'the CALLBACK path cannot undo a dismissal either: a re-announce '
-        'during the same episode stays dismissed, a new episode re-offers',
+        'an install during the overlay\'s life shows the banner '
+        'whatever the status reads', (tester) async {
+      await pumpOverlay(tester, config: config);
+      expect(find.text('Update ready. Restart to apply.'), findsNothing);
+
+      CodePush.debugSetInstallPendingRestart(true);
+      CodePush.debugBumpInstallSeq();
+      // The busy status channel has already moved past the level —
+      // production truth: every check overwrites it.
+      CodePush.status.value = 'Patch already installed';
+      await tester.pump();
+
+      expect(find.text('Update ready. Restart to apply.'), findsOneWidget);
+    });
+
+    testWidgets(
+        'an overlay mounting AFTER the install shows the banner '
+        'even while the status reads a transient', (tester) async {
+      CodePush.debugSetInstallPendingRestart(true);
+      CodePush.debugBumpInstallSeq();
+      CodePush.status.value = 'No update (204)';
+
+      await pumpOverlay(tester, config: config);
+      await tester.pump();
+
+      expect(find.text('Update ready. Restart to apply.'), findsOneWidget,
+          reason: 'the anchor is the SDK pending state, not the status '
+              'string of the moment');
+    });
+
+    testWidgets(
+        'a dismissal stands for its episode across BOTH delivery '
+        'paths and every status churn; a LATER install re-offers',
         (tester) async {
       await pumpOverlay(tester, config: config);
-
+      CodePush.debugSetInstallPendingRestart(true);
+      CodePush.debugBumpInstallSeq();
       CodePush.status.value = CodePush.statusRestartToApply;
       await tester.pump();
       await tester.tap(find.text('LATER'));
       await tester.pump();
       expect(find.text('Update ready. Restart to apply.'), findsNothing);
 
-      // The update cycle re-announces through the overlay's callback
-      // (a resume check hitting already-installed) while the level
-      // still stands.
+      // Production re-announce sequence: the status is overwritten
+      // FIRST, then the callback fires (round 10's exact ordering).
+      CodePush.status.value = 'Patch already installed';
+      await tester.pump();
       signalUpdateReady();
       await tester.pump();
       expect(find.text('Update ready. Restart to apply.'), findsNothing,
-          reason: 'both delivery paths honor the episode rule');
+          reason: 'the dismissed episode stays dismissed through the '
+              'callback path with the status off the level');
 
-      // A fresh install transitions the status - new episode: the
-      // callback shows a new banner.
-      CodePush.status.value = 'Checking server...';
-      await tester.pump();
-      CodePush.status.value = CodePush.statusRestartToApply;
-      await tester.pump();
-      expect(find.text('Update ready. Restart to apply.'), findsOneWidget);
-    });
-
-    testWidgets(
-        'a dismissed banner STAYS dismissed while the restart level '
-        'persists — later notifier events do not undo the dismissal',
-        (tester) async {
-      await pumpOverlay(tester, config: config);
-
-      CodePush.status.value = CodePush.statusRestartToApply;
-      await tester.pump();
-      expect(find.text('Update ready. Restart to apply.'), findsOneWidget);
-
-      await tester.tap(find.text('LATER'));
-      await tester.pump();
-      expect(find.text('Update ready. Restart to apply.'), findsNothing);
-
-      // A second delivery of the same episode: another notifier event
-      // re-runs the listener while the status level still stands.
+      // More notifier churn cannot resurrect it either.
       CodePush.moduleResult.value = Object();
       await tester.pump();
-      expect(find.text('Update ready. Restart to apply.'), findsNothing,
-          reason: 'one banner per episode; the level must not re-latch');
+      expect(find.text('Update ready. Restart to apply.'), findsNothing);
+      CodePush.moduleResult.value = null;
 
-      // A NEW episode (status leaves and returns) shows a new banner.
-      CodePush.status.value = 'Checking server...';
-      await tester.pump();
+      // A LATER install is a NEW episode: re-offer.
+      CodePush.debugBumpInstallSeq();
       CodePush.status.value = CodePush.statusRestartToApply;
       await tester.pump();
       expect(find.text('Update ready. Restart to apply.'), findsOneWidget);
-      CodePush.moduleResult.value = null;
-    });
-
-    testWidgets(
-        'an edge to statusRestartToApply during the overlay\'s life '
-        'shows the banner', (tester) async {
-      await pumpOverlay(tester, config: config);
-      expect(find.text('Update ready. Restart to apply.'), findsNothing);
-
-      CodePush.status.value = CodePush.statusRestartToApply;
-      await tester.pump();
-
-      expect(find.text('Update ready. Restart to apply.'), findsOneWidget,
-          reason: 'every listener sees the status edge, regardless of '
-              'which caller\'s callback consumed the session token');
-    });
-
-    testWidgets(
-        'an overlay mounting AFTER the install still shows the banner '
-        '(level, not just edge)', (tester) async {
-      CodePush.status.value = CodePush.statusRestartToApply;
-
-      await pumpOverlay(tester, config: config);
-      await tester.pump();
-
-      expect(find.text('Update ready. Restart to apply.'), findsOneWidget,
-          reason: 'initState evaluates the current level once, so a '
-              'late-mounting overlay is not blind to a pending restart');
     });
   });
 }
