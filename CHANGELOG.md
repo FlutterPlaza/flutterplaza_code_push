@@ -1,5 +1,11 @@
 ## Unreleased
 
+- Fixes a race where combining `CodePush.init(...)` in `main()` with
+  `CodePushOverlay` could install the first patch without showing the
+  banner: a later `init` now fully supersedes an earlier one, and a check
+  that lost to an in-flight one retries automatically.
+- Adds `CodePush.statusPatchActive`, a named constant for the
+  `'Patch active'` status value (value unchanged).
 - Overlapping `checkAndInstall` calls now report their own reason
   ("A check is already running") in `CodePush.status` instead of surfacing the
   other check's state.

@@ -158,6 +158,13 @@ final installed = await CodePush.checkAndInstall(
 On iOS, bytecode patches are loaded live without a restart. On Android and
 desktop, `onUpdateReady` is called so you can prompt the user to restart.
 
+`onUpdateReady` can also fire on a `false` return: when a patch installed
+earlier in this session still awaits its restart, the first call (per
+session) that passes a callback and finds it already installed is told an
+update awaits — so a check that raced another one does not lose the
+prompt. One announcement per session; widgets with several listeners
+should observe `CodePush.status` / `CodePush.moduleResult` instead.
+
 ### `CodePush.checkForUpdate()`
 
 Checks the engine for available updates without downloading.
@@ -247,6 +254,9 @@ CodePush.status.addListener(() {
 Values include: `init`, `Checking server...`, `Downloading patch...`,
 `Patch active`, `No update (204)`, `Restart to apply`,
 `A check is already running`, etc.
+
+The patch-loaded value is exported as `CodePush.statusPatchActive` — compare
+against that constant rather than against a copy of the string.
 
 One ordering guarantee holds across those transitions: when `checkAndInstall`
 returns `false`, the reason is that check's **final** `status` write, so

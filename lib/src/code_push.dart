@@ -1,4 +1,4 @@
-import 'dart:async' show Timer, TimeoutException, unawaited;
+import 'dart:async' show Completer, Timer, TimeoutException, unawaited;
 import 'dart:convert' show base64Encode, jsonDecode, jsonEncode, utf8;
 import 'dart:io' show Directory, File, FileMode, HttpClient, Platform, exit;
 import 'dart:math' show Random;
@@ -158,8 +158,27 @@ abstract final class CodePush {
     return payload;
   }
 
+  /// The [status] value written when a patch is loaded and running.
+  ///
+  /// Every writer of that state and every reader that latches the edge —
+  /// including [CodePushOverlay]'s own latch — go through this constant, so
+  /// the text can never drift apart between them. Compare against it rather
+  /// than against a copy of the literal.
+  ///
+  /// It remains a fleeting TRANSITION, not a level: see [status] for why an
+  /// app-facing "a patch loaded" signal should read [moduleResult] instead.
+  static const String statusPatchActive = 'Patch active';
+
+  /// The [status] value written when a patch has been installed and a
+  /// restart will apply it. Named so the overlay (and apps) can latch
+  /// the RESTART-PENDING edge from [status] instead of depending on a
+  /// [checkAndInstall] callback — the callback announcement is a
+  /// one-token-per-session signal that whichever caller installs first
+  /// consumes, while every listener sees this status edge.
+  static const String statusRestartToApply = 'Restart to apply';
+
   /// Status notifier — the current code-push state as a short string, for debug
-  /// UIs and logging. Each step OVERWRITES it (e.g. `'Patch active'` becomes
+  /// UIs and logging. Each step OVERWRITES it (e.g. [statusPatchActive] becomes
   /// `'Patch already installed'` at the next check, and again on every resume),
   /// so it is a fleeting TRANSITION, not a level you can poll.
   ///
@@ -170,10 +189,10 @@ abstract final class CodePush {
   /// value staying put afterwards.
   ///
   /// Do NOT use it as an app-facing "a patch loaded" signal. [CodePushOverlay]
-  /// latches the `'Patch active'` edge internally, but on that same transition
-  /// it re-keys its child subtree — disposing any latch a widget under it holds
-  /// — and the edge never returns. For an app-facing iOS signal use
-  /// [moduleResult] (a level, so it survives the re-key).
+  /// latches the [statusPatchActive] edge internally, but on that same
+  /// transition it re-keys its child subtree — disposing any latch a widget
+  /// under it holds — and the edge never returns. For an app-facing iOS
+  /// signal use [moduleResult] (a level, so it survives the re-key).
   static final ValueNotifier<String> status = ValueNotifier('init');
 
   /// The result from the last loaded module — the app-facing iOS patch signal.
@@ -346,6 +365,7 @@ abstract final class CodePush {
         releaseVersion: releaseVersion,
         interval: interval,
         channel: channel,
+        epoch: epoch,
         onUpdateReady: onUpdateReady,
       );
     }());
@@ -360,6 +380,7 @@ abstract final class CodePush {
     required String releaseVersion,
     required Duration interval,
     required String channel,
+    required int epoch,
     VoidCallback? onUpdateReady,
   }) {
     // Crash protection runs async because it needs the engine's patch
@@ -371,6 +392,14 @@ abstract final class CodePush {
     // unconditionally on init which left no room for the boot counter
     // to trip — see CHANGELOG 0.1.7 for the race condition this fixes.
     _runCrashProtection().then((_) async {
+      // A dispose() or a newer init() during crash protection owns the
+      // session now. Without this guard the stale continuation runs the
+      // whole boot sequence — iOS reload, launch timer, quarantine, and
+      // a checkAndInstall carrying the SUPERSEDED serverUrl/appId — and
+      // whichever chain resolves first takes the single-flight guard,
+      // starving the live session's first check (#30). Same discipline
+      // as init's store-install branch: re-check after EVERY await.
+      if (epoch != _initEpoch) return;
       // Re-apply a patch that was installed on a previous launch. On
       // iOS the patch is loaded into the running VM rather than mapped
       // at boot by the engine, so without this the patch would only be
@@ -384,9 +413,13 @@ abstract final class CodePush {
       // hangs cannot be reported as a successful launch, leaving the
       // boot counter incremented for the next attempt).
       await _iosReloadInstalledPatch(serverUrl: serverUrl, appId: appId);
+      if (epoch != _initEpoch) return;
 
       // Start launch success timer only after crash protection completes,
-      // so a rollback doesn't get immediately overwritten by a success report.
+      // so a rollback doesn't get immediately overwritten by a success
+      // report. A superseded/disposed session must never report launch
+      // success, so the epoch guard above also protects gate 5 —
+      // dispose() has already cancelled any running launch timer.
       _startLaunchTimer();
 
       // Quarantine any just-rolled-back patch synchronously BEFORE the
@@ -402,6 +435,7 @@ abstract final class CodePush {
       // breadcrumb ever appeared (restored backup, future engine change).
       if (!Platform.isIOS) {
         final quarantineDir = await _getPatchDir();
+        if (epoch != _initEpoch) return;
         if (quarantineDir != null) {
           _quarantineFromBreadcrumb(quarantineDir);
         }
@@ -449,6 +483,16 @@ abstract final class CodePush {
   ///
   /// Returns `true` if a patch was installed (restart needed).
   ///
+  /// [onUpdateReady] can fire even on a `false` return: when an install
+  /// from THIS session still awaits its restart, the first caller (per
+  /// session) that passes a callback and finds the patch already
+  /// installed receives the pending-restart announcement — that is how
+  /// a caller whose own first check lost a race to the installing chain
+  /// still learns an update awaits. One announcement per session; a
+  /// caller passing no callback does not consume it. UIs with several
+  /// listeners should observe [status]/[moduleResult] rather than rely
+  /// on every call's callback firing.
+  ///
   /// Status contract: every `false` return leaves its reason as the FINAL
   /// [status] write of that check, so reading [status] immediately after the
   /// `await` reliably explains the result (a later check will overwrite it).
@@ -478,13 +522,38 @@ abstract final class CodePush {
     // and without this write a losing caller would surface the OTHER
     // check's in-flight state as if it were its own result. The in-flight
     // check keeps overwriting [status] as it progresses, so this write is
-    // transient and cannot mask a 'Patch active' edge (notifications are
+    // transient and cannot mask a statusPatchActive edge (notifications are
     // synchronous, so that edge has already been delivered).
+    final entryEpoch = _initEpoch;
     if (_checkInFlight) {
       status.value = 'A check is already running';
+      // Re-arm ONLY when a LIVE caller lost to a STALE in-flight check
+      // — the #30 starvation shape: a superseded chain took the guard
+      // just before the supersede, and without a retry the live
+      // session's first check waits for the periodic timer (default
+      // 4h) or an app resume. Same-epoch overlaps (timer + resume +
+      // manual) keep the long-standing quiet-loser semantics — no
+      // retry — which several tests pin. The retry re-checks the
+      // epoch at fire time; the guard serializes any concurrent
+      // re-arms, so this cannot stampede.
+      final done = _checkDone;
+      if (done != null && _inFlightEpoch != _initEpoch) {
+        unawaited(done.future.then((_) {
+          if (entryEpoch != _initEpoch) return;
+          unawaited(checkAndInstall(
+            serverUrl: serverUrl,
+            appId: appId,
+            releaseVersion: releaseVersion,
+            channel: channel,
+            onUpdateReady: onUpdateReady,
+          ));
+        }));
+      }
       return false;
     }
     _checkInFlight = true;
+    _inFlightEpoch = entryEpoch;
+    _checkDone = Completer<void>();
     try {
       print('[CP] checkAndInstall start');
       status.value = 'Checking server...';
@@ -522,6 +591,15 @@ abstract final class CodePush {
           '${deviceHash != null ? '&device_hash=$deviceHash' : ''}';
 
       final r = await _httpGet(url);
+      // A dispose() or newer init() during the offer round trip owns
+      // the session now — a stale chain must not proceed to download
+      // and install with superseded serverUrl/appId (#30). Checked at
+      // the two network chokepoints, which bound every irreversible
+      // side effect in this method.
+      if (entryEpoch != _initEpoch) {
+        status.value = 'Check superseded by a newer init';
+        return false;
+      }
       if (r.statusCode == 204 || r.statusCode != 200) {
         status.value = 'No update (${r.statusCode})';
         return false;
@@ -621,6 +699,24 @@ abstract final class CodePush {
             patchHash: serverPatchHash,
           )) {
         status.value = 'Patch already installed';
+        // Re-deliver the update-ready notification when an install from
+        // THIS session is still pending a restart: a live caller whose
+        // first check lost to a chain that then completed the install
+        // (the #30 install-window door) would otherwise land here and
+        // never hear that an update awaits — patch installed, no
+        // banner. ONE announcement per session (the announced-epoch
+        // marker): without it this branch is a sticky level and every
+        // periodic/resume check re-fires the banner until restart. The
+        // return value stays false (nothing newly downloaded).
+        // A caller with no callback must not consume the session's one
+        // announcement token — the next caller that CAN hear it gets it.
+        if (_installPendingRestart &&
+            onUpdateReady != null &&
+            entryEpoch == _initEpoch &&
+            _pendingRestartAnnouncedEpoch != _initEpoch) {
+          _pendingRestartAnnouncedEpoch = _initEpoch;
+          onUpdateReady();
+        }
         return false;
       }
 
@@ -721,6 +817,10 @@ abstract final class CodePush {
       status.value = 'Downloading patch...';
       print('[CP] downloading from $patchUrl');
       final dlR = await _httpGetBytes(patchUrl);
+      if (entryEpoch != _initEpoch) {
+        status.value = 'Check superseded by a newer init';
+        return false;
+      }
       if (dlR.statusCode != 200) {
         status.value = 'Download failed (${dlR.statusCode})';
         return false;
@@ -789,7 +889,7 @@ abstract final class CodePush {
                   patchHash: offerHash,
                 );
               }
-              status.value = 'Patch active';
+              status.value = statusPatchActive;
               return false;
             case IosLoadedSessionDecision.rejectMalformed:
               // This branch never goes through _iosLoadPayload's format
@@ -835,16 +935,29 @@ abstract final class CodePush {
                 // The server withdrew a pending update and reverted to
                 // the module that is running right now: disk converged,
                 // a restart would change nothing — no banner, no
-                // callback.
-                status.value = 'Patch active';
+                // callback, and nothing pending a restart any more.
+                _installPendingRestart = false;
+                _pendingRestartAnnouncedEpoch = -1;
+                status.value = statusPatchActive;
                 return false;
               }
               // persistAndRestart — or persistSilently after a rollback
               // reverted the app-facing content this session: the
               // module is resident but moduleResult was cleared, so a
-              // restart DOES change what the user sees. Surface it.
-              status.value = 'Restart to apply';
-              onUpdateReady?.call();
+              // restart DOES change what the user sees. Surface it —
+              // but never through a superseded session's callback; the
+              // pending-restart latch lets the live session's next
+              // check re-announce instead.
+              _installPendingRestart = true;
+              _installSeq++;
+              status.value = statusRestartToApply;
+              // Stamp the session's announcement token only when a
+              // callback actually hears it — a callback-less installer
+              // must leave the token for the next caller that can.
+              if (entryEpoch == _initEpoch && onUpdateReady != null) {
+                _pendingRestartAnnouncedEpoch = _initEpoch;
+                onUpdateReady();
+              }
               return true;
           }
         }
@@ -892,8 +1005,20 @@ abstract final class CodePush {
             patchHash: offerHash,
           );
         }
-        status.value = 'Restart to apply';
-        onUpdateReady?.call();
+        // The install is committed regardless of who ran it, so the
+        // status is true either way — but the notification must not go
+        // to a superseded session's callback. The pending-restart latch
+        // lets the live session's next check (including the #30
+        // re-arm's) re-announce through the already-installed branch.
+        _installPendingRestart = true;
+        _installSeq++;
+        status.value = statusRestartToApply;
+        // Same token rule as the iOS tail: only a heard announcement
+        // consumes it.
+        if (entryEpoch == _initEpoch && onUpdateReady != null) {
+          _pendingRestartAnnouncedEpoch = _initEpoch;
+          onUpdateReady();
+        }
         return true;
       }
     } catch (e) {
@@ -901,11 +1026,69 @@ abstract final class CodePush {
       return false;
     } finally {
       _checkInFlight = false;
+      _checkDone?.complete();
+      _checkDone = null;
     }
   }
 
   /// Guards [checkAndInstall] against overlapping invocations.
   static bool _checkInFlight = false;
+
+  /// True once an install THIS SESSION committed and still awaits a
+  /// restart. The already-installed branch consults it to re-announce
+  /// update-ready to a live caller whose own check had nothing new to
+  /// download — the #30 install-window door: without this, a stale
+  /// chain finishing the install consumed the only notification and
+  /// the live session's banner never appeared. Cleared by rollback and
+  /// by the server-withdrawal convergence branch.
+  ///
+  /// [_pendingRestartAnnouncedEpoch] records which SESSION already got
+  /// its announcement (delivered at install time or re-announced here),
+  /// making the notification edge-triggered per session: the periodic
+  /// timer and resume checks of the same session never re-fire it, and
+  /// a genuinely new session (a later init, e.g. an overlay remount)
+  /// gets exactly one.
+  static bool _installPendingRestart = false;
+  static int _pendingRestartAnnouncedEpoch = -1;
+
+  /// Whether an install from this session still awaits its restart.
+  ///
+  /// The status channel is BUSY (every check overwrites it), so UI that
+  /// needs the pending-restart level must read it here, not by string-
+  /// comparing [status] — the overlay's banner is driven off this.
+  static bool get isRestartPending => _installPendingRestart;
+
+  /// Monotonic count of installs committed this session. Each commit is
+  /// a new "episode": a banner dismissal belongs to the episode it was
+  /// made in, so a LATER install re-offers while a re-announce of the
+  /// same pending install does not.
+  static int _installSeq = 0;
+
+  /// The current install episode (see [_installSeq]).
+  static int get installSeq => _installSeq;
+
+  /// Test hooks for the pending-restart latch (process-global state).
+  @visibleForTesting
+  static void debugSetInstallPendingRestart(bool value) {
+    _installPendingRestart = value;
+    if (!value) _pendingRestartAnnouncedEpoch = -1;
+  }
+
+  @visibleForTesting
+  static bool get debugInstallPendingRestart => _installPendingRestart;
+
+  /// Simulates an install commit for widget tests: a new episode.
+  @visibleForTesting
+  static void debugBumpInstallSeq() {
+    _installSeq++;
+  }
+
+  /// Completes when the in-flight [checkAndInstall] releases the guard,
+  /// so a live caller that lost to a STALE check can re-arm (#30
+  /// starvation). [_inFlightEpoch] records which session's check holds
+  /// the guard; a live-vs-live loss keeps the quiet-loser semantics.
+  static Completer<void>? _checkDone;
+  static int _inFlightEpoch = 0;
 
   /// Maximum accepted patch download size. Visible for tests; real
   /// patches are tens of megabytes, so the default is generous.
@@ -1738,6 +1921,10 @@ abstract final class CodePush {
   /// service with the SAME patch — a marker would block that until an
   /// unrelated patch shipped.
   static Future<void> _rollbackInternal({required bool quarantine}) async {
+    // Whatever was pending a restart is being removed — the
+    // already-installed branch must stop re-announcing it (#30 latch).
+    _installPendingRestart = false;
+    _pendingRestartAnnouncedEpoch = -1;
     // Try engine-side rollback first (works on Android/desktop).
     try {
       final bool? success = await _channel.invokeMethod<bool>(
@@ -2013,7 +2200,7 @@ abstract final class CodePush {
       _loadedPatchHash = sha256.convert(container).toString();
       _contentRevertedThisSession = false;
       moduleResult.value = result;
-      status.value = 'Patch active';
+      status.value = statusPatchActive;
       // Clear any previous rollback marker — this patch works.
       if (patchDir != null) {
         try {
@@ -2179,7 +2366,33 @@ abstract final class CodePush {
     return null;
   }
 
-  static Future<void> _runCrashProtection() async {
+  /// The boot counter is a per-LAUNCH concept, but init() can run more
+  /// than once per launch (main() + CodePushOverlay is the documented
+  /// combination). Without this latch each init's chain incremented the
+  /// counter, so two inits + two early exits could trip the three-strike
+  /// rollback on a healthy patch. Crash protection therefore runs at
+  /// most once per process; later chains await the same future.
+  static Future<void>? _crashProtectionOnce;
+
+  static Future<void> _runCrashProtection() =>
+      _crashProtectionOnce ??= _runCrashProtectionImpl();
+
+  /// Resets the per-process crash-protection latch. Tests only — a real
+  /// process must never run crash protection twice per launch.
+  @visibleForTesting
+  static void debugResetCrashProtectionLatch() {
+    _crashProtectionOnce = null;
+  }
+
+  /// How many times crash protection has actually ENTERED its body this
+  /// process. The latch's whole guarantee is that this stays at 1 per
+  /// launch no matter how many init() chains run; the counter is bumped
+  /// before the platform check so host tests can observe it.
+  @visibleForTesting
+  static int debugCrashProtectionRuns = 0;
+
+  static Future<void> _runCrashProtectionImpl() async {
+    debugCrashProtectionRuns++;
     if (!Platform.isIOS) return; // Engine handles non-iOS.
     try {
       final patchDir = await _getPatchDir();
@@ -2511,7 +2724,8 @@ class CodePushOverlay extends StatefulWidget {
   /// post-failure revert, while the module stays resident), so it signals
   /// content, not merely "a patch is active".
   /// Don't latch on [CodePush.status] from a widget under the overlay:
-  /// `'Patch active'` is a fleeting edge, and the re-key disposes the latch.
+  /// [CodePush.statusPatchActive] is a fleeting edge, and the re-key disposes
+  /// the latch.
   /// And don't use [CodePush.isPatched] — on iOS it always reads `false` (the
   /// engine channel is disabled there).
   ///
@@ -2547,6 +2761,25 @@ class CodePushOverlay extends StatefulWidget {
   /// Whether to show the debug status bar at the top. Defaults to false.
   final bool showDebugBar;
 
+  /// Test-only seam: takes over the update-cycle calls the overlay makes on
+  /// its own behalf — the [CodePush.init] in `initState`, the
+  /// [CodePush.checkAndInstall] on app resume, and the [CodePush.dispose] on
+  /// unmount. When it is set, the overlay never touches the live client.
+  ///
+  /// The [bannerBuilder] contract — the builder's widget is what renders once
+  /// an update is ready, and the handed `onDismiss` removes it — is otherwise
+  /// unassertable on a host test runner: `initState` drives the real update
+  /// cycle (server check, patch-directory file I/O) and the update-ready
+  /// signal is private to that flow. With the seam set, a test captures the
+  /// `onUpdateReady` callback it is handed and fires it directly.
+  ///
+  /// Set it before pumping the overlay and restore it to `null` in
+  /// `tearDown`: it is a static, so a leaked override would silently disable
+  /// the update cycle for every later test in the same process.
+  @visibleForTesting
+  static void Function(CodePushConfig config, VoidCallback onUpdateReady)?
+      debugUpdateCycleOverride;
+
   @override
   State<CodePushOverlay> createState() => _CodePushOverlayState();
 }
@@ -2555,6 +2788,22 @@ class _CodePushOverlayState extends State<CodePushOverlay>
     with WidgetsBindingObserver {
   bool _updateReady = false;
   bool _patchActive = false;
+
+  /// The install episode ([CodePush.installSeq]) whose banner the user
+  /// dismissed, or -1. The status channel is BUSY — every check
+  /// overwrites it — so episodes are anchored on the SDK's install
+  /// sequence, not on status strings (rounds 8-10): a dismissal stands
+  /// for its own episode however the status churns, and a LATER
+  /// install (a new episode) re-offers.
+  int _dismissedInstallSeq = -1;
+
+  /// The update-cycle override THIS state captured in [initState].
+  /// Resume and dispose consult the capture, not the static, so an
+  /// override installed or cleared mid-lifetime cannot make dispose
+  /// tear down a live cycle this widget never started (or leak one it
+  /// did start). Null ⇒ this state drives the real cycle.
+  void Function(CodePushConfig config, VoidCallback onUpdateReady)?
+      _cycleOverride;
 
   /// Effective config: an explicit `widget.config` always wins, then
   /// falls back to `CodePush.lastConfig` (set by an earlier
@@ -2578,7 +2827,19 @@ class _CodePushOverlayState extends State<CodePushOverlay>
     WidgetsBinding.instance.addObserver(this);
     CodePush.status.addListener(_onModuleLoaded);
     CodePush.moduleResult.addListener(_onModuleLoaded);
+    // Level-triggered catch-up: the two listeners only see EDGES, but
+    // this overlay can mount AFTER a patch activated or an install
+    // committed (deferred route, remount) — the notifier already holds
+    // the level and will never fire for it. Evaluate the current
+    // values once, exactly as the listener would.
+    _onModuleLoaded();
     final cfg = _config;
+    final override = CodePushOverlay.debugUpdateCycleOverride;
+    _cycleOverride = override;
+    if (override != null) {
+      override(cfg, _markUpdateReady);
+      return;
+    }
     CodePush.init(
       serverUrl: cfg.serverUrl,
       appId: cfg.appId,
@@ -2586,15 +2847,52 @@ class _CodePushOverlayState extends State<CodePushOverlay>
       interval: cfg.checkInterval,
       channel: cfg.channel,
       disableOnPlayStoreInstalls: cfg.disableOnPlayStoreInstalls,
-      onUpdateReady: () {
-        if (mounted) setState(() => _updateReady = true);
-      },
+      onUpdateReady: _markUpdateReady,
     );
   }
 
+  /// The overlay's own update-ready handler, handed to every entry point so
+  /// all of them raise the same banner slot.
+  void _markUpdateReady() {
+    // One banner per install EPISODE, on every delivery path: a
+    // dismissal recorded for the current episode suppresses re-shows
+    // regardless of how the busy status channel has churned since
+    // (round 10: the previous status-keyed guard was dead code — the
+    // re-announce site overwrites the status before the callback).
+    if (CodePush.isRestartPending &&
+        CodePush.installSeq == _dismissedInstallSeq) {
+      return;
+    }
+    if (mounted) setState(() => _updateReady = true);
+  }
+
+  /// Lowers the banner slot until the next update becomes ready. Handed to
+  /// [CodePushOverlay.bannerBuilder] as `onDismiss`, so a custom banner may
+  /// call it long after the frame that built it — `mounted` is not implied.
+  void _dismissBanner() {
+    // Record which episode was dismissed, so only a LATER install
+    // re-offers (see _dismissedInstallSeq).
+    if (CodePush.isRestartPending) {
+      _dismissedInstallSeq = CodePush.installSeq;
+    }
+    if (mounted) setState(() => _updateReady = false);
+  }
+
   void _onModuleLoaded() {
-    if (mounted && !_patchActive && CodePush.status.value == 'Patch active') {
+    if (!mounted) return;
+    if (!_patchActive && CodePush.status.value == CodePush.statusPatchActive) {
       setState(() => _patchActive = true);
+    }
+    // The pending-restart signal reaches the overlay through the SDK's
+    // OWN state, not through status strings (the status channel is
+    // overwritten by every check) and not solely through a callback
+    // (the announcement token goes to whichever caller installs
+    // first). Every notifier event re-evaluates the level, so the
+    // banner appears no matter who ran the install and no matter what
+    // the status happens to read — and _markUpdateReady's episode rule
+    // keeps a dismissal standing until a LATER install.
+    if (CodePush.isRestartPending && !_updateReady) {
+      _markUpdateReady();
     }
   }
 
@@ -2602,7 +2900,11 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   void dispose() {
     CodePush.status.removeListener(_onModuleLoaded);
     CodePush.moduleResult.removeListener(_onModuleLoaded);
-    CodePush.dispose();
+    // Under the test seam the overlay never started the live cycle, so it
+    // must not tear one down either — CodePush.dispose() is process-global.
+    // Decided by the override captured in initState, not the static: the
+    // two can disagree if a test (un)installs the seam mid-lifetime.
+    if (_cycleOverride == null) CodePush.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -2611,14 +2913,19 @@ class _CodePushOverlayState extends State<CodePushOverlay>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       final cfg = _config;
+      // Same capture rule as dispose(): resume follows whichever mode
+      // this state started in.
+      final override = _cycleOverride;
+      if (override != null) {
+        override(cfg, _markUpdateReady);
+        return;
+      }
       CodePush.checkAndInstall(
         serverUrl: cfg.serverUrl,
         appId: cfg.appId,
         releaseVersion: cfg.releaseVersion,
         channel: cfg.channel,
-        onUpdateReady: () {
-          if (mounted) setState(() => _updateReady = true);
-        },
+        onUpdateReady: _markUpdateReady,
       );
     }
   }
@@ -2665,11 +2972,11 @@ class _CodePushOverlayState extends State<CodePushOverlay>
                   ? widget.bannerBuilder!(
                       context,
                       CodePush.restart,
-                      () => setState(() => _updateReady = false),
+                      _dismissBanner,
                     )
                   : _DefaultUpdateBanner(
                       onRestart: CodePush.restart,
-                      onDismiss: () => setState(() => _updateReady = false),
+                      onDismiss: _dismissBanner,
                     ),
             ),
         ],
